@@ -1,0 +1,52 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# ===== 模型权重与训练产物 =====
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ===== 数据文件（大体量，不入库） =====
+data/
+*.mat
+*.xlsx
+*.xls
+*.npy
+*.npz
+
+# ===== TensorBoard / 日志 =====
+runs/
+*.log
+logs/
+
+# ===== 分析输出 =====
+analysis_results/
+interpretability/
+low_pcc_analysis/
+
+# ===== IDE / 编辑器 =====
+.trae/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db

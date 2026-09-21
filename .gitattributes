@@ -1,0 +1,20 @@
+# 统一换行符处理
+* text=auto
+
+# Shell 脚本保持 LF
+*.sh text eol=lf
+
+# Python 源码
+*.py text diff=python
+
+# 文档
+*.md text
+*.csv text
+
+# 二进制文件
+*.mat binary
+*.pt binary
+*.pth binary
+*.png binary
+*.jpg binary
+*.pdf binary
