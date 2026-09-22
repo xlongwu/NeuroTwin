@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # NeuroTwin：病理条件驱动的脑动态数字孪生框架
 
 > **NeuroTwin: Pathology-Conditioned Mixture-of-Denoising-Experts Digital Twin for Brain Dynamics**
