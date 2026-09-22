@@ -94,7 +94,7 @@ data_root/
 ├── Mask/
 │   ├── HC/   # Mask_{subj_id}.mat（结构连接矩阵 SC）
 │   └── MDD/
-└── Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx   # 临床评分表（微调必需，含 ID 与 HAMD 列）
+└── Rest-meta-MDD-V1V2-Merged-MDD.xlsx              # 临床评分表（微调必需，含 ID 与 HAMD 列）
 ```
 
 单个样本的张量构成（由 `NeuroTwinDataset` 滑窗生成，最大起点为 `total_windows - in_window - pred_window + 1`）：
@@ -209,7 +209,7 @@ MoE 训练正则（`compute_moe_regularization`，仅在 finetune 生效）：
 ```bash
 python analysis/run_comprehensive.py \
     --finetuned_weight checkpoints/neurotwin_finetune_pred1/finetuned_best.pt \
-    --data_root /data3/Digital_Brain/AMD/data \
+    --data_root data \
     --output_dir ./checkpoints/analysis_results
 ```
 

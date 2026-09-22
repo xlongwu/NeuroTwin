@@ -1,6 +1,8 @@
 #!/bin/bash
-data_root="/data3/Digital_Brain/AMD/data"
-checkpoint_dir="/data3/Digital_Brain/NeuroTwin/checkpoints"
+# 项目根目录（脚本位于 <root>/scripts/，路径均基于项目内，迁移无需修改）
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+data_root="$ROOT/data"
+checkpoint_dir="$ROOT/checkpoints"
 pretrain_name="neurotwin_pretrain"
 finetune_name="neurotwin_finetune"
 
@@ -64,6 +66,7 @@ do
     --pin_memory True \
     --patience $patience \
     --amp True \
+    --compile True \
     --use_ema True \
     --ema_decay 0.999 \
     --init_log_var_pcc 0.0 \

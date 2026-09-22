@@ -35,10 +35,13 @@ class NeuroTwinDataset(Dataset):
         in_window: int = 6,
         pred_window: int = 3,
         pathology_input_dim: int = 1,
-        clinical_file: str = 'Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx',
+        clinical_file: str = 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
         total_windows: int = 9,
         seq_len: int = 30,
         cache_in_memory: bool = False,
+        # 实测（R1/R2 对照）：page cache 下 loadmat 重复读并非瓶颈，被试级缓存
+        # 无稳态收益且增加 worker 内存（×num_workers）与启动成本，故默认关闭
+        cache_subjects: bool = False,
     ):
         self.data_root = Path(data_root)
         self.mode = mode
@@ -48,6 +51,10 @@ class NeuroTwinDataset(Dataset):
         self.total_windows = total_windows
         self.seq_len = seq_len
         self.cache_in_memory = cache_in_memory
+        # 被试级缓存：同一被试的 Mask/9 窗只加载与归一化一次，
+        # 消除滑窗样本间约 2/3~90% 的重复读盘（多 worker 下每进程各持一份）
+        self.cache_subjects = cache_subjects
+        self._subject_cache: Dict[str, Dict[str, np.ndarray]] = {}
         self._mat_cache: Dict[str, np.ndarray] = {}
 
         if self.in_window + self.pred_window > self.total_windows:
@@ -74,6 +81,10 @@ class NeuroTwinDataset(Dataset):
         group_folder = 'HC' if mode == 'pretrain' else 'MDD'
         self.window_dir = self.data_root / 'ROISignals_window' / group_folder
         self.sc_dir = self.data_root / 'Mask' / group_folder
+        # 聚合 npz 缓存目录（由 scripts/convert_mat_to_npz.py 生成）：
+        # 每被试一个 npz（sc + windows [W,F,S]），存在则优先读取，消除小 mat 文件 I/O
+        self.npz_dir = self.data_root / 'npz_cache' / group_folder
+        self.npz_dir = self.npz_dir if self.npz_dir.is_dir() else None
 
         self.samples: List[Dict] = []
         self.subject_ids: List[str] = []
@@ -197,20 +208,35 @@ class NeuroTwinDataset(Dataset):
         sc = np.clip(sc, 0.0, 1.0)
         return sc.astype(np.float32)
 
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        start_idx = sample['start_idx']
+    def _load_subject_from_npz(self, npz_path: Path) -> Dict[str, np.ndarray]:
+        """从聚合 npz 读取单被试数据（sc 为原始 Mask，windows 已统一为 [W, F, S] float32）。"""
+        with np.load(npz_path) as z:
+            sc_raw = np.asarray(z['sc'])
+            windows = np.asarray(z['windows'])
+        sc_matrix = self._normalize_sc(sc_raw)
+        if windows.ndim != 3 or windows.shape[0] != self.total_windows:
+            raise ValueError(f"npz windows 形状异常 {windows.shape}（期望 [W={self.total_windows}, F, S]）: {npz_path.name}")
+        if windows.shape[1] != sc_matrix.shape[0] or windows.shape[2] != self.seq_len:
+            raise ValueError(f"npz 维度与 SC/seq_len 不匹配: {npz_path.name} windows={windows.shape}")
+        return {'sc': sc_matrix, 'windows': windows.astype(np.float32, copy=False)}
+
+    def _load_subject(self, subj_id: str, sc_path: Path, window_paths: List[Path]) -> Dict[str, np.ndarray]:
+        """加载并预处理单个被试的全部数据：归一化 SC + 堆叠 9 窗 [W_total, F, S]。"""
+        if self.npz_dir is not None:
+            npz_path = self.npz_dir / f"{subj_id}.npz"
+            if npz_path.exists():
+                return self._load_subject_from_npz(npz_path)
 
         sc_matrix = self._read_mat_array(
-            sample['sc_path'],
+            sc_path,
             preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask']
         )
         if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
-            raise ValueError(f"SC/mask must be square [F, F], got {sc_matrix.shape} for {sample['subj_id']}")
+            raise ValueError(f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
         sc_matrix = self._normalize_sc(sc_matrix)
 
         bold_windows = []
-        for w_path in sample['window_paths']:
+        for w_path in window_paths:
             mat_data = self._read_mat_array(w_path, preferred_keys=['ROISignals', 'data', 'bold'])
             if mat_data.ndim != 2:
                 raise ValueError(f"BOLD window must be 2D, got {mat_data.shape} in {w_path.name}")
@@ -227,8 +253,24 @@ class NeuroTwinDataset(Dataset):
         bold_windows = np.stack(bold_windows, axis=0)  # [W_total, F, S]
         if bold_windows.shape[1] != sc_matrix.shape[0]:
             raise ValueError(
-                f"Node count mismatch for {sample['subj_id']}: BOLD has {bold_windows.shape[1]} nodes, SC has {sc_matrix.shape[0]}"
+                f"Node count mismatch for {subj_id}: BOLD has {bold_windows.shape[1]} nodes, SC has {sc_matrix.shape[0]}"
             )
+        return {'sc': sc_matrix, 'windows': bold_windows}
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        start_idx = sample['start_idx']
+
+        entry = None
+        if self.cache_subjects:
+            entry = self._subject_cache.get(sample['subj_id'])
+        if entry is None:
+            entry = self._load_subject(sample['subj_id'], sample['sc_path'], sample['window_paths'])
+            if self.cache_subjects:
+                self._subject_cache[sample['subj_id']] = entry
+
+        sc_matrix = entry['sc']
+        bold_windows = entry['windows']
 
         x_bold = bold_windows[start_idx: start_idx + self.in_window].transpose(1, 0, 2)  # [F, in_W, S]
         y_bold = bold_windows[
@@ -286,10 +328,11 @@ class NeuroTwinDataLoader:
         data_root,
         mode: str = 'pretrain',
         batch_size: int = 8,
+        eval_batch_size: Optional[int] = None,
         in_window: int = 6,
         pred_window: int = 3,
         pathology_input_dim: int = 1,
-        clinical_file: str = 'Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx',
+        clinical_file: str = 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
         total_windows: int = 9,
         seq_len: int = 30,
         num_workers: int = 4,
@@ -299,12 +342,14 @@ class NeuroTwinDataLoader:
         test_ratio: float = 0.1,
         stratify_bins: int = 5,
         cache_in_memory: Optional[bool] = None,
+        cache_subjects: bool = False,
         persistent_workers: bool = True,
         prefetch_factor: int = 2,
         split_by_subject: bool = True,
     ):
         self.seed = seed
         self.batch_size = batch_size
+        self.eval_batch_size = eval_batch_size if eval_batch_size else batch_size * 4
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
@@ -325,6 +370,7 @@ class NeuroTwinDataLoader:
             total_windows=total_windows,
             seq_len=seq_len,
             cache_in_memory=cache_in_memory,
+            cache_subjects=cache_subjects,
         )
 
         if self.split_by_subject:
@@ -608,10 +654,10 @@ class NeuroTwinDataLoader:
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
 
-    def _make_loader(self, dataset: Dataset, shuffle: bool):
+    def _make_loader(self, dataset: Dataset, shuffle: bool, batch_size: Optional[int] = None):
         kwargs = dict(
             dataset=dataset,
-            batch_size=self.batch_size,
+            batch_size=batch_size if batch_size is not None else self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
@@ -627,7 +673,10 @@ class NeuroTwinDataLoader:
         return self._make_loader(self.train_dataset, shuffle=True)
 
     def get_val(self):
-        return self._make_loader(self.val_dataset, shuffle=False)
+        # 评估无反传，显存压力小，可用更大 batch 减少调度与 collate 次数
+        return self._make_loader(self.val_dataset, shuffle=False,
+                                 batch_size=self.eval_batch_size)
 
     def get_test(self):
-        return self._make_loader(self.test_dataset, shuffle=False)
+        return self._make_loader(self.test_dataset, shuffle=False,
+                                 batch_size=self.eval_batch_size)

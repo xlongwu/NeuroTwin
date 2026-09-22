@@ -20,10 +20,25 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model):
-        for k, v in self.ema.state_dict().items():
-            src = model.state_dict()[k].detach()
-            v.mul_(self.decay).add_(src, alpha=1.0 - self.decay) \
-                if v.dtype.is_floating_point else v.copy_(src)
+        # torch.compile 包装后 state_dict 键带 '_orig_mod.' 前缀，取内层原模型对齐 EMA 键
+        inner = getattr(model, '_orig_mod', model)
+        msd = inner.state_dict()
+        ema_sd = self.ema.state_dict()
+        # _foreach_ 批量融合：避免逐键 mul_/add_ 产生数百次小 kernel launch
+        float_dst, float_src, other_dst, other_src = [], [], [], []
+        for k, v in ema_sd.items():
+            src = msd[k].detach()
+            if v.dtype.is_floating_point:
+                float_dst.append(v)
+                float_src.append(src)
+            else:
+                other_dst.append(v)
+                other_src.append(src)
+        if float_dst:
+            torch._foreach_mul_(float_dst, self.decay)
+            torch._foreach_add_(float_dst, float_src, alpha=1.0 - self.decay)
+        if other_dst:
+            torch._foreach_copy_(other_dst, other_src)
 
 
 def load_backbone_weights(model, pretrained_path, device):

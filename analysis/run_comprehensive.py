@@ -36,22 +36,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str, default='auto')
     
     # 路径参数
-    parser.add_argument('--data_root', type=str, default='/data3/Digital_Brain/AMD/data')
+    parser.add_argument('--data_root', type=str, default=str(ROOT / 'data'))
     parser.add_argument('--finetuned_weight', type=str,
-                        default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/finetuned_best.pt')
+                        default=str(ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'finetuned_best.pt'))
     parser.add_argument('--output_dir', type=str,
-                        default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/analysis_results')
+                        default=str(ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'analysis_results'))
     parser.add_argument('--run_name', type=str,
                         default='comprehensive_analysis')
     parser.add_argument('--clinical_file', type=str,
-                        default='Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx')
+                        default='Rest-meta-MDD-V1V2-Merged-MDD.xlsx')
     
     # HAMD分析参数
     parser.add_argument('--hamd_normalized_file', type=str,
-                       default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx',
+                       default=str(ROOT / 'data' / 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx'),
                        help='归一化HAMD文件路径（用于匹配样本）')
     parser.add_argument('--hamd_original_file', type=str,
-                       default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-HAMD-V1-V2-Merge.xlsx',
+                       default=str(ROOT / 'data' / 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx'),
                        help='原始HAMD文件路径（用于可视化）')
     parser.add_argument('--expert_assignment_method', type=str, default='top1',
                        choices=['top1', 'threshold'],

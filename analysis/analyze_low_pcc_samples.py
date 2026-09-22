@@ -16,6 +16,9 @@ from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
+# 项目根目录（脚本位于 <root>/analysis/，路径均基于项目内）
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['Times New Roman']
 plt.rcParams['axes.unicode_minus'] = False
@@ -23,12 +26,13 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def parse_args():
     p = argparse.ArgumentParser(description='低 PCC 样本临床特征分析')
-    p.add_argument('--analysis_dir', type=str, default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/interpretability/comprehensive_analysis_20260422_230827',
+    p.add_argument('--analysis_dir', type=str,
+                   default=str(PROJECT_ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'interpretability' / 'comprehensive_analysis_20260422_230827'),
                    help='run_comprehensive 输出目录（含 sample_metrics.json）')
     p.add_argument('--output_dir', type=str, default=None,
                    help='结果输出目录，默认 <analysis_dir>/low_pcc_analysis')
-    p.add_argument('--v1_file', type=str, default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-V1-MDD.xlsx')
-    p.add_argument('--v2_file', type=str, default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-V2-MDD.xlsx')
+    p.add_argument('--v1_file', type=str, default=str(PROJECT_ROOT / 'data' / 'Rest-meta-MDD-V1-MDD.xlsx'))
+    p.add_argument('--v2_file', type=str, default=str(PROJECT_ROOT / 'data' / 'Rest-meta-MDD-V2-MDD.xlsx'))
     return p.parse_args()
 
 

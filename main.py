@@ -45,7 +45,8 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 @torch.no_grad()
 def evaluate(model, data_loader, criterion, device, args):
     model.eval()
-    meters = defaultdict(float)
+    meters = defaultdict(list)      # tensor 累积，epoch 末一次性同步，避免每 step .item() 造成 GPU/CPU 串行
+    live = defaultdict(float)       # 进度条所需的少数关键指标
     pbar = tqdm(data_loader, total=len(data_loader), dynamic_ncols=True, leave=False)
     pbar.set_description('[Val]')
 
@@ -70,18 +71,26 @@ def evaluate(model, data_loader, criterion, device, args):
         for k, v in {**loss_stats, **moe_stats,
                      'metric_mae': mae.detach(),
                      'metric_total': total_loss.detach()}.items():
-            meters[k] += float(v.item())
-        pbar.set_postfix({'PCC_Loss': f"{meters['loss_pcc']/step:.4f}",
-                          'PCC': f"{meters['pcc']/step:.4f}",
-                          'MAE': f"{meters['metric_mae']/step:.4f}"})
+            meters[k].append(v.detach())
+        live['loss_pcc'] += float(loss_stats['loss_pcc'].item())
+        live['pcc']      += float(loss_stats['pcc'].item())
+        live['metric_mae'] += float(mae.item())
+        pbar.set_postfix({'PCC_Loss': f"{live['loss_pcc']/step:.4f}",
+                          'PCC': f"{live['pcc']/step:.4f}",
+                          'MAE': f"{live['metric_mae']/step:.4f}"})
 
-    return {k: v / max(1, len(data_loader)) for k, v in meters.items()}
+    return {k: torch.stack(vs).mean().item() for k, vs in meters.items()}
 
 
 def main(args):
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     amp_enabled = (device.type == 'cuda' and args.amp)
     torch.set_num_threads(args.num_threads)
+    if device.type == 'cuda' and args.tf32:
+        # 输入形状固定，启用 cudnn 自动调优；TF32 加速 autocast 覆盖不到的 fp32 matmul
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     set_seed(args.seed)
 
     print('=' * 50)
@@ -111,6 +120,7 @@ def main(args):
         stratify_bins=args.stratify_bins,
         cache_in_memory=args.cache_in_memory, persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
+        eval_batch_size=args.eval_batch_size, cache_subjects=args.cache_subjects,
     )
     train_data, val_data = dl.get_train(), dl.get_val()
 
@@ -153,6 +163,10 @@ def main(args):
     scheduler = build_scheduler(optimizer, args)
     scaler    = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     ema       = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
+    if args.compile and hasattr(torch, 'compile'):
+        # 在 EMA 深拷贝之后包装，避免 OptimizedModule 进入 EMA；训练前向被融合编译
+        model = torch.compile(model)
+        print('torch.compile 已启用（实验性）')
 
     best_pcc_loss    = float('inf')
     patience_counter = 0
@@ -188,7 +202,8 @@ def main(args):
                   f"可训练参数量 = {count_trainable_params(model)}")
 
         model.train()
-        train_meters = defaultdict(float)
+        train_meters = defaultdict(list)    # tensor 累积，epoch 末一次性同步
+        live = defaultdict(float)           # 进度条所需的少数关键指标
         pbar = tqdm(train_data, total=len(train_data), dynamic_ncols=True, leave=False)
         pbar.set_description(f"Epoch {epoch+1:03d}/{args.train_epochs:03d} [Train]")
 
@@ -226,19 +241,21 @@ def main(args):
             if ema is not None: ema.update(model)
 
             for k, v in {**loss_stats, **moe_stats, 'metric_total': total_loss.detach()}.items():
-                train_meters[k] += float(v.item())
+                train_meters[k].append(v.detach())
+            live['metric_total'] += float(total_loss.item())
+            live['loss_pcc']     += float(loss_stats['loss_pcc'].item())
+            live['pcc']          += float(loss_stats['pcc'].item())
             pbar.set_postfix({
-                'Loss': f"{train_meters['metric_total']/step:.4f}",
-                'PCC_Loss': f"{train_meters['loss_pcc']/step:.4f}",
-                'PCC': f"{train_meters['pcc']/step:.4f}",
+                'Loss': f"{live['metric_total']/step:.4f}",
+                'PCC_Loss': f"{live['loss_pcc']/step:.4f}",
+                'PCC': f"{live['pcc']/step:.4f}",
             })
 
         eval_model  = ema.ema if ema is not None else model
         val_metrics = evaluate(eval_model, val_data, criterion, device, args)
         scheduler.step()
 
-        n            = max(1, len(train_data))
-        train_metrics = {k: v / n for k, v in train_meters.items()}
+        train_metrics = {k: torch.stack(vs).mean().item() for k, vs in train_meters.items()}
         group_lrs    = {g.get('name', f'g{i}'): g['lr']
                         for i, g in enumerate(optimizer.param_groups)}
         lr_text = ' | '.join(f"{k}: {v:.2e}" for k, v in group_lrs.items())
@@ -341,7 +358,7 @@ def parse_args():
     p.add_argument('--data_root', default='./data')
     p.add_argument('--checkpoint_dir', default='./checkpoints')
     p.add_argument('--name', default='neurotwin')
-    p.add_argument('--clinical_file', default='Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx')
+    p.add_argument('--clinical_file', default='Rest-meta-MDD-V1V2-Merged-MDD.xlsx')
     p.add_argument('--num_rois', type=int, default=116)
     p.add_argument('--seq_len', type=int, default=30)
     p.add_argument('--in_window', type=int, default=6)
@@ -414,6 +431,14 @@ def parse_args():
     p.add_argument('--pin_memory', type=str2bool, default=True)
     p.add_argument('--persistent_workers', type=str2bool, default=True)
     p.add_argument('--prefetch_factor', type=int, default=2)
+    p.add_argument('--eval_batch_size', type=int, default=None,
+                   help='验证/测试 DataLoader 的 batch 大小，默认为 batch_size×4')
+    p.add_argument('--tf32', type=str2bool, default=True,
+                   help='启用 cudnn.benchmark 与 TF32（对 autocast 未覆盖的 fp32 计算加速）')
+    p.add_argument('--cache_subjects', type=str2bool, default=False,
+                   help='按被试缓存加载数据（实测负优化：page cache 下无收益且增加内存，保留开关备用）')
+    p.add_argument('--compile', type=str2bool, default=False,
+                   help='torch.compile 编译模型前向（实验性；首次编译有额外耗时）')
 
     return p.parse_args()
 

@@ -36,6 +36,7 @@ logs/
 analysis_results/
 interpretability/
 low_pcc_analysis/
+datasets/
 
 # ===== IDE / 编辑器 =====
 .trae/
