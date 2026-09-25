@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from models.neurotwin import NeuroTwin
+from utils.common import parse_pred_quantiles
 from utils.dataloader import NeuroTwinDataLoader
 
 log = logging.getLogger(__name__)
@@ -19,7 +20,21 @@ def load_checkpoint_compat(
 ) -> Tuple[torch.nn.Module, Dict[str, List[str]]]:
     """兼容加载 checkpoint"""
     raw = torch.load(ckpt_path, map_location=device)
-    state_dict: dict = raw.get('model', raw) if isinstance(raw, dict) and 'model' in raw else raw
+    # 兼容三种格式：train.optim.save_backbone_weights / main.py 保存的
+    # {'state_dict', 'arch_version', 'config'}、旧格式 {'model': state_dict}、裸 state_dict。
+    # 取错层级时（例如把整份元数据 dict 当 state_dict）load_state_dict 会把全部权重
+    # 记为 missing，strict=False 下静默跳过、模型停在随机初始化——必须显式报错，
+    # 不允许用兜底掩盖权重未加载。
+    if isinstance(raw, dict) and isinstance(raw.get('state_dict'), dict):
+        state_dict = raw['state_dict']
+    elif isinstance(raw, dict) and isinstance(raw.get('model'), dict):
+        state_dict = raw['model']
+    else:
+        state_dict = raw
+    if not isinstance(state_dict, dict) or not any('.' in str(k) for k in state_dict):
+        raise ValueError(
+            f'无法从 {ckpt_path} 解析出参数 state_dict；'
+            f'顶层键={list(raw) if isinstance(raw, dict) else type(raw)}')
     
     # 检测版本
     keys = set(state_dict.keys())
@@ -44,7 +59,16 @@ def load_checkpoint_compat(
 
 
 def build_model_and_loader(args, device: torch.device):
-    """构建模型和数据加载器"""
+    """构建模型与评估用 DataLoader。
+
+    评估划分由 ``args.eval_split`` 选择（``val`` / ``test``，均为被试级 8:1:1 内部划分）。
+    划分参数（seed / val_ratio / test_ratio / stratify_bins）**必须与训练时一致**，
+    否则 ``test`` 不再是训练时留出的那批被试。
+    """
+    eval_split = getattr(args, 'eval_split', 'val')
+    if eval_split not in ('val', 'test'):
+        raise ValueError(f"eval_split 仅支持 val/test，收到 '{eval_split}'")
+
     data_loader = NeuroTwinDataLoader(
         data_root=args.data_root,
         mode='finetune',
@@ -59,12 +83,20 @@ def build_model_and_loader(args, device: torch.device):
         pin_memory=args.pin_memory,
         seed=args.seed,
         val_ratio=args.val_ratio,
+        test_ratio=getattr(args, 'test_ratio', 0.1),
         stratify_bins=args.stratify_bins,
         cache_in_memory=args.cache_in_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    val_data = data_loader.get_val()
+    if eval_split == 'test':
+        eval_data = data_loader.get_test()
+        eval_subjects = data_loader.get_test_subjects()
+    else:
+        eval_data = data_loader.get_val()
+        eval_subjects = data_loader.get_val_subjects()
+    log.info(f'评估划分: [{eval_split}] | 被试数={len(eval_subjects)} | '
+             f'样本数={len(eval_data.dataset)}')
     
     model = NeuroTwin(
         features=args.num_rois,
@@ -91,6 +123,9 @@ def build_model_and_loader(args, device: torch.device):
         moe_router_cond_only=args.moe_router_cond_only,
         moe_use_argmax=args.moe_use_argmax,
         moe_inference_temperature=args.moe_inference_temperature,
+        # 预测头需与训练时一致，否则概率头会以随机初始化权重参与校准指标计算
+        pred_head=args.pred_head,
+        pred_quantiles=parse_pred_quantiles(args.pred_quantiles),
     ).to(device)
     
     model, compat_info = load_checkpoint_compat(
@@ -99,4 +134,6 @@ def build_model_and_loader(args, device: torch.device):
         device=device,
         strict=args.strict_load,
     )
+
+    return model, eval_data, compat_info
     

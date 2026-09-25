@@ -79,9 +79,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--top_k', type=int, default=2)
     parser.add_argument('--moe_expert_hidden_dim', type=int, default=256)
     parser.add_argument('--moe_use_shared_expert', type=str2bool, default=True)
-    parser.add_argument('--moe_router_cond_only', type=str2bool, default=True)
+    # 注意：默认值必须与训练脚本一致。moe_router_cond_only 会改变路由器输入维度
+    # （False 时输入为 hidden_states+cond_dim），若与训练相反则 router 权重形状不匹配，
+    # strict_load=False 下会被静默跳过，评估结果不可用。
+    parser.add_argument('--moe_router_cond_only', type=str2bool, default=False)
     parser.add_argument('--moe_use_argmax', type=str2bool, default=False)
     parser.add_argument('--moe_inference_temperature', type=float, default=0.3)
+
+    # 预测头（Phase 7.1）：必须与训练时一致，否则概率头权重无法从 checkpoint 加载
+    parser.add_argument('--pred_head', type=str, default='gaussian',
+                       choices=['point', 'gaussian', 'quantile'],
+                       help='预测头类型，需与训练配置一致（默认 gaussian）')
+    parser.add_argument('--pred_quantiles', type=str, default='0.1,0.5,0.9',
+                       help='--pred_head quantile 时的分位点列表（逗号分隔）')
     
     # 加载参数
     parser.add_argument('--strict_load', type=str2bool, default=False)
@@ -93,8 +103,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--persistent_workers', type=str2bool, default=True)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--cache_in_memory', type=str2bool, default=False)
-    parser.add_argument('--val_ratio', type=float, default=0.2)
+    # 划分参数必须与训练脚本一致（scripts/Finetune_MDD.sh / Pretrain_HC.sh 为
+    # seed=2024 / val_ratio=0.10 / test_ratio=0.10 / stratify_bins=5），否则被评估的
+    # val/test 划分与训练时留出的那批被试不是同一批，test 就不能称为独立测试集。
+    parser.add_argument('--val_ratio', type=float, default=0.10)
+    parser.add_argument('--test_ratio', type=float, default=0.10)
     parser.add_argument('--stratify_bins', type=int, default=5)
+    parser.add_argument('--eval_split', type=str, default='val',
+                        choices=['val', 'test'],
+                        help='在哪个划分上评估：val（默认）或 test（独立测试集，8:1:1 留出）')
     
     # 损失权重
     parser.add_argument('--moe_load_balance_weight', type=float, default=0.01)
@@ -126,9 +143,12 @@ def main():
     
     log.info(f'Device: {device}')
     log.info(f'Checkpoint: {args.finetuned_weight}')
+    log.info(f'Eval split: [{args.eval_split}] | seed={args.seed} '
+             f'val_ratio={args.val_ratio} test_ratio={args.test_ratio} '
+             f'stratify_bins={args.stratify_bins}')
     
     # 构建模型和数据加载器
-    model, val_data, compat_info = build_model_and_loader(args, device)
+    model, eval_data, compat_info = build_model_and_loader(args, device)
     criterion = UncertaintyWeightedHybridLoss().to(device)
     
     # 创建输出目录
@@ -147,7 +167,7 @@ def main():
     # ═══════════════════════════════════════════════════════════════════════
     
     metrics, artifacts = analyzer.evaluate(
-        val_data, criterion,
+        eval_data, criterion,
         moe_load_balance_weight=args.moe_load_balance_weight,
         moe_entropy_weight=args.moe_entropy_weight,
         moe_z_loss_weight=args.moe_z_loss_weight,
@@ -157,6 +177,8 @@ def main():
     metrics['ckpt_version'] = 'standard'
     metrics['ckpt_missing_count'] = len(compat_info['missing'])
     metrics['ckpt_unexpected_count'] = len(compat_info['unexpected'])
+    # 记录评估划分，便于区分 val / 独立 test 的结果文件
+    metrics['eval_split'] = args.eval_split
     
     # 保存指标
     save_json(save_dir / 'metrics.json', metrics)
@@ -237,7 +259,7 @@ def main():
     # ═══════════════════════════════════════════════════════════════════════
     if args.compute_feature_importance:
         importance = analyzer.compute_feature_importance(
-            val_data, 
+            eval_data, 
             n_samples=args.feature_importance_samples,
             n_permutations=args.feature_importance_permutations,
             method=args.feature_importance_method

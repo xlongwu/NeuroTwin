@@ -213,6 +213,22 @@ python analysis/run_comprehensive.py \
     --output_dir ./checkpoints/analysis_results
 ```
 
+默认在 `val` 划分上评估。要求独立测试集（8:1:1 中被试级留出、训练全程未参与选权重）时加
+`--eval_split test`，并把划分参数显式写成与训练脚本一致的值，否则被评估的 test 划分与训练时
+留出的那批被试不是同一批：
+
+```bash
+python analysis/run_comprehensive.py \
+    --finetuned_weight checkpoints/neurotwin_finetune_pred1/finetuned_best.pt \
+    --output_dir ./checkpoints/analysis_results \
+    --run_name test_holdout \
+    --eval_split test \
+    --seed 2024 --val_ratio 0.10 --test_ratio 0.10 --stratify_bins 5
+```
+
+`metrics.json` 中的 `eval_split` 字段记录本次评估用的划分；`ckpt_missing_count` /
+`ckpt_unexpected_count` 应均为 0，否则说明权重未完整加载，指标不可用。
+
 配套脚本：
 
 | 脚本 | 用途 |

@@ -35,6 +35,8 @@ class NeuroTwinDataset(Dataset):
         in_window: int = 6,
         pred_window: int = 3,
         pathology_input_dim: int = 1,
+        pathology_fields: Optional[List[str]] = None,
+        pathology_missing: str = 'drop',
         clinical_file: str = 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
         total_windows: int = 9,
         seq_len: int = 30,
@@ -42,41 +44,73 @@ class NeuroTwinDataset(Dataset):
         # 实测（R1/R2 对照）：page cache 下 loadmat 重复读并非瓶颈，被试级缓存
         # 无稳态收益且增加 worker 内存（×num_workers）与启动成本，故默认关闭
         cache_subjects: bool = False,
+        # 可变截断：允许未来窗不足 pred_window 的样本入训，提升每被试样本数
+        # （pred_window=3 且 total_windows=9 / in_window=6 时固定截断仅 1 样本/被试）。
+        # 不足部分在 y 中以零占位，并由 pred_mask 标记为无效窗口，损失端按掩码加权。
+        variable_cutoff: bool = False,
     ):
         self.data_root = Path(data_root)
         self.mode = mode
         self.in_window = in_window
         self.pred_window = pred_window
         self.pathology_input_dim = pathology_input_dim
+        # 病理条件字段（默认仅 HAMD 总分；条目级缺失率高，向量路径需显式开启）
+        self.pathology_fields = list(pathology_fields) if pathology_fields else ['HAMD']
+        if pathology_missing not in ('drop', 'zero', 'mean'):
+            raise ValueError(
+                f"pathology_missing 仅支持 drop/zero/mean，收到 '{pathology_missing}'")
+        self.pathology_missing = pathology_missing
         self.total_windows = total_windows
         self.seq_len = seq_len
         self.cache_in_memory = cache_in_memory
         # 被试级缓存：同一被试的 Mask/9 窗只加载与归一化一次，
         # 消除滑窗样本间约 2/3~90% 的重复读盘（多 worker 下每进程各持一份）
         self.cache_subjects = cache_subjects
+        self.variable_cutoff = bool(variable_cutoff)
         self._subject_cache: Dict[str, Dict[str, np.ndarray]] = {}
         self._mat_cache: Dict[str, np.ndarray] = {}
 
-        if self.in_window + self.pred_window > self.total_windows:
+        # 可变截断下至少保留 1 个未来窗即可成样本，因此约束放宽到 in_window + 1
+        min_pred = 1 if self.variable_cutoff else self.pred_window
+        if self.in_window + min_pred > self.total_windows:
             raise ValueError(
                 f"in_window + pred_window must be <= {self.total_windows}, got {self.in_window} + {self.pred_window}"
             )
 
-        self.clinical_dict: Dict[str, float] = {}
+        if self.mode == 'finetune' and self.pathology_input_dim != len(self.pathology_fields):
+            raise ValueError(
+                f"pathology_input_dim={self.pathology_input_dim} 与 pathology_fields="
+                f"{self.pathology_fields}（宽度 {len(self.pathology_fields)}）不一致。")
+
+        self.clinical_dict: Dict[str, np.ndarray] = {}
         if self.mode == 'finetune':
             clinical_path = self.data_root / clinical_file
             if not clinical_path.exists():
                 raise FileNotFoundError(f"未找到临床评分文件：{clinical_path}")
 
             df = pd.read_excel(clinical_path)
-            required_cols = {'ID', 'HAMD'}
+            required_cols = {'ID', *self.pathology_fields}
             if not required_cols.issubset(df.columns):
                 raise ValueError(f"clinical file must contain columns {required_cols}, got {set(df.columns)}")
 
-            df = df[['ID', 'HAMD']].dropna()
+            df = df[['ID', *self.pathology_fields]].copy()
             df['ID'] = df['ID'].astype(str).str.strip()
-            self.clinical_dict = {k: float(v) for k, v in zip(df['ID'], df['HAMD'])}
-            print(f"成功加载临床评分表，共包含 {len(self.clinical_dict)} 个被试的 HAMD 数据。")
+            value_cols = self.pathology_fields
+            if self.pathology_missing == 'drop':
+                df = df.dropna(subset=value_cols)
+            elif self.pathology_missing == 'mean':
+                df[value_cols] = df[value_cols].fillna(df[value_cols].mean(numeric_only=True))
+                df = df.dropna(subset=value_cols)
+            else:  # zero
+                df[value_cols] = df[value_cols].fillna(0.0)
+            values = df[value_cols].to_numpy(dtype=np.float32)
+            self.clinical_dict = {
+                k: v for k, v in zip(df['ID'].tolist(), list(values))
+            }
+            print(
+                f"成功加载临床评分表，共包含 {len(self.clinical_dict)} 个被试的 "
+                f"{'/'.join(value_cols)} 数据（缺失策略: {self.pathology_missing}）。"
+            )
 
         group_folder = 'HC' if mode == 'pretrain' else 'MDD'
         self.window_dir = self.data_root / 'ROISignals_window' / group_folder
@@ -97,7 +131,8 @@ class NeuroTwinDataset(Dataset):
         subject_to_indices: Dict[str, List[int]] = defaultdict(list)
         valid_subjects: List[str] = []
 
-        max_start = self.total_windows - self.in_window - self.pred_window + 1
+        min_pred = 1 if self.variable_cutoff else self.pred_window
+        max_start = self.total_windows - self.in_window - min_pred + 1
         if max_start <= 0:
             raise ValueError(
                 f"无法切出任何样本：total_windows={self.total_windows}, in_window={self.in_window}, pred_window={self.pred_window}"
@@ -120,7 +155,8 @@ class NeuroTwinDataset(Dataset):
 
             valid_subjects.append(subj_id)
             if self.mode == 'finetune':
-                self.subject_to_score[subj_id] = float(self.clinical_dict[subj_id])
+                # 分层划分使用首个字段（默认 HAMD 总分）作为标量分层依据
+                self.subject_to_score[subj_id] = float(self.clinical_dict[subj_id][0])
 
             for start_idx in range(max_start):
                 sample = {
@@ -128,9 +164,13 @@ class NeuroTwinDataset(Dataset):
                     'sc_path': sc_file,
                     'window_paths': window_files,
                     'start_idx': start_idx,
+                    # 该起点实际可用的未来窗数（<= pred_window）；固定截断时恒为 pred_window
+                    'pred_len': min(self.pred_window,
+                                    self.total_windows - start_idx - self.in_window),
                 }
                 if self.mode == 'finetune':
-                    sample['pathology_score'] = float(self.clinical_dict[subj_id])
+                    sample['pathology_score'] = np.asarray(
+                        self.clinical_dict[subj_id], dtype=np.float32)
                 sample_idx = len(self.samples)
                 self.samples.append(sample)
                 subject_to_indices[subj_id].append(sample_idx)
@@ -140,6 +180,7 @@ class NeuroTwinDataset(Dataset):
 
         print(
             f"构建完毕 | 模式: {self.mode} | 有效被试数: {len(self.subject_ids)} | 样本数: {len(self.samples)}"
+            f" | variable_cutoff: {self.variable_cutoff}"
         )
 
     def get_subject_ids(self) -> List[str]:
@@ -149,15 +190,24 @@ class NeuroTwinDataset(Dataset):
         return list(self.subject_to_indices.get(subj_id, []))
 
     def get_pathology_scalar_by_index(self, idx: int) -> Optional[float]:
+        """返回首个病理字段的标量值（默认 HAMD 总分），仅供分层/统计使用。"""
         if self.mode != 'finetune':
             return None
-        return float(self.samples[idx]['pathology_score'])
+        return float(np.asarray(self.samples[idx]['pathology_score']).reshape(-1)[0])
 
     def get_pathology_scalar_by_subject(self, subj_id: str) -> Optional[float]:
+        """返回首个病理字段的标量值（默认 HAMD 总分），仅供分层/统计使用。"""
         if self.mode != 'finetune':
             return None
         score = self.subject_to_score.get(str(subj_id), None)
         return None if score is None else float(score)
+
+    def get_pathology_vector_by_subject(self, subj_id: str) -> Optional[np.ndarray]:
+        """返回完整病理条件向量 [D]（默认 [HAMD]）。"""
+        if self.mode != 'finetune':
+            return None
+        vec = self.clinical_dict.get(str(subj_id), None)
+        return None if vec is None else np.asarray(vec, dtype=np.float32)
 
     def __len__(self):
         return len(self.samples)
@@ -273,9 +323,18 @@ class NeuroTwinDataset(Dataset):
         bold_windows = entry['windows']
 
         x_bold = bold_windows[start_idx: start_idx + self.in_window].transpose(1, 0, 2)  # [F, in_W, S]
+        # 可变截断下未来窗可能不足 pred_window：不足部分补零占位，
+        # 并由 pred_mask 标记无效窗口，损失端按掩码加权（零值不会被监督）
+        pred_len = int(sample.get('pred_len', self.pred_window))
+        pred_len = max(1, min(pred_len, self.pred_window))
         y_bold = bold_windows[
-            start_idx + self.in_window: start_idx + self.in_window + self.pred_window
-        ].transpose(1, 0, 2)  # [F, pred_W, S]
+            start_idx + self.in_window: start_idx + self.in_window + pred_len
+        ].transpose(1, 0, 2)  # [F, pred_len, S]
+        if pred_len < self.pred_window:
+            pad = np.zeros(
+                (y_bold.shape[0], self.pred_window - pred_len, y_bold.shape[2]),
+                dtype=y_bold.dtype)
+            y_bold = np.concatenate([y_bold, pad], axis=1)
 
         out = {
             'x': torch.tensor(x_bold, dtype=torch.float32),
@@ -283,8 +342,13 @@ class NeuroTwinDataset(Dataset):
             'sc': torch.tensor(sc_matrix, dtype=torch.float32),
             'subj_id': sample['subj_id'],
         }
+        if self.variable_cutoff:
+            mask = np.zeros(self.pred_window, dtype=np.float32)
+            mask[:pred_len] = 1.0
+            out['pred_mask'] = torch.from_numpy(mask)
         if self.mode == 'finetune':
-            out['pathology_score'] = torch.tensor([sample['pathology_score']], dtype=torch.float32)
+            out['pathology_score'] = torch.tensor(
+                np.asarray(sample['pathology_score'], dtype=np.float32))
         return out
 
 
@@ -332,6 +396,8 @@ class NeuroTwinDataLoader:
         in_window: int = 6,
         pred_window: int = 3,
         pathology_input_dim: int = 1,
+        pathology_fields: Optional[List[str]] = None,
+        pathology_missing: str = 'drop',
         clinical_file: str = 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
         total_windows: int = 9,
         seq_len: int = 30,
@@ -346,6 +412,7 @@ class NeuroTwinDataLoader:
         persistent_workers: bool = True,
         prefetch_factor: int = 2,
         split_by_subject: bool = True,
+        variable_cutoff: bool = False,
     ):
         self.seed = seed
         self.batch_size = batch_size
@@ -366,11 +433,14 @@ class NeuroTwinDataLoader:
             in_window=in_window,
             pred_window=pred_window,
             pathology_input_dim=pathology_input_dim,
+            pathology_fields=pathology_fields,
+            pathology_missing=pathology_missing,
             clinical_file=clinical_file,
             total_windows=total_windows,
             seq_len=seq_len,
             cache_in_memory=cache_in_memory,
             cache_subjects=cache_subjects,
+            variable_cutoff=variable_cutoff,
         )
 
         if self.split_by_subject:
@@ -402,6 +472,11 @@ class NeuroTwinDataLoader:
         self.train_dataset = DatasetView(self.base_dataset, train_indices, augmentation=augmentation)
         self.val_dataset = DatasetView(self.base_dataset, val_indices, augmentation=None)
         self.test_dataset = DatasetView(self.base_dataset, test_indices, augmentation=None)
+
+        # 持久化被试划分结果：供归一化统计量拟合、分析脚本与实验记录复用
+        self.train_subjects: List[str] = sorted(train_subjects)
+        self.val_subjects: List[str] = sorted(val_subjects)
+        self.test_subjects: List[str] = sorted(test_subjects)
 
         overlap_subjects = sorted(set(train_subjects) & set(val_subjects))
         if overlap_subjects:
@@ -680,3 +755,33 @@ class NeuroTwinDataLoader:
     def get_test(self):
         return self._make_loader(self.test_dataset, shuffle=False,
                                  batch_size=self.eval_batch_size)
+
+    # ------------------------------------------------------------------
+    # 只读访问器：被试划分与病理条件（供归一化统计量拟合 / 分析脚本使用）
+    # ------------------------------------------------------------------
+    def get_train_subjects(self) -> List[str]:
+        return list(self.train_subjects)
+
+    def get_val_subjects(self) -> List[str]:
+        return list(self.val_subjects)
+
+    def get_test_subjects(self) -> List[str]:
+        return list(self.test_subjects)
+
+    def get_train_pathology_scores(self) -> Optional[np.ndarray]:
+        """训练集被试的病理条件矩阵 [N_train, D]；非 finetune 模式返回 None。
+
+        仅包含 train subjects，确保归一化统计量不泄露 val/test 信息。
+        """
+        if self.base_dataset.mode != 'finetune':
+            return None
+        rows = [
+            vec for vec in (
+                self.base_dataset.get_pathology_vector_by_subject(sid)
+                for sid in self.train_subjects
+            )
+            if vec is not None
+        ]
+        if not rows:
+            return None
+        return np.stack(rows, axis=0).astype(np.float32)

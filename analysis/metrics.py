@@ -233,6 +233,90 @@ def compute_temporal_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, 
     }
 
 
+def _gaussian_z(alpha: float) -> float:
+    """双侧正态分位数 z_{1-α/2}（用于把高斯 logvar 转成预测区间）。"""
+    try:
+        from scipy.stats import norm
+        return float(norm.ppf(1.0 - alpha / 2.0))
+    except Exception:  # scipy 缺失时退化为查表，避免 import 失败影响主流程
+        table = {0.05: 1.959963984540054, 0.1: 1.6448536269514722,
+                 0.2: 1.2815515655446004}
+        if alpha in table:
+            return table[alpha]
+        log.warning("scipy 不可用且 alpha=%s 未在查表中，回退 z=1.959963985（alpha=0.05）", alpha)
+        return 1.959963984540054
+
+
+def compute_calibration_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    pred_logvar: np.ndarray = None,
+    lower: np.ndarray = None,
+    upper: np.ndarray = None,
+    alpha: float = 0.1,
+) -> Dict[str, float]:
+    """概率预测的校准指标（Phase 7.1 概率头评估）。
+
+    Args:
+        pred: 点预测（高斯/分位头的均值或中位数），与 ``target`` 同形。
+        target: 真实值。
+        pred_logvar: 高斯头的对数方差（与 ``pred`` 同形）；与 ``lower/upper`` 二选一。
+        lower / upper: 分位头给出的预测区间端点（与 ``pred`` 同形）。
+        alpha: 目标未覆盖率，名义覆盖率 = 1 - alpha（默认 0.9）。
+
+    Returns:
+        字典，包含：
+
+        ================  ==========================================================
+        PICP              实际覆盖率（真实值落入区间的比例，越接近名义值越好）
+        MPIW              平均预测区间宽度（同一数值空间，越小越锐利）
+        PICP_target       名义覆盖率 1 - alpha
+        MPIW_norm         MPIW 除以目标标准差，跨被试/跨 ROI 可比
+        Gaussian_NLL      平均高斯负对数似然（仅 ``pred_logvar`` 可用时给出）
+        ================  ==========================================================
+
+        区间端点优先使用显式给出的 ``lower/upper``；否则由 ``pred_logvar`` 按
+        ``pred ± z·σ`` 构造。两者都缺失时返回仅含名义覆盖率的字典。
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if pred.shape != target.shape:
+        raise ValueError(f"pred 与 target 形状需一致，收到 {pred.shape} 与 {target.shape}")
+    metrics = {'PICP_target': float(1.0 - alpha)}
+
+    lv = None
+    if pred_logvar is not None:
+        lv = np.asarray(pred_logvar, dtype=np.float64)
+        if lv.shape != pred.shape:
+            raise ValueError(
+                f"pred_logvar 与 pred 形状需一致，收到 {lv.shape} 与 {pred.shape}")
+        metrics['Gaussian_NLL'] = float(
+            np.mean(0.5 * (lv + (target - pred) ** 2 * np.exp(-lv))))
+
+    if lower is None or upper is None:
+        if lv is None:
+            metrics.update({'PICP': float('nan'), 'MPIW': float('nan'),
+                            'MPIW_norm': float('nan')})
+            return metrics
+        z = _gaussian_z(float(alpha))
+        sigma = np.exp(0.5 * lv)
+        lower = pred - z * sigma
+        upper = pred + z * sigma
+    else:
+        lower = np.asarray(lower, dtype=np.float64)
+        upper = np.asarray(upper, dtype=np.float64)
+        if lower.shape != pred.shape or upper.shape != pred.shape:
+            raise ValueError(
+                "lower/upper 与 pred 形状需一致，收到 "
+                f"{lower.shape}/{upper.shape} 与 {pred.shape}")
+
+    width = upper - lower
+    metrics['PICP'] = float(np.mean((target >= lower) & (target <= upper)))
+    metrics['MPIW'] = float(np.mean(width))
+    metrics['MPIW_norm'] = float(np.mean(width) / (np.std(target) + 1e-12))
+    return metrics
+
+
 def fdr_correction(pvalues: np.ndarray, alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
     """
     Benjamini-Hochberg FDR 校正
