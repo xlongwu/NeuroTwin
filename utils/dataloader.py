@@ -1,5 +1,6 @@
 # coding=utf-8
 import copy
+import json
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -413,6 +414,7 @@ class NeuroTwinDataLoader:
         prefetch_factor: int = 2,
         split_by_subject: bool = True,
         variable_cutoff: bool = False,
+        refresh_split_manifest: bool = False,
     ):
         self.seed = seed
         self.batch_size = batch_size
@@ -423,6 +425,7 @@ class NeuroTwinDataLoader:
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
         self.loader_generator = torch.Generator().manual_seed(seed)
         self.split_by_subject = split_by_subject
+        self.refresh_split_manifest = refresh_split_manifest
 
         if cache_in_memory is None:
             cache_in_memory = (num_workers == 0)
@@ -555,7 +558,59 @@ class NeuroTwinDataLoader:
         return allocations
 
     def _split_subject_ids(self, mode: str, val_ratio: float, test_ratio: float, stratify_bins: int) -> Tuple[List[str], List[str], List[str]]:
-        """将受试者划分为训练集、验证集和测试集（8:1:1）"""
+        """将受试者划分为训练集、验证集和测试集（8:1:1）。
+
+        版本化固定：切分结果落盘到 ``<data_root>/subject_split_<mode>.json``
+        （含 seed/比例/分箱等配置指纹）。同配置的后续运行直接复用名单，
+        防止代码演化导致的切分漂移（跨实验 test 集一致性）；配置变化或
+        被试集合变化时默认报错，需显式 ``refresh_split_manifest=True`` 重新生成。
+        """
+        manifest_path = self._split_manifest_path(mode)
+        meta = {'mode': mode, 'seed': int(self.seed), 'val_ratio': float(val_ratio),
+                'test_ratio': float(test_ratio), 'stratify_bins': int(stratify_bins),
+                'n_subjects': len(self.base_dataset.get_subject_ids())}
+        if manifest_path is not None and manifest_path.exists() \
+                and not self.refresh_split_manifest:
+            try:
+                old = json.loads(manifest_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as e:
+                raise RuntimeError(
+                    f'切分 manifest 损坏（{manifest_path}）：{e}。'
+                    '删除该文件或传 refresh_split_manifest=True 重新生成。') from e
+            mismatch = {k: (old.get(k), v) for k, v in meta.items() if old.get(k) != v}
+            if mismatch:
+                raise RuntimeError(
+                    f'切分 manifest 配置与当前运行不一致（{manifest_path}）：{mismatch}。'
+                    '确认数据或配置变更后传 refresh_split_manifest=True 重新生成；'
+                    '若非有意变更，请回退当前运行的 seed/比例设置以复用固定切分。')
+            cur = set(self.base_dataset.get_subject_ids())
+            train, val, test = old.get('train'), old.get('val'), old.get('test')
+            if train and val and test and (set(train) | set(val) | set(test)) == cur:
+                print(f'[split] 复用版本化切分 manifest: {manifest_path}')
+                return sorted(train), sorted(val), sorted(test)
+            raise RuntimeError(
+                f'切分 manifest 与当前被试集合不一致（{manifest_path}），'
+                '数据目录可能已变化。删除该文件或传 refresh_split_manifest=True 重新生成。')
+
+        train, val, test = self._split_subject_ids_impl(mode, val_ratio, test_ratio,
+                                                        stratify_bins)
+        if manifest_path is not None:
+            manifest_path.write_text(
+                json.dumps({**meta, 'train': train, 'val': val, 'test': test},
+                           ensure_ascii=False, indent=2),
+                encoding='utf-8')
+            print(f'[split] 版本化切分已写入: {manifest_path} '
+                  f'(train/val/test = {len(train)}/{len(val)}/{len(test)})')
+        return train, val, test
+
+    def _split_manifest_path(self, mode: str):
+        root = getattr(self.base_dataset, 'data_root', None)
+        if not root:
+            return None
+        return Path(str(root)) / f'subject_split_{mode}.json'
+
+    def _split_subject_ids_impl(self, mode: str, val_ratio: float, test_ratio: float,
+                                stratify_bins: int) -> Tuple[List[str], List[str], List[str]]:
         subject_ids = self.base_dataset.get_subject_ids()
         rng = random.Random(self.seed)
 

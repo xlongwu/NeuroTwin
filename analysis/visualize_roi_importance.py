@@ -48,9 +48,8 @@ NETWORK_COLORS = {
 
 def parse_args():
     p = argparse.ArgumentParser(description='ROI 重要性可视化（结合 AAL116 图谱）')
-    p.add_argument('--input_json', type=str,
-                   default=str(PROJECT_ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'interpretability' / 'comprehensive_analysis_20260422_230827' / 'feature_importance.json'),
-                   help='run_comprehensive 输出的 feature_importance.json')
+    p.add_argument('--input_json', type=str, required=True,
+                   help='evaluate_variant.py --feature_importance 输出的 feature_importance_<split>.json')
     p.add_argument('--aal_file', type=str, default=str(PROJECT_ROOT / 'data' / 'AAL116.xlsx'),
                    help='AAL116 脑区图谱 xlsx')
     p.add_argument('--output_dir', type=str, default=None,

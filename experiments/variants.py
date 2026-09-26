@@ -117,11 +117,32 @@ VARIANTS = [
        {'moe_gate_features': 'state_revin_difficulty'},
        eval_note='gate 统计；top1 分配分布'),
 
+    # ---- 1.4 路由坍缩对策（2026-09-26，P0 报告建议；基于 multinomial 修复后的新基线） ----
+    _v('moe_exp2_t1', 'G14_MOE', '1.4', 'P0',
+       '专家数 4→2、top_k 2→1（对齐实际有效容量 + 硬单选路由）',
+       {'num_experts': 2, 'top_k': 1},
+       eval_note='gate 统计；top1 分配分布；normalized entropy'),
+    _v('moe_argmax', 'G14_MOE', '1.4', 'P0',
+       '训练期硬确定性路由（use_argmax，容量感知 argmax 取代概率采样）',
+       {'moe_use_argmax': True},
+       eval_note='gate 统计；条件敏感性对照（multinomial 修复的消融）'),
+    _v('moe_temp_low', 'G14_MOE', '1.4', 'P0',
+       '路由温度下调（gate_temp 1.5→1.0 起、1.0→0.5 终），锐化概率分布配合 multinomial 采样',
+       {'moe_gate_temp_start': 1.0, 'moe_gate_temp_end': 0.5},
+       eval_note='gate 统计；路由熵；top1 集中度'),
+
     # ---- 1.5 预测头分支 ----
     _v('head_flatten', 'G15_HEAD', '1.5', 'P0',
        '形状分支退化为 flatten 展平（关闭 FutureQueryDecoder）',
        {'head_shape_mode': 'flatten'}, requires_pretrain=True,
        eval_note=''),
+    # ---- 1.5 head_flatten 预训练混淆对照（2026-09-26，P0 报告建议） ----
+    _v('head_shape_scratch', 'G15_HEAD', '1.5', 'P0',
+       'baseline 结构但 shape 分支（future_query.*）强制随机初始化——'
+       '隔离「shape 分支未预训练」混淆：与 baseline 差 = 预训练贡献，'
+       '与 head_flatten 差 ≈ 0 则 flatten 损失主要是未预训练混淆',
+       {'pretrained_skip_pattern': 'future_query.*'}, requires_pretrain=True,
+       eval_note='核对日志中「受控跳过」键数与 missing 一致'),
     _v('head_no_history', 'G15_HEAD', '1.5', 'P1',
        '关闭 history_proj 分支',
        {'head_use_history_proj': False}, eval_note=''),

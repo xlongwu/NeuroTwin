@@ -88,7 +88,7 @@
 | `main.py` | HC pretrain / MDD finetune，共用 AMP、EMA、AdamW、warmup+cosine、grad clipping、early stop | CLI 约 60 项 | device 硬编码成 `cuda:1`；训练仅显式取 train/val，未在训练入口完成 held-out test；没有 solver/method/tolerance/step-scale CLI。fileciteturn11file0L2-L2 fileciteturn12file0L2-L2 |
 | `train/losses.py` | PCC + MAE + 一阶差分 + std，同方差不确定性自动加权 | log-var 范围 `[-6,6]` | 对点预测合理，但没有向量场速度、Jacobian、solver consistency、结构 FC 等 ODE 专属约束。fileciteturn15file0L2-L2 |
 | `utils/dataloader.py` | subject-level train/val/test；HC/MDD；SC 预处理；规则滑窗 | 常用 `F=116,W=6,S=30` | 数据划分逻辑比许多时序项目更严谨；但真实时间戳/TR 没进入模型接口，因此目前不支持真正的 irregular-time DE。fileciteturn16file0L2-L2 fileciteturn19file0L2-L2 |
-| `analysis/run_comprehensive.py` | checkpoint 后做评估、ROI importance、HAMD/MoE 分析、可视化 | ODE 只暴露 steps/hidden/stochastic depth | 分析入口已支持 `--eval_split val|test` 与 `--test_ratio`：传 `test` 即在被试级 8:1:1 留出的独立测试集上评估。划分参数（seed/val_ratio/test_ratio/stratify_bins）须与训练脚本一致，`metrics.json` 的 `eval_split` 字段记录本次划分。 |
+| `experiments/evaluate_variant.py` | checkpoint 后做评估、ROI importance、HAMD/MoE 分析、可视化（已合并原 `analysis/run_comprehensive.py`） | ODE 只暴露 steps/hidden/stochastic depth | 分析入口按 checkpoint 内的训练配置快照重建模型，无需手工同步超参；默认在被试级 8:1:1 留出的 test 集评估（`--splits` 可显式加 val）。 |
 
 ### 当前 RK2 实际做了什么
 

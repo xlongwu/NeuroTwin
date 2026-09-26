@@ -26,27 +26,29 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def parse_args():
     p = argparse.ArgumentParser(description='低 PCC 样本临床特征分析')
-    p.add_argument('--analysis_dir', type=str,
-                   default=str(PROJECT_ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'interpretability' / 'comprehensive_analysis_20260422_230827'),
-                   help='run_comprehensive 输出目录（含 sample_metrics.json）')
+    p.add_argument('--eval_dir', type=str, required=True,
+                   help='evaluate_variant.py 输出目录（含 sample_metrics_<split>.csv）')
+    p.add_argument('--split', type=str, default='test', choices=['test', 'val'],
+                   help='读取哪个划分的样本级 CSV（默认 test）')
     p.add_argument('--output_dir', type=str, default=None,
-                   help='结果输出目录，默认 <analysis_dir>/low_pcc_analysis')
+                   help='结果输出目录，默认 <eval_dir>/low_pcc_analysis')
     p.add_argument('--v1_file', type=str, default=str(PROJECT_ROOT / 'data' / 'Rest-meta-MDD-V1-MDD.xlsx'))
     p.add_argument('--v2_file', type=str, default=str(PROJECT_ROOT / 'data' / 'Rest-meta-MDD-V2-MDD.xlsx'))
     return p.parse_args()
 
 
 def load_data(args):
-    """加载所有数据"""
-    # 加载sample metrics
-    with open(Path(args.analysis_dir) / 'sample_metrics.json', 'r') as f:
-        sample_metrics = json.load(f)
+    """加载所有数据：evaluate_variant.py 落盘的样本级 CSV + V1/V2 临床量表"""
+    csv_path = Path(args.eval_dir) / f'sample_metrics_{args.split}.csv'
+    df = pd.read_csv(csv_path)
+    # evaluate_variant 的 hamd 列对应原 sample_metrics.json 的 pathology_score
+    df = df.rename(columns={'hamd': 'pathology_score'})
 
     # 加载V1和V2 MDD数据
     v1_df = pd.read_excel(args.v1_file)
     v2_df = pd.read_excel(args.v2_file)
 
-    return sample_metrics, v1_df, v2_df
+    return df, v1_df, v2_df
 
 def process_sample_metrics(sample_metrics):
     """处理样本metrics，提取PCC信息"""
@@ -401,7 +403,7 @@ def identify_worst_cases(subj_stats, merged_df, top_n=20):
     return worst_cases_detailed
 
 def main(args):
-    out_dir = Path(args.output_dir) if args.output_dir else Path(args.analysis_dir) / 'low_pcc_analysis'
+    out_dir = Path(args.output_dir) if args.output_dir else Path(args.eval_dir) / 'low_pcc_analysis'
     out_dir.mkdir(parents=True, exist_ok=True)
     print("="*60)
     print("低PCC样本临床特征分析")

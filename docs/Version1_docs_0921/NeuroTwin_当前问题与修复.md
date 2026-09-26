@@ -98,6 +98,10 @@ ForecastHead 的 `cross_roi_*` 实际是 ROI channel 上 `Conv1d(kernel_size=1)`
 
 **消融实证（2026-09-25，P0，单 seed）。** 对照矩阵已跑（deterministic dense_soft 评估，方案 1/3 部分完成）：`no-MoE` 相对基线 ΔPCC=−0.0308、ΔMAE=+0.106（四个 HAMD 分层一致变差），**MoE 结构收益确证**；`shared-only` ΔPCC=−0.0081，`routed-only` 与 `routed_shared` 差 −0.0016（噪声级），即收益主体是路由专家、shared expert 增量≈0。**已落地调整：默认 `moe_experts_mode` routed_shared→routed_only**（移除 shared expert）。路由坍缩在正式权重上依然存在：baseline top1 分配 674/675 集中于单一专家，4 专家中仅约 2 个有效（normalized entropy≈0.50）——比 pred13 时代更严重，方案 1/2 的 state-aware routing（`moe_gate_difficulty`，P1）与专家数缩减（4→2，实际有效容量）为下一步；"自动发现临床亚型"的声明继续不成立。
 
+**条件注入失效根因修复（2026-09-26）。** 静态审计确认 HAMD 条件失效根因：`RouterCond._select_without_shared` 训练期实现为 Gumbel-argmax + 自适应高温（`adaptive_temp = temperature × (1 + 负载均值)`），与 docstring 声称的 multinomial 设计行为背离——高温 Gumbel 把专家选择近似为与条件无关的均匀随机，专家的 FiLM 条件调制与路由器的条件→专家映射同时失去梯度信号（专家看到的 (样本, HAMD) 配对统计独立，FiLM 最优解为忽略条件；路由 logits 收敛为条件无关常数，评估期 dense_soft 后坍缩单专家）。**修复：训练分支恢复为按容量惩罚后概率的 multinomial 采样**（`models/neurotwin_moe.py`，温度调度与容量软惩罚不变），恢复「概率→选择」保真通路。合成数据验证（真实正则配置 LB=0.05/熵=1e-3/Z=1e-3/多样性=0.001，400 步）：训练收敛、训练期专家负载近均衡（0.24/0.24/0.24/0.27）、条件敏感性（同输入 shuffled-HAMD 相对响应）从 ≈0 恢复至 22.3%、评估期 top1 集中度从 1.000 降至 0.688。限制：本机无 Version4 正式权重，真实数据收益需按新配置重训后用 `evaluate_variant --no_shuffled` 对照复验；路由集中度 0.688 仍未达均衡，方案 1/2 的 state-aware routing 与专家数缩减实验继续有效。
+
+**路由坍缩对策实验注册（2026-09-26）。** 基于 multinomial 修复后的新基线，按 P0 报告建议在 `experiments/variants.py` 注册 3 个对策变体（G14_MOE 组，均为 P0）：`moe_exp2_t1`（专家数 4→2、top_k 2→1，对齐实际有效容量 + 硬单选）、`moe_argmax`（训练期容量感知 argmax 硬路由，兼作 multinomial 修复的消融对照）、`moe_temp_low`（路由温度 1.5/1.0→1.0/0.5，锐化概率分布）。全部变体通过 overrides 校验与 dry-run 验证，`num_experts=2/top_k=1` 路径通过前向/反传冒烟。执行：`bash RunAblation.sh --group G14_MOE --only moe_exp2_t1,moe_argmax,moe_temp_low`（需先按新代码重训 `neurotwin_pretrain_pred1`）。评估关注：top1 分配分布、normalized entropy、expert-HAMD 分层、条件敏感性（与 1.1 shuffled 负对照联动）。
+
 ### 1.5 ForecastHead 语义、幅值重组与多分支冗余
 
 **现状。** 对 `W=6,S=30`，history/latent 很早压平为 180 维，六路 history/latent MLP、temporal、cross-ROI 与 window-attention 分支融合。输出采用：
@@ -117,6 +121,8 @@ $$\hat{y} = \text{anchor} + \text{trend} + \text{softplus}(\text{scale}) \cdot \
 3. 做 current flatten / query decoder、六路 branch leave-one-out、GraphODE/head attention 去重的消融；`pred_window=1/2/3` 上比较扩展性和长程误差。
 
 **消融实证（2026-09-25，P0，单 seed）。** 方案 1 的对照已完成：关闭 FutureQueryDecoder 退回 flatten（`head_flatten`）PCC +0.0008（噪声级）但 MAE +0.0176 明显变差，即 query decoder 的贡献在幅值精度而非整体相关——**保留 query decoder**。注意该对照经自预训练链路（`ablation_pre_head_flatten`）而非复用 pred1 权重，与其它变体不完全对等，结论强度有限。方案 2 的幅值重参数化与 branch leave-one-out（`head_no_*`，P1）待实施。
+
+**预训练混淆对照实验注册（2026-09-26）。** `head_flatten` 变体中 shape 分支结构变化导致预训练权重无法加载（随机初始化），其 MAE 损失可能混入「shape 分支未预训练」的代价而非 flatten 结构本身的缺陷。为此新增受控跳过机制（`--pretrained_skip_pattern`，fnmatch 模式，[train/optim.py](../../train/optim.py) `load_backbone_weights` 加载时命中键保留随机初始化）并注册 P0 对照变体 `head_shape_scratch`（baseline query 结构 + finetune 时强制 `future_query.*` 随机初始化）。判读：head_shape_scratch vs baseline 差 = shape 分支预训练的独立贡献；若 head_shape_scratch ≈ head_flatten，则 head_flatten 的 MAE 损失主要是未预训练混淆而非结构缺陷，1.5 节「保留 query decoder」结论需重新评估。注意其自预训练产物与 baseline 完全同构同配置（skip_pattern 仅作用于 finetune 加载段），可直接复用 baseline 的预训练权重省一次训练。
 
 ### 1.6 `IterativePredictionRefiner`：初始化错误与固定轮数
 
@@ -146,6 +152,8 @@ BrainMDM 的 sequence/window 多尺度路径固定全开；在当前 `W=6` 时�
 
 **BrainRevIN。** 它按 sample、ROI 对历史窗口统计并 detach mean/std，降低幅度尺度差异且在输出逆变换，是合理通用组件。但 MDD 的整体幅度变化可能具病理信息，逐样本归一化可能抹除它。保留 RevIN mean/std 作为 MoE 条件或预测头辅助特征，比较是否改善病理判别和预测；不应仅将它包装为核心创新。
 
+**PICP 过覆盖的 conformal 方差校准（2026-09-26）。** P0 消融实测名义 90% 区间实际覆盖 0.937–0.962。诊断确认区间构造与 NLL 实现均正确（`_gaussian_z` 分位数无误、`GaussianNLLLoss` 标准形式），过覆盖源于异方差 NLL 训练的方差系统性上偏（模型以大 σ 缓冲错误预测，回归 NLL 的固有现象），属评估侧校准问题而非训练 bug。**修复：评估侧 conformal 方差校准**——`analysis/metrics.py` 新增 `fit_conformal_scale`（val 上拟合归一化残差的经验高分位 q，含 finite-sample 修正 ⌈(N+1)(1-α)⌉/N），`evaluate_variant.py` 默认启用（`--no_calibrate` 关闭）：val 不在 `--splits` 时自动补评用于拟合，各 split 应用 `μ ± q·σ` 得 `PICP_cal/MPIW_cal`（写入 `metrics_<split>.json` 与 registry 新列 `test_picp_cal`）。合成验证：σ 上偏 1.6 倍时 PICP 0.990→0.904（对齐名义）、MPIW 收缩 35%，欠覆盖方向对照正确。校准不触碰模型权重与训练流程，点预测指标不变；原始 PICP 保留以便对照。
+
 > 1.7 与 1.8 未进入 2026-09-25 的 P0 消融矩阵（BrainMDM 分支、MDM 自适应、概率预测头为 P1/P2 项），暂无新实证。
 
 ## 2. 实验设计、数据协议、评估与工程问题
@@ -156,7 +164,13 @@ BrainMDM 的 sequence/window 多尺度路径固定全开；在当前 `W=6` 时�
 
 但评估闭环尚不完整：`main.py` 虽构造 train/val/test loader，主训练流程只使用 train/val，未自动加载最佳 checkpoint 执行最终 test；既有 pred1/pred12/pred13 是 1,353 个 validation samples 而非独立 test，且分析曾用 `val_ratio=0.2`、主 CLI 默认 `0.1`，不能作严格横向结论。
 
-**部分完成（2026-09-25）。** 消融评估框架（`experiments/`）已实现：被试级 (dataset, site) 8:1:1 切分、训练后自动加载 `finetuned_best.pt` 对 val/test 独立评估并写入 `results/ablation/registry.csv`（本节方案 1 的框架级落地）；`main.py` 主流程自动 test 仍待接入。
+**部分完成（2026-09-25）。** 消融评估框架（`experiments/`）已实现：被试级 (dataset, site) 8:1:1 切分、训练后自动加载 `finetuned_best.pt` 评估（默认仅 test，`--splits` 可显式加 val）并写入 `results/ablation/registry.csv`（本节方案 1 的框架级落地）。评估指标已扩展：FC 上三角 MAE/RMSE、edge-PCC、命名网络内/间边 MAE、被试级聚合 PCC/MAE 与低 PCC 被试诊断、参数量，并落盘被试级聚合 CSV（统计单位为被试）。多 seed 复验暂缓，当前固定 seed=2024（按 2026-09-26 决定暂不开展）。
+
+**已完成（2026-09-26）：评估方法三项落地。**
+
+1. **版本化固定 subject-ID split（方案 1 前半）**：`utils/dataloader.py` 的 `_split_subject_ids` 升级为 manifest 包装层，切分名单连同配置指纹（mode/seed/比例/分箱/被试数）落盘 `<data_root>/subject_split_<mode>.json`；同配置自动复用，配置不一致或被试集合变化直接报错，`--refresh_split_manifest` 显式重新生成（`main.py` / `evaluate_variant.py` / `fc_baselines.py` 三入口透传）。单测覆盖生成→复用→配置冲突→被试集合变化→refresh 五场景（5/5 通过）。训练、评估、基线自此共用同一锁定 test 集。
+2. **`main.py` 训练结束自动评 test（方案 1 后半）**：finetune 收尾自动加载 `finetuned_best.pt` 调用 `evaluate_variant.evaluate`（含 conformal 校准自动补评 val 与 shuffled-HAMD 负对照），评估失败仅告警、不影响训练产物；`--no_eval_after_train` 可关闭。pretrain 模式不接入（预训练权重缺 MoE 分支，strict 加载必然报错）。
+3. **被试级配对统计检验（方案 3 前半）**：`experiments/compare.py` 新增 `--paired_tests EXP_ID=EVAL_DIR ...`，对齐各评估目录 `subject_metrics_test.csv` 的逐被试 PCC 做配对 t 检验与 Wilcoxon 符号秩（共同被试 ≥8 才检验），报告落盘 `results/ablation/paired_tests.md`；多重比较校正仍待纳入，正式结论前需补。
 
 **拟解决方案。**
 
@@ -175,6 +189,8 @@ BrainMDM 的 sequence/window 多尺度路径固定全开；在当前 `W=6` 时�
 2. 建立基线套件：persistence、VAR/岭回归、无 SC Transformer、no-MoE、no-ODE，以及各结构模块单独消融；形成清晰对照表。
 3. 增加 `pred_window={1,2,3}` rolling evaluation，绘制 error-horizon 曲线；同步报告 refiner 轮数 `1--4` 的敏感性。
 4. 所有结果同时报告 params、FLOPs/MACs、GPU memory、throughput/epoch time，避免把不可接受的代价隐藏在小幅 PCC 增益后。
+
+**部分完成（2026-09-26）：无模型平凡基线落地。** 新建 `analysis/fc_baselines.py`，提供 persistence（末帧持续）、linear（每 ROI 窗口均值最小二乘线性外推）、mean（历史均值持续）三种基线；经 `--ckpt` 配置快照 + 版本化切分 manifest 构建与 `evaluate_variant` 完全一致的 test loader，输出 FC 上三角 MAE/edge-PCC 与点级 PCC/MAE 至 `<out_dir>/fc_baselines.json`，直接对照 `metrics_test.json` 同名 FC 指标，回答「模型 FC 重构是否优于平凡策略」（方案 2 前半）。VAR/岭回归与结构消融基线仍走 `experiments/variants.py` 变体框架（no-SC/no-MoE/no-ODE 已在册）。
 
 ### 2.3 病理条件、协变量与多站点数据协议
 
@@ -238,3 +254,11 @@ HAMD 合并表 `Rest-meta-MDD-V1V2-Merged-MDD.xlsx` 汇集 V1、V2 两个**独�
 | 2026-09-22 | 合并既有“当前问题与修复”整合稿与本次补充内容；去除重复项，正文重构为“模型结构”“实验设计、数据协议、评估与工程”两大块。 |
 | 2026-09-22 | 将正文 4 处 `\[...\]` 公式转换为 Markdown 可渲染的 `$$...$$` 行间公式；移除公式内中文句号，多字母标识符统一用 `\text{}` 排版。 |
 | 2026-09-25 | 补充 P0 消融实验（13 变体、seed=2024）实证结论至 1.1--1.6；1.1 条件失效被 shuffled 负对照确证、1.4 MoE 收益确证但路由坍缩加剧；已落地参数调整（`ode_steps` 6→3、`delta_refiner_rounds` 2→1、`moe_experts_mode` routed_shared→routed_only）；标注已完成代码项（refiner 初始化修复、`refiner_rounds=0` 支持、消融评估闭环）；修正 1.4 中 `moe_router_cond_only` 过时描述。 |
+| 2026-09-25 | `main.py` CLI 默认参数与 `experiments/base_config.py` 对齐：`pred_window` 3→1、`ode_steps` 6→3、`delta_refiner_rounds` 2→1、`moe_experts_mode` routed_shared→routed_only，以及 `train_epochs/batch_size/lr_init/lr_final/warmup_epochs/patience/moe_load_balance_weight/moe_gate_temp_start/compile` 等训练规模项；`loss_lr_scale` 保持 1.0（随默认 pretrain 模式，finetune 由脚本显式传 0.5），属模式相关差异而非失同步。 |
+| 2026-09-25 | `scripts/Pretrain_HC.sh` 同步取消融值：`ode_steps` 6→3、`delta_refiner_rounds` 2→1，与 `Finetune_MDD.sh`/`base_config.py` 对齐，两阶段 ODE 配置保持一致。 |
+| 2026-09-25 | 评估分析脚本收敛为单一入口：`experiments/evaluate_variant.py` 吸收原 `analysis/run_comprehensive.py` 全部独有能力（expert-HAMD 分层分析、可视化、置换特征重要性 + FDR 显著脑区导出、预测数组保存），作为 `--visualize / --feature_importance / --save_arrays` 开关；`run_comprehensive.py` 已删除（其 `build_model_and_loader` 部分参数重建对结构性变体会权重错配，评估功能与 evaluate_variant 完全重叠）。`analyze_low_pcc_samples.py` 改读 `sample_metrics_<split>.csv`；README 与 Version1 文档引用同步更新。 |
+| 2026-09-26 | **HAMD 条件注入失效根因修复**：`models/neurotwin_moe.py` 训练期路由选择由 Gumbel-argmax + 自适应高温恢复为 multinomial 概率采样（与设计一致），修复专家 FiLM 条件调制与路由器条件→专家映射同时失去梯度信号的问题；合成验证（真实正则配置）条件敏感性 ≈0→22.3%、训练期专家负载恢复近均衡、评估期 top1 集中度 1.000→0.688；真实数据收益待重训复验。详见 1.4 节修复记录。 |
+| 2026-09-26 | **注册 MoE 路由坍缩对策实验**（1.4 节，G14_MOE 组新增 3 个 P0 变体）：`moe_exp2_t1`（专家数 4→2/top_k 2→1）、`moe_argmax`（训练期硬确定性路由，兼作 multinomial 修复消融）、`moe_temp_low`（路由温度 1.5/1.0→1.0/0.5）；变体总数 35→38，全部通过 overrides 校验、dry-run 与 2 专家前向冒烟；执行命令见 1.4 节。 |
+| 2026-09-26 | **PICP 过覆盖 conformal 方差校准**（1.8 节）：`analysis/metrics.py` 新增 `fit_conformal_scale`（val 拟合归一化残差经验高分位，finite-sample 修正），`evaluate_variant.py` 默认启用校准（`--no_calibrate` 关闭，val 自动补评拟合），产出 `PICP_cal/MPIW_cal`；registry/compare/run_experiments 同步 `test_picp_cal` 字段。合成验证 PICP 0.990→0.904、区间收窄 35%；训练零改动，对已有 checkpoint 立即可用。 |
+| 2026-09-26 | **注册 head_flatten 预训练混淆对照实验**（1.5 节）：`load_backbone_weights` 新增 `skip_pattern` 受控跳过（fnmatch 命中键保留随机初始化，单测验证），main.py 新增 `--pretrained_skip_pattern` CLI，BASE_ARGS 同步；注册 P0 变体 `head_shape_scratch`（baseline 结构 + `future_query.*` 强制随机），变体总数 38→39，dry-run 参数注入验证通过；判读逻辑见 1.5 节。 |
+| 2026-09-26 | **完善评估/实验方法类任务（2.1/2.2 节，多 seed 按用户决定暂不开展）**：① 版本化固定 split——`utils/dataloader.py` 切分 manifest 落盘/复用/配置冲突与被试集合变化报错/refresh（`--refresh_split_manifest` 于 main.py、evaluate_variant.py、fc_baselines.py 三入口透传；单测 5/5 通过）；② `main.py` finetune 训练结束自动评 test（复用 manifest，含 conformal 校准与 shuffled 负对照；`--no_eval_after_train` 可关；评估失败不影响训练产物）；③ `experiments/compare.py` 新增 `--paired_tests` 被试级配对 t/Wilcoxon 检验（报告落盘 `results/ablation/paired_tests.md`，多重比较校正待补）；④ 新建 `analysis/fc_baselines.py` 无模型基线套件（persistence/linear/mean，与 evaluate_variant 同 test 集对照，输出 `fc_baselines.json`）。另修复 `main.py --help` 因 `--compile` help 字符串含未转义 `%` 导致的崩溃。 |

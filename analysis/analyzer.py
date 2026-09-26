@@ -180,6 +180,10 @@ class ModelAnalyzer:
             'roi_metrics': roi_metrics,
             'temporal_metrics': temporal_metrics,
             'batch_data': all_batch_data,
+            # 概率头产物（仅 gaussian/quantile 头非空），供 conformal 方差校准复用
+            'pred_logvar': lv_np,
+            'lower': lo_np,
+            'upper': hi_np,
         }
         
         return metrics, artifacts

@@ -174,6 +174,11 @@ def run_variant(variant, seed, smoke=False, dry_run=False):
             val_pcc=summary.get('val_pcc'), val_mae=summary.get('val_mae'),
             test_pcc=summary.get('test_pcc'), test_mae=summary.get('test_mae'),
             test_r2=summary.get('test_r2'), test_picp=summary.get('test_picp'),
+            test_picp_cal=summary.get('test_picp_cal'),
+            test_fc_upper_mae=summary.get('test_fc_upper_mae'),
+            test_edge_pcc=summary.get('test_edge_pcc'),
+            test_subj_pcc=summary.get('test_subj_pcc'),
+            test_n_params=summary.get('test_n_params'),
         )
         registry.upsert_record(record)
         print(f"[OK] {exp_id} s{seed}: test_pcc={record['test_pcc']}, "
@@ -196,7 +201,7 @@ def run_variant(variant, seed, smoke=False, dry_run=False):
 def evaluate_ckpt(ckpt, out_dir, seed):
     """隔离导入：仅训练成功后才加载 torch 评估栈。"""
     from experiments.evaluate_variant import evaluate
-    return evaluate(str(ckpt), str(out_dir), eval_splits=('val', 'test'),
+    return evaluate(str(ckpt), str(out_dir), eval_splits=('test',),
                     seed=seed, run_shuffled=True)
 
 

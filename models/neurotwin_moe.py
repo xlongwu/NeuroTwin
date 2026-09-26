@@ -288,7 +288,12 @@ class RouterCond(nn.Module):
 
                     if self.training:
                         # 训练时：结合原始概率和容量约束
-                        # 使用 Gumbel-softmax 风格的探索
+                        # 按可用概率多项式采样（MoDE 设计行为）。此前的
+                        # Gumbel-argmax + 自适应高温会把选择近似为与条件无关的
+                        # 均匀随机，导致专家的 FiLM 条件调制与路由器的条件→专家
+                        # 映射同时失去梯度信号（HAMD 条件注入失效的根因）；
+                        # multinomial 保留「概率→选择」的保真通路，
+                        # 温度调度仍通过 probs 本身控制探索程度。
                         available_probs = temp_probs * soft_mask
 
                         # 如果所有专家都接近满负荷，允许轻微超载
@@ -297,12 +302,7 @@ class RouterCond(nn.Module):
                             expert_idx = usage_ratio.argmin()
                         else:
                             available_probs = available_probs / available_probs.sum()
-                            # 添加 Gumbel 噪声鼓励探索
-                            gumbel_noise = -torch.log(-torch.log(torch.rand_like(available_probs) + 1e-10) + 1e-10)
-                            # 温度随使用率调整：使用率低时更随机，高时更确定
-                            adaptive_temp = self.temperature * (1.0 + usage_ratio.mean())
-                            noisy_probs = (available_probs.log() + gumbel_noise) / adaptive_temp
-                            expert_idx = noisy_probs.argmax()
+                            expert_idx = torch.multinomial(available_probs, 1).item()
                     else:
                         # 推理时：低温缩放 + 容量感知
                         T = self.inference_temperature

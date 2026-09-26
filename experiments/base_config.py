@@ -147,6 +147,8 @@ BASE_ARGS = {
     'moe_expert_kind': 'homogeneous',
     'moe_eval_mc_samples': 0,
     'moe_expert_stats_interval': 0,
+    # 受控消融：finetune 加载预训练权重时强制随机初始化的分支（fnmatch 模式）
+    'pretrained_skip_pattern': '',
     # ---- Phase 6：长程与状态递推（高风险项默认关闭） ----
     'variable_cutoff': False,
     'loss_diff_mode': 'per_window',

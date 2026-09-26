@@ -20,6 +20,8 @@ FIELDS = [
     'exp_id', 'group', 'doc_ref', 'priority', 'seed', 'mode', 'status',
     'git_commit', 'started_at', 'finished_at', 'cmd',
     'val_pcc', 'val_mae', 'test_pcc', 'test_mae', 'test_r2', 'test_picp',
+    'test_picp_cal',
+    'test_fc_upper_mae', 'test_edge_pcc', 'test_subj_pcc', 'test_n_params',
     'log_path', 'note',
 ]
 

@@ -30,7 +30,7 @@ total_windows=9
 in_window=6
 pred_windows=(1)              # 未来窗长度；可写 (1 2 3)，每个值是一次完整训练
 n_block=2
-ode_steps=6
+ode_steps=3
 ode_hidden_dim=256
 num_scales=3
 
@@ -114,7 +114,7 @@ for pred_window in "${pred_windows[@]}"; do
     --test_ratio 0.10
     --stratify_bins 5
     --refiner_rounds 3
-    --delta_refiner_rounds 2
+    --delta_refiner_rounds 1
     --refiner_adaptive False
     --refiner_inter_sup_weight 0.05
     --refiner_inter_sup_decay 0.5

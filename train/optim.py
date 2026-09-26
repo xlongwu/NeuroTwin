@@ -76,7 +76,8 @@ def save_backbone_weights(path, model, meta=None):
     return path
 
 
-def load_backbone_weights(model, pretrained_path, device, arch_policy='require_match'):
+def load_backbone_weights(model, pretrained_path, device, arch_policy='require_match',
+                          skip_pattern=''):
     """按形状兼容过滤加载预训练权重（MoE 等新增模块自动跳过）。
 
     Args:
@@ -84,11 +85,16 @@ def load_backbone_weights(model, pretrained_path, device, arch_policy='require_m
             - 'require_match'（默认）：直接报错并提示重新预训练
             - 'warn'：打印警告后按 shape 过滤加载（逃生舱）
             - 'ignore'：跳过权重加载
+        skip_pattern: fnmatch 模式（如 ``'future_query.*'``），命中的预训练键
+            不加载、保留随机初始化。用于受控消融：量化「某分支未经预训练」
+            对 finetune 结果的独立影响（如 head_flatten 的对照实验）。
     Returns:
         dict，含 loaded / skipped / missing / arch_version / skipped_load
     """
     if arch_policy not in ARCH_POLICIES:
         raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
+    if skip_pattern:
+        import fnmatch
 
     ckpt = torch.load(pretrained_path, map_location=device)
     state, arch_version, _ = unwrap_state_dict(ckpt)
@@ -115,6 +121,14 @@ def load_backbone_weights(model, pretrained_path, device, arch_policy='require_m
     model_dict = model.state_dict()
     filtered = {k: v for k, v in state.items()
                 if k in model_dict and model_dict[k].shape == v.shape}
+    if skip_pattern:
+        # 受控跳过：命中模式的键不加载（保留随机初始化），计入 skipped 以便核对
+        force_skipped = sorted(k for k in filtered if fnmatch.fnmatch(k, skip_pattern))
+        for k in force_skipped:
+            filtered.pop(k)
+        if force_skipped:
+            print(f"受控跳过预训练加载（--pretrained_skip_pattern '{skip_pattern}'）: "
+                  f"{len(force_skipped)} 个键，例如 {force_skipped[:5]}")
     skipped  = sorted(k for k in state if k not in filtered)
     model_dict.update(filtered)
     model.load_state_dict(model_dict)

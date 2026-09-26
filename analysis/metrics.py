@@ -247,6 +247,49 @@ def _gaussian_z(alpha: float) -> float:
         return 1.959963984540054
 
 
+def fit_conformal_scale(pred, target, pred_logvar=None, lower=None, upper=None,
+                        alpha: float = 0.1) -> float:
+    """在拟合集（应为 val）上拟合 conformal 区间缩放因子 q。
+
+    高斯 NLL 训练的方差估计存在系统性上偏（模型用大 σ 缓冲错误预测），
+    导致名义 (1-α) 区间实际覆盖显著高于名义值（PICP 过覆盖）。本函数按
+    conformal prediction 的思路拟合归一化残差的经验高分位：
+
+        r_i = |y_i - μ_i| / σ_i ，  q = Quantile_{⌈(N+1)(1-α)⌉/N}(r)
+
+    应用侧区间为 ``μ ± q·σ``（分位数头则 ``σ_eff=(upper-lower)/(2z)`` 代入）。
+    该构造对任意残差分布保证边际覆盖 ≥ 1-α（finite-sample 保证），
+    仅用拟合集统计量、不触碰模型权重与训练流程。
+
+    Args:
+        pred / target: 拟合集预测与真值（同形）。
+        pred_logvar: 高斯头对数方差（与 ``lower/upper`` 二选一）。
+        lower / upper: 分位数头区间端点。
+        alpha: 未覆盖率，名义覆盖 1 - alpha。
+
+    Returns:
+        标量缩放因子 q（> 0）。q < z_{1-α/2} 说明原区间过宽（过覆盖），
+        q > z 则过窄（欠覆盖）。
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    z = _gaussian_z(alpha)
+    if pred_logvar is not None:
+        lv = np.asarray(pred_logvar, dtype=np.float64)
+        sigma = np.exp(0.5 * lv)
+    elif lower is not None and upper is not None:
+        lo = np.asarray(lower, dtype=np.float64)
+        hi = np.asarray(upper, dtype=np.float64)
+        sigma = (hi - lo) / (2.0 * z)  # 由区间端点反推有效 σ
+    else:
+        raise ValueError("fit_conformal_scale 需要 pred_logvar 或 lower/upper 之一")
+    sigma = np.clip(sigma, 1e-12, None)
+    residuals = np.abs(target - pred) / sigma
+    n = residuals.size
+    level = min(1.0, float(np.ceil((n + 1) * (1.0 - alpha)) / n))
+    return float(np.quantile(residuals, level, method='higher'))
+
+
 def compute_calibration_metrics(
     pred: np.ndarray,
     target: np.ndarray,

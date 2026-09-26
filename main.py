@@ -186,6 +186,7 @@ def main(args):
         prefetch_factor=args.prefetch_factor,
         eval_batch_size=args.eval_batch_size, cache_subjects=args.cache_subjects,
         variable_cutoff=args.variable_cutoff,
+        refresh_split_manifest=getattr(args, 'refresh_split_manifest', False),
     )
     train_data, val_data = dl.get_train(), dl.get_val()
 
@@ -273,7 +274,8 @@ def main(args):
         if not os.path.exists(args.pretrained_weight):
             raise FileNotFoundError(f"未找到预训练权重: {args.pretrained_weight}")
         load_backbone_weights(model, args.pretrained_weight, device,
-                              arch_policy=args.pretrained_arch_policy)
+                              arch_policy=args.pretrained_arch_policy,
+                              skip_pattern=getattr(args, 'pretrained_skip_pattern', ''))
         set_finetune_stage(model, backbone_unfrozen=False)
         print('已进入分阶段微调: 前期仅训练 MoE 与条件模块（MoDE），后期逐步解冻主干。')
 
@@ -601,7 +603,25 @@ def main(args):
 
     writer.close()
     best_n = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
-    print(f"\n训练完成！最佳权重已保存至: {os.path.join(save_dir, best_n)}")
+    best_path = os.path.join(save_dir, best_n)
+    print(f"\n训练完成！最佳权重已保存至: {best_path}")
+
+    if args.mode == 'finetune' and getattr(args, 'eval_after_train', True) \
+            and os.path.exists(best_path):
+        # 训练结束自动评 test（闭环）：复用版本化切分 manifest，含 conformal
+        # 校准（自动补评 val 拟合）与 shuffled-HAMD 负对照。评估失败不影响训练产物。
+        from experiments.evaluate_variant import evaluate as _eval_variant
+        eval_dir = os.path.join(save_dir, 'eval')
+        try:
+            summary = _eval_variant(best_path, eval_dir, eval_splits=('test',),
+                                    seed=args.seed, run_shuffled=True)
+            print(f"[post-train eval] test_PCC={summary.get('test_pcc')} "
+                  f"test_MAE={summary.get('test_mae')} "
+                  f"PICP={summary.get('test_picp')} PICP_cal={summary.get('test_picp_cal')}")
+            print(f"[post-train eval] 详细指标见: {eval_dir}/metrics_test.json")
+        except Exception as e:
+            print(f"[post-train eval] 自动评估失败（训练产物不受影响）: {type(e).__name__}: {e}\n"
+                  f"可手动复评: python -m experiments.evaluate_variant --ckpt {best_path} --out_dir {eval_dir}")
 
 
 def parse_args():
@@ -618,27 +638,27 @@ def parse_args():
     p.add_argument('--num_rois', type=int, default=116)
     p.add_argument('--seq_len', type=int, default=30)
     p.add_argument('--in_window', type=int, default=6)
-    p.add_argument('--pred_window', type=int, default=3)
+    p.add_argument('--pred_window', type=int, default=1)
     p.add_argument('--total_windows', type=int, default=9)
     p.add_argument('--n_block', type=int, default=2)
     p.add_argument('--alpha', type=float, default=0.5)
     p.add_argument('--norm', type=str2bool, default=True)
     p.add_argument('--dropout', type=float, default=0.2)
     p.add_argument('--num_scales', type=int, default=3)
-    p.add_argument('--ode_steps', type=int, default=6)
+    p.add_argument('--ode_steps', type=int, default=3)  # 2026-09-25 消融：1–12 步差 ≤0.002，取 3 省算力（与 base_config 同步）
     p.add_argument('--ode_hidden_dim', type=int, default=256)
     p.add_argument('--stochastic_depth_rate', type=float, default=0.10)
     p.add_argument('--num_experts', type=int, default=4)
     p.add_argument('--top_k', type=int, default=2)
-    p.add_argument('--train_epochs', type=int, default=200)
-    p.add_argument('--batch_size', type=int, default=8)
-    p.add_argument('--lr_init', type=float, default=1e-6)
+    p.add_argument('--train_epochs', type=int, default=150)
+    p.add_argument('--batch_size', type=int, default=32)
+    p.add_argument('--lr_init', type=float, default=5e-5)
     p.add_argument('--lr_peak', type=float, default=1e-4)
-    p.add_argument('--lr_final', type=float, default=1e-6)
-    p.add_argument('--warmup_epochs', type=int, default=10)
+    p.add_argument('--lr_final', type=float, default=5e-5)
+    p.add_argument('--warmup_epochs', type=int, default=15)
     p.add_argument('--weight_decay', type=float, default=1e-2)
     p.add_argument('--grad_clip', type=float, default=1.0)
-    p.add_argument('--patience', type=int, default=25)
+    p.add_argument('--patience', type=int, default=20)
     p.add_argument('--init_log_var_pcc', type=float, default=0.0)
     p.add_argument('--init_log_var_mae', type=float, default=-1.5)
     p.add_argument('--init_log_var_diff', type=float, default=-2.0)
@@ -649,15 +669,15 @@ def parse_args():
     p.add_argument('--log_var_max', type=float, default=6.0)
 
     # MoDE MoE 超参
-    p.add_argument('--moe_load_balance_weight', type=float, default=0.01,
-                   help='负载均衡损失权重。乘以 load_balancing_term（均匀时≈1.0）。典型值 0.01~0.02。')
+    p.add_argument('--moe_load_balance_weight', type=float, default=0.05,
+                   help='负载均衡损失权重。乘以 load_balancing_term（均匀时≈1.0）。')
     p.add_argument('--moe_entropy_weight', type=float, default=1e-3,
                    help='门控熵正则化权重，鼓励路由分布不过于集中。')
     p.add_argument('--moe_z_loss_weight', type=float, default=1e-3,
                    help='路由 Z-Loss 权重（ST-MoE），惩罚 logit 幅度过大。')
     p.add_argument('--moe_diversity_weight', type=float, default=0.001,
                    help='专家多样化损失权重，鼓励 batch 内路由决策的多样性。典型值 0.001~0.01。')
-    p.add_argument('--moe_gate_temp_start', type=float, default=2.0,
+    p.add_argument('--moe_gate_temp_start', type=float, default=1.5,
                    help='路由温度初始值。高温使 softmax 更均匀，有利于 multinomial 探索。')
     p.add_argument('--moe_gate_temp_end', type=float, default=1.0,
                    help='路由温度终止值（backbone 解冻后线性衰减）。')
@@ -679,6 +699,16 @@ def parse_args():
                    choices=['require_match', 'warn', 'ignore'],
                    help='预训练权重架构版本不匹配时的策略：require_match 直接报错；'
                         'warn 打印并跳过不兼容键；ignore 静默跳过。')
+    p.add_argument('--pretrained_skip_pattern', default='',
+                   help='fnmatch 模式，命中的预训练键不加载（保留随机初始化），'
+                         '用于受控消融对照，如 head_shape_scratch 用 future_query.*')
+    p.add_argument('--refresh_split_manifest', action='store_true',
+                   help='重新生成 subject_split_<mode>.json 切分 manifest'
+                        '（默认存在且配置一致时复用，配置不一致时报错）')
+    p.add_argument('--no_eval_after_train', dest='eval_after_train',
+                   action='store_false',
+                   help='finetune 训练结束后不自动评 test（默认自动评估并落盘到'
+                        ' <save_dir>/eval/）')
     p.add_argument('--pathology_norm_mode', default='robust_z',
                    choices=['identity', 'robust_z', 'zscore_quadratic',
                             'empirical_cdf', 'quantile', 'zscore_rbf'],
@@ -706,10 +736,11 @@ def parse_args():
                         'state_revin_difficulty=再追加"难度"项（base 预测与最后历史窗的偏差）。')
     p.add_argument('--moe_gate_input_dim', type=int, default=None,
                    help='门控输入宽度，默认按 gate_features 与 ROI 数自动推导并校验。')
-    p.add_argument('--moe_experts_mode', default='routed_shared',
+    p.add_argument('--moe_experts_mode', default='routed_only',
                    choices=['routed_shared', 'shared_only', 'routed_only', 'none'],
-                   help='专家臂组合：routed_shared=路由+共享（默认）；shared_only=仅共享；'
-                        'routed_only=仅路由；none=关闭 MoE 残差分支（干净消融，前向等于主干）。')
+                   help='专家臂组合：routed_only=仅路由（默认，2026-09-25 消融：shared 增量≈0）；'
+                        'routed_shared=路由+共享；shared_only=仅共享；'
+                        'none=关闭 MoE 残差分支（干净消融，前向等于主干）。')
     p.add_argument('--moe_expert_kind', default='homogeneous',
                    choices=['homogeneous', 'heterogeneous'],
                    help='专家结构：homogeneous=同宽同激活（默认）；'
@@ -724,8 +755,9 @@ def parse_args():
                    help='每 N 次前向采集专家输出范数与跨窗路由一致性（诊断）；0 关闭。')
     p.add_argument('--refiner_rounds', type=int, default=3,
                    help='主干预测头 IterativePredictionRefiner 的迭代轮数。')
-    p.add_argument('--delta_refiner_rounds', type=int, default=2,
-                   help='MoE 病理残差细化器 IterativePredictionRefiner 的迭代轮数。')
+    p.add_argument('--delta_refiner_rounds', type=int, default=1,
+                   help='MoE 病理残差细化器 IterativePredictionRefiner 的迭代轮数。'
+                        '默认 1：2026-09-25 消融显示 1 轮与 2 轮等价。')
     p.add_argument('--refiner_adaptive', type=str2bool, default=False,
                    help='是否启用轮间自适应强度门控（依修正幅度调节每轮权重）。')
     p.add_argument('--refiner_inter_sup_weight', type=float, default=0.05,
@@ -910,8 +942,8 @@ def parse_args():
                    help='反事实扫掠 counterfactual_pathology_sweep / 虚拟干预使用的模式：'
                         'latent=潜在状态与条件按 intensity 混合；parametric=直接用目标条件重跑。'
                         '本训练入口不消费该参数，仅供分析脚本保持一致口径。')
-    p.add_argument('--compile', type=str2bool, default=False,
-                   help='torch.compile 编译模型前向（实验性；首次编译有额外耗时）')
+    p.add_argument('--compile', type=str2bool, default=True,
+                   help='torch.compile 编译模型前向（稳态约 35%% 提速；首次编译有额外耗时）')
 
     return p.parse_args()
 
