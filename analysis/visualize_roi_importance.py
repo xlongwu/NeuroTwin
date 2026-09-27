@@ -12,6 +12,9 @@ import matplotlib
 matplotlib.use('Agg')
 from pathlib import Path
 
+# 项目根目录（脚本位于 <root>/analysis/，路径均基于项目内）
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'SimHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
@@ -45,9 +48,9 @@ NETWORK_COLORS = {
 
 def parse_args():
     p = argparse.ArgumentParser(description='ROI 重要性可视化（结合 AAL116 图谱）')
-    p.add_argument('--input_json', type=str, default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/interpretability/comprehensive_analysis_20260422_230827/feature_importance.json',
-                   help='run_comprehensive 输出的 feature_importance.json')
-    p.add_argument('--aal_file', type=str, default='/data3/Digital_Brain/AMD/data/AAL116.xlsx',
+    p.add_argument('--input_json', type=str, required=True,
+                   help='evaluate_variant.py --feature_importance 输出的 feature_importance_<split>.json')
+    p.add_argument('--aal_file', type=str, default=str(PROJECT_ROOT / 'data' / 'AAL116.xlsx'),
                    help='AAL116 脑区图谱 xlsx')
     p.add_argument('--output_dir', type=str, default=None,
                    help='图片输出目录，默认 <input_json 所在目录>/visualizations')
@@ -312,21 +315,22 @@ def generate_summary_table(df_sorted, network_stats, output_path):
     print(f"Saved: {output_path}")
     return summary
 
-def main():
+def main(args):
     print("="*60)
     print("ROI重要性可视化")
     print("="*60)
-    
+
     # 加载数据
     print("\n1. 加载数据...")
-    importance_data, aal_df = load_data()
-    
+    importance_data, aal_df = load_data(args)
+
     # 准备数据
     print("2. 准备数据...")
     df, df_sorted = prepare_data(importance_data, aal_df)
-    
-    # 输出路径
-    output_dir = '/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/interpretability/comprehensive_analysis_20260422_230827/visualizations'
+
+    # 输出路径：默认 <input_json 所在目录>/visualizations
+    output_dir = args.output_dir or str(Path(args.input_json).parent / 'visualizations')
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # 生成可视化
     print("\n3. 生成可视化...")

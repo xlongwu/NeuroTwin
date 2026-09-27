@@ -50,3 +50,7 @@ low_pcc_analysis/
 # ===== 操作系统 =====
 .DS_Store
 Thumbs.db
+
+# Local datasets and generated experiment results
+/data.zip
+/results/

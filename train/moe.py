@@ -56,6 +56,62 @@ def update_router_temperature(model: NeuroTwin, args, epoch: int,
     return float(temp)
 
 
+def compute_graph_regularization(aux_info, device,
+                                 sparsity_weight: float = 1e-3,
+                                 entropy_weight: float = 1e-3,
+                                 temporal_weight: float = 0.0):
+    """SC 软先验的图正则，返回 (total_reg, stats)。
+
+    total_reg = 稀疏(L1, 去掉对角) × sparsity_weight
+              + 行熵（抑制模糊的均匀图） × entropy_weight
+              + 时间一致性（逐窗功能图一阶差分平方） × temporal_weight
+
+    从 aux_info['sc_prior']（SoftAnatomicalPrior 输出字典）读取：
+      - 'A_eff' [B,F,F]：可微软先验（带梯度 → 正则可回传到 λ / U,V / ΔA / 掩码）
+      - 'A_seq' [B,W,F,F]：仅当 --sc_temporal_weight > 0 时才生成
+
+    未启用 SC 软先验（--sc_prior_mode scaled）或三项权重全为 0 时返回零正则，
+    不影响原有训练行为。
+    """
+    zero = torch.zeros(1, device=device).squeeze(0)
+    zero_stats = {'graph_sparsity': zero.detach(),
+                  'graph_entropy': zero.detach(),
+                  'graph_temporal': zero.detach()}
+
+    if max(sparsity_weight, entropy_weight, temporal_weight) <= 0.0:
+        return zero, zero_stats
+
+    sc_prior = aux_info.get('sc_prior', None) if isinstance(aux_info, dict) else None
+    if not isinstance(sc_prior, dict):
+        return zero, zero_stats
+    a_eff = sc_prior.get('A_eff', None)
+    if not torch.is_tensor(a_eff) or a_eff.ndim != 3:
+        return zero, zero_stats
+
+    # 去掉对角线：稀疏与熵只约束 ROI 之间的连接
+    off_diag = a_eff - torch.diag_embed(a_eff.diagonal(dim1=-2, dim2=-1))
+    sparsity = off_diag.abs().mean()
+
+    p_row = off_diag.clamp_min(1e-8)
+    p_row = p_row / p_row.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    entropy = -(p_row * p_row.log()).sum(dim=-1).mean()
+
+    temporal = zero
+    a_seq = sc_prior.get('A_seq', None)
+    if temporal_weight > 0 and torch.is_tensor(a_seq) and a_seq.ndim == 4 and a_seq.shape[1] > 1:
+        temporal = (a_seq[:, 1:] - a_seq[:, :-1]).pow(2).mean()
+
+    total_reg = (sparsity_weight * sparsity
+                 + entropy_weight * entropy
+                 + temporal_weight * temporal)
+    stats = {
+        'graph_sparsity': sparsity.detach(),
+        'graph_entropy':  entropy.detach(),
+        'graph_temporal': temporal.detach() if torch.is_tensor(temporal) else zero.detach(),
+    }
+    return total_reg, stats
+
+
 def compute_moe_regularization(aux_info, device,
                                load_balance_weight: float = 0.01,
                                entropy_weight: float = 1e-3,
@@ -79,10 +135,22 @@ def compute_moe_regularization(aux_info, device,
     load         = _get(aux_info, 'load')
     sel_freq     = _get(aux_info, 'selection_frequency')
     lbt          = _get(aux_info, 'load_balancing_term')
+    # 路由不确定性报告：eval_mc_samples>0 时由 MoE 写入，纯监控量
+    prob_std     = _get(aux_info, 'moe_router_prob_std')
 
-    if soft_gates is None or soft_gates.ndim != 2:
-        return zero, {'moe_load_balance': zero.detach(),
-                      'moe_entropy': zero.detach(), 'moe_z_loss': zero.detach()}
+    zero_stats = {'moe_load_balance': zero.detach(),
+                  'moe_entropy': zero.detach(), 'moe_z_loss': zero.detach()}
+    if prob_std is not None:
+        zero_stats['moe_router_prob_std'] = prob_std.detach()
+
+    if soft_gates is None or soft_gates.ndim < 2:
+        return zero, zero_stats
+
+    # token 级路由（route_level='token'）形状为 [B, F, E]，展平到 token 维度 [N, E]
+    if soft_gates.ndim > 2:
+        soft_gates = soft_gates.reshape(-1, soft_gates.shape[-1])
+    if gate_logits is not None and gate_logits.ndim > 2:
+        gate_logits = gate_logits.reshape(-1, gate_logits.shape[-1])
 
     num_experts = soft_gates.shape[1]
 
@@ -90,16 +158,21 @@ def compute_moe_regularization(aux_info, device,
         importance = soft_gates.mean(0)
     if load is None or load.ndim != 1:
         top_k_idx = _get(aux_info, 'top_k_indices')
-        if top_k_idx is not None and top_k_idx.ndim == 2:
+        if top_k_idx is not None and top_k_idx.ndim >= 2:
+            if top_k_idx.ndim > 2:
+                top_k_idx = top_k_idx.reshape(-1, top_k_idx.shape[-1])
             oh = F.one_hot(top_k_idx, num_classes=num_experts).float()
-            load = oh.sum(dim=(0,1)) / float(max(1, top_k_idx.shape[0] * top_k_idx.shape[1]))
+            # 分母为 token 总数 × top_k（token 级路由时 token 数 = B × F）
+            load = oh.sum(dim=(0, 1)) / float(
+                max(1, top_k_idx.shape[0] * top_k_idx.shape[1]))
             if sel_freq is None:
                 sel_freq = oh.amax(dim=1).float().mean(0)
         else:
             load = soft_gates.mean(0)
     if sel_freq is None:
         gates = _get(aux_info, 'gates')
-        sel_freq = (gates > 0).float().mean(0) if gates is not None else torch.zeros_like(importance)
+        sel_freq = ((gates > 0).float().mean(0) if gates is not None
+                    else torch.zeros_like(importance))
 
     # 1. 负载均衡损失（lbt 为 detach 的监控值，反传用 importance×load 可微形式）
     if lbt is not None and lbt.numel() == 1:
@@ -146,4 +219,46 @@ def compute_moe_regularization(aux_info, device,
         stats[f'moe_select_freq_e{idx}'] = sel_freq[idx].detach()
         stats[f'moe_gate_mean_e{idx}'] = (gates[:, idx].mean().detach()
                                           if gates is not None else zero.detach())
+    if prob_std is not None:
+        stats['moe_router_prob_std'] = prob_std.detach()
     return total_reg, stats
+
+
+def compute_expert_diversity(model, aux_info, device):
+    """专家多样性/使用诊断，返回 {指标名: tensor}，**只报指标不返回损失**。
+
+    - ``moe_expert_cos_mean``：路由专家参数展平后的平均成对余弦（越低越多样）
+    - ``moe_expert_param_cv``：各专家参数范数的变异系数（越大容量分配越不均）
+    - ``moe_expert_out_norm_e{i}`` / ``moe_router_window_consistency``：
+      由 MoE 的 ``expert_stats_interval`` 采集后经 ``aux_info['expert_diag']`` 透传
+
+    异构专家（``expert_kind='heterogeneous'``）的参数布局不同：余弦只在尺寸
+    相同的专家对上统计，参数范数 CV 只在容量一致（同尺寸）时报告，避免把设计
+    差异误读为"使用不均"。由 ``main.py`` 按 ``--moe_expert_stats_interval`` 采样
+    调用；专家臂关闭（experts_mode='none'/'shared_only'）时只返回诊断透传项。
+    """
+    stats = {}
+    experts = getattr(model, 'experts', None)
+    if experts is not None and len(experts) > 1:
+        with torch.no_grad():
+            flats = []
+            for module in experts.values():
+                params = [p.detach().reshape(-1) for p in module.parameters()]
+                flats.append(torch.cat(params) if params else torch.zeros(1))
+            sizes = [int(f.numel()) for f in flats]
+            normed = [f / f.norm().clamp_min(1e-8) for f in flats]
+            sims = [torch.dot(normed[i], normed[j])
+                    for i in range(len(normed)) for j in range(i + 1, len(normed))
+                    if sizes[i] == sizes[j]]
+            if sims:
+                stats['moe_expert_cos_mean'] = torch.stack(sims).mean().to(device)
+            if len(set(sizes)) == 1:
+                norms = torch.stack([f.norm() for f in flats])
+                stats['moe_expert_param_cv'] = (
+                    norms.std(unbiased=False) / norms.mean().clamp_min(1e-8)).to(device)
+
+    diag = aux_info.get('expert_diag', None) if isinstance(aux_info, dict) else None
+    if isinstance(diag, dict):
+        for k, v in diag.items():
+            stats[f'moe_{k}'] = torch.as_tensor(float(v), device=device)
+    return stats

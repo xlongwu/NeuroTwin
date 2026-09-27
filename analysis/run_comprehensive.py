@@ -20,7 +20,8 @@ if str(ROOT) not in sys.path:
 from utils.common import set_seed, str2bool  # noqa: E402
 from train.losses import UncertaintyWeightedHybridLoss  # noqa: E402
 from analysis.metrics import (ensure_dir, export_significance_to_xlsx,  # noqa: E402
-                              load_hamd_data, resolve_device, save_json)
+                              compute_subject_metrics, load_hamd_data, resolve_device,
+                              save_json, summarize_subject_metrics)
 from analysis.checkpoint import build_model_and_loader  # noqa: E402
 from analysis.analyzer import ModelAnalyzer  # noqa: E402
 from analysis.visualizer import VisualizationGenerator  # noqa: E402
@@ -32,26 +33,29 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Comprehensive Model Analysis')
     
     # 基础参数
+    parser.add_argument('--mode', type=str, default='finetune', choices=['pretrain', 'finetune'])
     parser.add_argument('--seed', type=int, default=2024)
     parser.add_argument('--device', type=str, default='auto')
     
     # 路径参数
-    parser.add_argument('--data_root', type=str, default='/data3/Digital_Brain/AMD/data')
+    parser.add_argument('--data_root', type=str, default=str(ROOT / 'data'))
+    parser.add_argument('--split_file', type=str, default=None,
+                        help='固定 subject-ID split JSON，与训练使用同一文件。')
     parser.add_argument('--finetuned_weight', type=str,
-                        default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/finetuned_best.pt')
+                        default=str(ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'finetuned_best.pt'))
     parser.add_argument('--output_dir', type=str,
-                        default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/analysis_results')
+                        default=str(ROOT / 'checkpoints' / 'neurotwin_finetune_pred13' / 'analysis_results'))
     parser.add_argument('--run_name', type=str,
                         default='comprehensive_analysis')
     parser.add_argument('--clinical_file', type=str,
-                        default='Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx')
+                        default='Rest-meta-MDD-V1V2-Merged-MDD.xlsx')
     
     # HAMD分析参数
     parser.add_argument('--hamd_normalized_file', type=str,
-                       default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx',
+                       default=None,
                        help='归一化HAMD文件路径（用于匹配样本）')
     parser.add_argument('--hamd_original_file', type=str,
-                       default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-HAMD-V1-V2-Merge.xlsx',
+                       default=None,
                        help='原始HAMD文件路径（用于可视化）')
     parser.add_argument('--expert_assignment_method', type=str, default='top1',
                        choices=['top1', 'threshold'],
@@ -79,9 +83,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--top_k', type=int, default=2)
     parser.add_argument('--moe_expert_hidden_dim', type=int, default=256)
     parser.add_argument('--moe_use_shared_expert', type=str2bool, default=True)
-    parser.add_argument('--moe_router_cond_only', type=str2bool, default=True)
+    # 注意：默认值必须与训练脚本一致。moe_router_cond_only 会改变路由器输入维度
+    # （False 时输入为 hidden_states+cond_dim），若与训练相反则 router 权重形状不匹配，
+    # strict_load=False 下会被静默跳过，评估结果不可用。
+    parser.add_argument('--moe_router_cond_only', type=str2bool, default=False)
     parser.add_argument('--moe_use_argmax', type=str2bool, default=False)
     parser.add_argument('--moe_inference_temperature', type=float, default=0.3)
+
+    # 预测头（Phase 7.1）：必须与训练时一致，否则概率头权重无法从 checkpoint 加载
+    parser.add_argument('--pred_head', type=str, default='gaussian',
+                       choices=['point', 'gaussian', 'quantile'],
+                       help='预测头类型，需与训练配置一致（默认 gaussian）')
+    parser.add_argument('--pred_quantiles', type=str, default='0.1,0.5,0.9',
+                       help='--pred_head quantile 时的分位点列表（逗号分隔）')
     
     # 加载参数
     parser.add_argument('--strict_load', type=str2bool, default=False)
@@ -93,8 +107,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--persistent_workers', type=str2bool, default=True)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--cache_in_memory', type=str2bool, default=False)
-    parser.add_argument('--val_ratio', type=float, default=0.2)
+    # 划分参数必须与训练脚本一致（scripts/Finetune_MDD.sh / Pretrain_HC.sh 为
+    # seed=2024 / val_ratio=0.10 / test_ratio=0.10 / stratify_bins=5），否则被评估的
+    # val/test 划分与训练时留出的那批被试不是同一批，test 就不能称为独立测试集。
+    parser.add_argument('--val_ratio', type=float, default=0.10)
+    parser.add_argument('--test_ratio', type=float, default=0.10)
     parser.add_argument('--stratify_bins', type=int, default=5)
+    parser.add_argument('--eval_split', type=str, default='val',
+                        choices=['val', 'test'],
+                        help='在哪个划分上评估：val（默认）或 test（独立测试集，8:1:1 留出）')
     
     # 损失权重
     parser.add_argument('--moe_load_balance_weight', type=float, default=0.01)
@@ -126,9 +147,12 @@ def main():
     
     log.info(f'Device: {device}')
     log.info(f'Checkpoint: {args.finetuned_weight}')
+    log.info(f'Eval split: [{args.eval_split}] | seed={args.seed} '
+             f'val_ratio={args.val_ratio} test_ratio={args.test_ratio} '
+             f'stratify_bins={args.stratify_bins}')
     
     # 构建模型和数据加载器
-    model, val_data, compat_info = build_model_and_loader(args, device)
+    model, eval_data, compat_info = build_model_and_loader(args, device)
     criterion = UncertaintyWeightedHybridLoss().to(device)
     
     # 创建输出目录
@@ -147,7 +171,7 @@ def main():
     # ═══════════════════════════════════════════════════════════════════════
     
     metrics, artifacts = analyzer.evaluate(
-        val_data, criterion,
+        eval_data, criterion,
         moe_load_balance_weight=args.moe_load_balance_weight,
         moe_entropy_weight=args.moe_entropy_weight,
         moe_z_loss_weight=args.moe_z_loss_weight,
@@ -157,6 +181,8 @@ def main():
     metrics['ckpt_version'] = 'standard'
     metrics['ckpt_missing_count'] = len(compat_info['missing'])
     metrics['ckpt_unexpected_count'] = len(compat_info['unexpected'])
+    # 记录评估划分，便于区分 val / 独立 test 的结果文件
+    metrics['eval_split'] = args.eval_split
     
     # 保存指标
     save_json(save_dir / 'metrics.json', metrics)
@@ -166,21 +192,29 @@ def main():
         {
             'sample_index': i,
             'subj_id': str(artifacts['subj_ids'][i]),
-            'pathology_score': float(artifacts['pathology_scores'][i]),
+            'pathology_score': float(artifacts['pathology_scores_original'][i]),
+            'pathology_score_model_input': float(artifacts['pathology_scores'][i]),
             'sample_pcc': float(artifacts['sample_pcc'][i]),
+            'sample_mae': float(np.mean(np.abs(artifacts['pred'][i] - artifacts['target'][i]))),
         }
         for i in range(len(artifacts['sample_pcc']))
     ]
     save_json(save_dir / 'sample_metrics.json', sample_rows)
+    subject_rows = compute_subject_metrics(
+        artifacts['pred'], artifacts['target'], artifacts['subj_ids'],
+        pathology_scores=artifacts['pathology_scores_original'])
+    save_json(save_dir / 'subject_metrics.json', subject_rows)
+    save_json(save_dir / 'subject_summary.json', summarize_subject_metrics(subject_rows))
     
     # ═══════════════════════════════════════════════════════════════════════
     #  2. 专家-HAMD分布分析
     # ═══════════════════════════════════════════════════════════════════════
     
     # 加载HAMD数据
+    clinical_default = str(Path(args.data_root) / args.clinical_file)
     hamd_data = load_hamd_data(
-        args.hamd_normalized_file,
-        args.hamd_original_file
+        args.hamd_normalized_file or clinical_default,
+        args.hamd_original_file or clinical_default,
     )
     
     expert_hamd_analysis = {}
@@ -237,7 +271,7 @@ def main():
     # ═══════════════════════════════════════════════════════════════════════
     if args.compute_feature_importance:
         importance = analyzer.compute_feature_importance(
-            val_data, 
+            eval_data,
             n_samples=args.feature_importance_samples,
             n_permutations=args.feature_importance_permutations,
             method=args.feature_importance_method
@@ -283,6 +317,7 @@ def main():
             gate_weights=artifacts['gate_weights'] if artifacts['gate_weights'] is not None else [],
             subj_ids=artifacts['subj_ids'],
             pathology_scores=artifacts['pathology_scores'],
+            pathology_scores_original=artifacts['pathology_scores_original'],
             roi_mae=artifacts['roi_metrics']['roi_mae'],
             roi_pcc=artifacts['roi_metrics']['roi_pcc'],
         )

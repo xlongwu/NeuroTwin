@@ -233,6 +233,133 @@ def compute_temporal_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, 
     }
 
 
+def _gaussian_z(alpha: float) -> float:
+    """双侧正态分位数 z_{1-α/2}（用于把高斯 logvar 转成预测区间）。"""
+    try:
+        from scipy.stats import norm
+        return float(norm.ppf(1.0 - alpha / 2.0))
+    except Exception:  # scipy 缺失时退化为查表，避免 import 失败影响主流程
+        table = {0.05: 1.959963984540054, 0.1: 1.6448536269514722,
+                 0.2: 1.2815515655446004}
+        if alpha in table:
+            return table[alpha]
+        log.warning("scipy 不可用且 alpha=%s 未在查表中，回退 z=1.959963985（alpha=0.05）", alpha)
+        return 1.959963984540054
+
+
+def fit_conformal_scale(pred, target, pred_logvar=None, lower=None, upper=None,
+                        alpha: float = 0.1) -> float:
+    """在拟合集（应为 val）上拟合 conformal 区间缩放因子 q。
+
+    高斯 NLL 训练的方差估计存在系统性上偏（模型用大 σ 缓冲错误预测），
+    导致名义 (1-α) 区间实际覆盖显著高于名义值（PICP 过覆盖）。本函数按
+    conformal prediction 的思路拟合归一化残差的经验高分位：
+
+        r_i = |y_i - μ_i| / σ_i ，  q = Quantile_{⌈(N+1)(1-α)⌉/N}(r)
+
+    应用侧区间为 ``μ ± q·σ``（分位数头则 ``σ_eff=(upper-lower)/(2z)`` 代入）。
+    该构造对任意残差分布保证边际覆盖 ≥ 1-α（finite-sample 保证），
+    仅用拟合集统计量、不触碰模型权重与训练流程。
+
+    Args:
+        pred / target: 拟合集预测与真值（同形）。
+        pred_logvar: 高斯头对数方差（与 ``lower/upper`` 二选一）。
+        lower / upper: 分位数头区间端点。
+        alpha: 未覆盖率，名义覆盖 1 - alpha。
+
+    Returns:
+        标量缩放因子 q（> 0）。q < z_{1-α/2} 说明原区间过宽（过覆盖），
+        q > z 则过窄（欠覆盖）。
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    z = _gaussian_z(alpha)
+    if pred_logvar is not None:
+        lv = np.asarray(pred_logvar, dtype=np.float64)
+        sigma = np.exp(0.5 * lv)
+    elif lower is not None and upper is not None:
+        lo = np.asarray(lower, dtype=np.float64)
+        hi = np.asarray(upper, dtype=np.float64)
+        sigma = (hi - lo) / (2.0 * z)  # 由区间端点反推有效 σ
+    else:
+        raise ValueError("fit_conformal_scale 需要 pred_logvar 或 lower/upper 之一")
+    sigma = np.clip(sigma, 1e-12, None)
+    residuals = np.abs(target - pred) / sigma
+    n = residuals.size
+    level = min(1.0, float(np.ceil((n + 1) * (1.0 - alpha)) / n))
+    return float(np.quantile(residuals, level, method='higher'))
+
+
+def compute_calibration_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    pred_logvar: np.ndarray = None,
+    lower: np.ndarray = None,
+    upper: np.ndarray = None,
+    alpha: float = 0.1,
+) -> Dict[str, float]:
+    """概率预测的校准指标（Phase 7.1 概率头评估）。
+
+    Args:
+        pred: 点预测（高斯/分位头的均值或中位数），与 ``target`` 同形。
+        target: 真实值。
+        pred_logvar: 高斯头的对数方差（与 ``pred`` 同形）；与 ``lower/upper`` 二选一。
+        lower / upper: 分位头给出的预测区间端点（与 ``pred`` 同形）。
+        alpha: 目标未覆盖率，名义覆盖率 = 1 - alpha（默认 0.9）。
+
+    Returns:
+        字典，包含：
+
+        ================  ==========================================================
+        PICP              实际覆盖率（真实值落入区间的比例，越接近名义值越好）
+        MPIW              平均预测区间宽度（同一数值空间，越小越锐利）
+        PICP_target       名义覆盖率 1 - alpha
+        MPIW_norm         MPIW 除以目标标准差，跨被试/跨 ROI 可比
+        Gaussian_NLL      平均高斯负对数似然（仅 ``pred_logvar`` 可用时给出）
+        ================  ==========================================================
+
+        区间端点优先使用显式给出的 ``lower/upper``；否则由 ``pred_logvar`` 按
+        ``pred ± z·σ`` 构造。两者都缺失时返回仅含名义覆盖率的字典。
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if pred.shape != target.shape:
+        raise ValueError(f"pred 与 target 形状需一致，收到 {pred.shape} 与 {target.shape}")
+    metrics = {'PICP_target': float(1.0 - alpha)}
+
+    lv = None
+    if pred_logvar is not None:
+        lv = np.asarray(pred_logvar, dtype=np.float64)
+        if lv.shape != pred.shape:
+            raise ValueError(
+                f"pred_logvar 与 pred 形状需一致，收到 {lv.shape} 与 {pred.shape}")
+        metrics['Gaussian_NLL'] = float(
+            np.mean(0.5 * (lv + (target - pred) ** 2 * np.exp(-lv))))
+
+    if lower is None or upper is None:
+        if lv is None:
+            metrics.update({'PICP': float('nan'), 'MPIW': float('nan'),
+                            'MPIW_norm': float('nan')})
+            return metrics
+        z = _gaussian_z(float(alpha))
+        sigma = np.exp(0.5 * lv)
+        lower = pred - z * sigma
+        upper = pred + z * sigma
+    else:
+        lower = np.asarray(lower, dtype=np.float64)
+        upper = np.asarray(upper, dtype=np.float64)
+        if lower.shape != pred.shape or upper.shape != pred.shape:
+            raise ValueError(
+                "lower/upper 与 pred 形状需一致，收到 "
+                f"{lower.shape}/{upper.shape} 与 {pred.shape}")
+
+    width = upper - lower
+    metrics['PICP'] = float(np.mean((target >= lower) & (target <= upper)))
+    metrics['MPIW'] = float(np.mean(width))
+    metrics['MPIW_norm'] = float(np.mean(width) / (np.std(target) + 1e-12))
+    return metrics
+
+
 def fdr_correction(pvalues: np.ndarray, alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
     """
     Benjamini-Hochberg FDR 校正

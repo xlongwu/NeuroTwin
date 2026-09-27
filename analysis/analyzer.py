@@ -10,6 +10,7 @@ from scipy import stats as scipy_stats
 from tqdm import tqdm
 
 from analysis.metrics import (compute_advanced_metrics,
+                              compute_calibration_metrics,
                               compute_roi_level_metrics,
                               compute_temporal_metrics,
                               pearson_per_sample)
@@ -33,6 +34,7 @@ class ModelAnalyzer:
         """执行完整评估"""
         meters = defaultdict(float)
         all_preds, all_targets, all_sample_pccs = [], [], []
+        all_logvars, all_lowers, all_uppers = [], [], []
         all_gate_weights = []
         all_subj_ids = []
         all_pathology_scores = []
@@ -51,8 +53,8 @@ class ModelAnalyzer:
             # 前向传播
             out, aux = self.model(x, sc, pathology)
             
-            # 计算损失
-            total_loss, loss_stats = criterion(out, y)
+            # 计算损失（传入 aux 以与训练口径一致：概率头启用时含 NLL 项）
+            total_loss, loss_stats = criterion(out, y, aux_info=aux)
             moe_reg, _ = compute_moe_regularization(
                 aux_info=aux, device=self.device,
                 load_balance_weight=moe_load_balance_weight,
@@ -68,6 +70,7 @@ class ModelAnalyzer:
             meters['loss_mae'] += float(loss_stats['loss_mae'].item())
             meters['loss_diff'] += float(loss_stats['loss_diff'].item())
             meters['loss_std'] += float(loss_stats['loss_std'].item())
+            meters['loss_nll'] += float(loss_stats['loss_nll'].item())
             meters['metric_mae'] += float(mae.item())
             
             # 样本级 PCC
@@ -79,6 +82,17 @@ class ModelAnalyzer:
             target_np = y.detach().cpu().numpy()
             all_preds.append(pred_np)
             all_targets.append(target_np)
+
+            # 概率头输出（Phase 7.1）：logvar 或分位数端点，用于校准指标
+            if isinstance(aux, dict):
+                lv = aux.get('pred_logvar')
+                if torch.is_tensor(lv):
+                    all_logvars.append(lv.detach().cpu().numpy())
+                pq = aux.get('pred_quantiles')
+                if torch.is_tensor(pq) and pq.shape[2] >= 2:
+                    pq_np = pq.detach().cpu().numpy()  # [B,F,Q,W,S]
+                    all_lowers.append(pq_np[:, :, 0])
+                    all_uppers.append(pq_np[:, :, -1])
             
             # 存储 batch 数据
             all_batch_data.append({
@@ -125,6 +139,17 @@ class ModelAnalyzer:
         metrics['sample_pcc_std'] = float(np.std(sample_pcc_np))
         metrics['sample_pcc_median'] = float(np.median(sample_pcc_np))
         metrics['num_samples'] = int(pred_np.shape[0])
+
+        # 概率预测校准指标（Phase 7.1）：仅当模型输出 logvar 或分位数时计算
+        lv_np = np.concatenate(all_logvars, axis=0) if all_logvars else None
+        if all_lowers:
+            lo_np = np.concatenate(all_lowers, axis=0)
+            hi_np = np.concatenate(all_uppers, axis=0)
+        else:
+            lo_np = hi_np = None
+        if lv_np is not None or lo_np is not None:
+            metrics.update(compute_calibration_metrics(
+                pred_np, target_np, pred_logvar=lv_np, lower=lo_np, upper=hi_np))
         
         # ROI 级别指标
         roi_metrics = compute_roi_level_metrics(pred_np, target_np)
@@ -155,6 +180,10 @@ class ModelAnalyzer:
             'roi_metrics': roi_metrics,
             'temporal_metrics': temporal_metrics,
             'batch_data': all_batch_data,
+            # 概率头产物（仅 gaussian/quantile 头非空），供 conformal 方差校准复用
+            'pred_logvar': lv_np,
+            'lower': lo_np,
+            'upper': hi_np,
         }
         
         return metrics, artifacts

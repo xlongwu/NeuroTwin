@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # NeuroTwin：病理条件驱动的脑动态数字孪生框架
 
 > **NeuroTwin: Pathology-Conditioned Mixture-of-Denoising-Experts Digital Twin for Brain Dynamics**
@@ -48,7 +47,6 @@ NeuroTwin/
 │   ├── augmentation.py         # BrainSignalAugmentation 训练集增强
 │   └── common.py               # set_seed / str2bool 通用工具
 ├── analysis/
-│   ├── run_comprehensive.py    # 综合分析 CLI 入口
 │   ├── analyzer.py / metrics.py / checkpoint.py / visualizer.py
 │   ├── analyze_low_pcc_samples.py    # 低 PCC 样本临床特征关联分析
 │   ├── visualize_roi_importance.py   # 结合 AAL116 图谱的 ROI 重要性可视化
@@ -95,7 +93,7 @@ data_root/
 ├── Mask/
 │   ├── HC/   # Mask_{subj_id}.mat（结构连接矩阵 SC）
 │   └── MDD/
-└── Rest-meta-MDD-HAMD-V1-V2-Merge-Normalize.xlsx   # 临床评分表（微调必需，含 ID 与 HAMD 列）
+└── Rest-meta-MDD-V1V2-Merged-MDD.xlsx              # 临床评分表（微调必需，含 ID 与 HAMD 列）
 ```
 
 单个样本的张量构成（由 `NeuroTwinDataset` 滑窗生成，最大起点为 `total_windows - in_window - pred_window + 1`）：
@@ -205,21 +203,41 @@ MoE 训练正则（`compute_moe_regularization`，仅在 finetune 生效）：
 
 ## 评估与可解释性分析
 
-综合分析（回归指标、专家-HAMD 分层、ROI 置换重要性、FDR 显著脑区、玻璃脑图等）：
+统一评估/分析入口为 [experiments/evaluate_variant.py](experiments/evaluate_variant.py)
+（已合并原 `analysis/run_comprehensive.py` 的全部能力）。模型结构与数据划分参数
+直接取自 checkpoint 内的训练配置快照，无需手工同步超参，结构性变体不会权重错配。
+默认在被试级 8:1:1 留出的独立 test 集评估（训练全程未参与选权重），需要 val 时
+显式 `--splits test,val`：
 
 ```bash
-python analysis/run_comprehensive.py \
-    --finetuned_weight checkpoints/neurotwin_finetune_pred1/finetuned_best.pt \
-    --data_root /data3/Digital_Brain/AMD/data \
-    --output_dir ./checkpoints/analysis_results
+python -m experiments.evaluate_variant \
+    --ckpt checkpoints/neurotwin_finetune_pred1/finetuned_best.pt \
+    --out_dir ./results/eval/neurotwin_finetune_pred1
 ```
+
+基础产出：`metrics_test.json`（PCC/MAE/R²/PICP、HAMD 分层、shuffled-HAMD 负对照、
+gate 统计、FC 边级/网络级、被试级聚合、参数量）、`sample_metrics_test.csv`、
+`subject_metrics_test.csv`。权重加载不完整时直接报错退出（strict 加载）。
+
+可选重分析开关：
+
+```bash
+python -m experiments.evaluate_variant \
+    --ckpt checkpoints/neurotwin_finetune_pred1/finetuned_best.pt \
+    --out_dir ./results/eval/neurotwin_finetune_pred1 \
+    --visualize --feature_importance --save_arrays
+```
+
+- `--visualize`：散射/误差分布/ROI 热图/门控分析/专家-HAMD 分布/综合仪表板等
+- `--feature_importance`：ROI 置换重要性 + FDR 显著脑区 xlsx 导出
+- `--save_arrays`：预测数组 `predictions_<split>.npz`
 
 配套脚本：
 
 | 脚本 | 用途 |
 | --- | --- |
-| [analysis/analyze_low_pcc_samples.py](analysis/analyze_low_pcc_samples.py) | 低 PCC 样本与临床特征（HAMD 等）的关联分析 |
-| [analysis/visualize_roi_importance.py](analysis/visualize_roi_importance.py) | 结合 AAL116 图谱的 ROI 置换重要性可视化 |
+| [analysis/analyze_low_pcc_samples.py](analysis/analyze_low_pcc_samples.py) | 低 PCC 样本与临床特征（HAMD 等）的关联分析（读 `sample_metrics_<split>.csv`） |
+| [analysis/visualize_roi_importance.py](analysis/visualize_roi_importance.py) | 结合 AAL116 图谱的 ROI 置换重要性可视化（读 `feature_importance_<split>.json`） |
 | [analysis/visualize_sig_region.py](analysis/visualize_sig_region.py) | 按脑网络分组渲染显著脑区玻璃脑图（依赖 nilearn） |
 
 回归指标覆盖 MAE / MSE / RMSE / PCC / R² / SMAPE / MASE / 误差分位数；模型内置 `virtual_intervention` 虚拟干预接口（excitatory / inhibitory / variance_boost / variance_suppress），支持机制层面的可干预性分析。
