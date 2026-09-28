@@ -128,6 +128,13 @@ class NeuroTwinNextPointDataset(Dataset):
         bold_source: str = 'auto',
         subject_cache_size: int = 256,
         cache_in_memory: bool = False,
+        # 实测（R1/R2 对照）：page cache 下 loadmat 重复读并非瓶颈，被试级缓存
+        # 无稳态收益且增加 worker 内存（×num_workers）与启动成本，故默认关闭
+        cache_subjects: bool = False,
+        # 可变截断：允许未来窗不足 pred_window 的样本入训，提升每被试样本数
+        # （pred_window=3 且 total_windows=9 / in_window=6 时固定截断仅 1 样本/被试）。
+        # 不足部分在 y 中以零占位，并由 pred_mask 标记为无效窗口，损失端按掩码加权。
+        variable_cutoff: bool = False,
     ):
         self.data_root = Path(data_root)
         self.mode = mode
@@ -384,6 +391,10 @@ class NeuroTwinNextPointDataset(Dataset):
             'subj_id': subj_id,
             'series_len': T,
         }
+        if self.variable_cutoff:
+            mask = np.zeros(self.pred_window, dtype=np.float32)
+            mask[:pred_len] = 1.0
+            out['pred_mask'] = torch.from_numpy(mask)
         if self.mode == 'finetune':
             entry['pathology_score'] = np.asarray(
                 self.clinical_dict[subj_id], dtype=np.float32)
@@ -765,6 +776,7 @@ class NeuroTwinDataLoader:
         test_ratio: float = 0.1,
         stratify_bins: int = 5,
         cache_in_memory: Optional[bool] = None,
+        cache_subjects: bool = False,
         persistent_workers: bool = True,
         prefetch_factor: int = 2,
         refresh_split_manifest: bool = False,
@@ -837,6 +849,8 @@ class NeuroTwinDataLoader:
             bold_source=self.bold_source,
             subject_cache_size=self.subject_cache_size,
             cache_in_memory=cache_in_memory,
+            cache_subjects=cache_subjects,
+            variable_cutoff=variable_cutoff,
         )
 
         train_indices, val_indices, test_indices, train_subjects, val_subjects, test_subjects = self._split_indices_by_subject(
@@ -873,6 +887,11 @@ class NeuroTwinDataLoader:
             anchors_per_subject=self.eval_anchors_per_subject,
             rollout_tasks_per_subject=self.eval_rollout_tasks_per_subject,
             rollout_steps=self.eval_rollout_steps)
+
+        # 持久化被试划分结果：供归一化统计量拟合、分析脚本与实验记录复用
+        self.train_subjects: List[str] = sorted(train_subjects)
+        self.val_subjects: List[str] = sorted(val_subjects)
+        self.test_subjects: List[str] = sorted(test_subjects)
 
         # 持久化被试划分结果：供归一化统计量拟合、分析脚本与实验记录复用
         self.train_subjects: List[str] = sorted(train_subjects)

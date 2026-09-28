@@ -680,6 +680,12 @@ class NeuroTwin(nn.Module):
         inversion_hidden_dim: int = 128,
     ):
         super().__init__()
+        if recur_mode not in ('none', 'terminal_state'):
+            raise ValueError(
+                f"recur_mode 仅支持 none/terminal_state，收到 '{recur_mode}'")
+        self.recur_mode = recur_mode
+        # scheduled sampling 概率：仅在训练态、且 future 可用时生效
+        self._scheduled_sampling_prob = 0.0
         self.features         = features
         self.norm             = norm
         self.pretrain_mode    = pretrain_mode
@@ -1183,6 +1189,7 @@ class NeuroTwin(nn.Module):
         dfc_data: torch.Tensor,
         sc_matrix: torch.Tensor,
         pathology_score: Optional[torch.Tensor] = None,
+        future: Optional[torch.Tensor] = None,
     ):
         """单次前向：整段 context 作为单窗口，并行预测各 offset 的下一时间点。"""
         history = dfc_data
