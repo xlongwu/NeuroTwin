@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 """
-ROI重要性可视化脚本
-结合AAL116脑区图谱信息进行可视化
+ROI 重要性可视化（next_timepoint 口径）
+
+输入为 experiments/evaluate_variant.py --feature_importance 落盘的
+``feature_importance_<split>.json``（ROI 置换重要性 ΔMAE + BH-FDR 校正 q 值），
+结合 AAL116 脑区图谱名称与网络标签进行可视化；FDR 显著脑区在图中单独标注。
 """
 import argparse
 import json
@@ -11,6 +14,9 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
 from pathlib import Path
+
+# 项目根目录（脚本位于 <root>/analysis/，路径均基于项目内）
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'SimHei', 'Arial Unicode MS']
@@ -45,9 +51,10 @@ NETWORK_COLORS = {
 
 def parse_args():
     p = argparse.ArgumentParser(description='ROI 重要性可视化（结合 AAL116 图谱）')
-    p.add_argument('--input_json', type=str, default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/interpretability/comprehensive_analysis_20260422_230827/feature_importance.json',
-                   help='run_comprehensive 输出的 feature_importance.json')
-    p.add_argument('--aal_file', type=str, default='/data3/Digital_Brain/AMD/data/AAL116.xlsx',
+    p.add_argument('--input_json', type=str, required=True,
+                   help='evaluate_variant.py --feature_importance 输出的 '
+                        'feature_importance_<split>.json（next_timepoint ROI 置换重要性）')
+    p.add_argument('--aal_file', type=str, default=str(PROJECT_ROOT / 'data' / 'AAL116.xlsx'),
                    help='AAL116 脑区图谱 xlsx')
     p.add_argument('--output_dir', type=str, default=None,
                    help='图片输出目录，默认 <input_json 所在目录>/visualizations')
@@ -66,22 +73,35 @@ def load_data(args):
     return importance_data, aal_df
 
 def prepare_data(importance_data, aal_df):
-    """准备数据用于可视化"""
+    """准备数据用于可视化（并附带 FDR q 值 / 显著性列，若产物中存在）。"""
     roi_importance = importance_data['roi_importance']
-    
+
     # AAL116.xlsx 列名映射（中文列名）
     # 'micro编号', '中文名称', 'micro命名', 'abbr', '对应网络'
     name_col = 'micro命名' if 'micro命名' in aal_df.columns else 'AAL_Name'
     network_col = '对应网络' if '对应网络' in aal_df.columns else 'Network'
-    
-    # 创建DataFrame
+    if len(aal_df) != len(roi_importance):
+        raise ValueError(
+            f'AAL 图谱行数({len(aal_df)})与重要性长度({len(roi_importance)})不一致，'
+            f'无法按 ROI 索引对齐；请核对 --aal_file 与被评估模型的 num_rois。')
+
     df = pd.DataFrame({
         'ROI_Index': range(len(roi_importance)),
         'Importance': roi_importance,
-        'AAL_Name': aal_df[name_col].values if name_col in aal_df.columns else [f'ROI_{i}' for i in range(len(roi_importance))],
-        'Network': aal_df[network_col].values if network_col in aal_df.columns else ['Unknown'] * len(roi_importance)
+        'AAL_Name': (aal_df[name_col].values if name_col in aal_df.columns
+                     else [f'ROI_{i}' for i in range(len(roi_importance))]),
+        'Network': (aal_df[network_col].values if network_col in aal_df.columns
+                    else ['Unknown'] * len(roi_importance))
     })
-    
+
+    # 置换检验 p 值 / BH-FDR q 值（旧产物无此列时为 NaN，不影响其余可视化）
+    pvals = importance_data.get('roi_pvalues')
+    qvals = importance_data.get('roi_pvalues_fdr')
+    alpha = float(importance_data.get('fdr_alpha', 0.05))
+    df['Pvalue'] = np.asarray(pvals, dtype=float) if pvals else np.nan
+    df['Qvalue'] = np.asarray(qvals, dtype=float) if qvals else np.nan
+    df['Significant'] = (df['Qvalue'] < alpha) if qvals else False
+
     # 按重要性排序
     df_sorted = df.sort_values('Importance', ascending=False).reset_index(drop=True)
     df_sorted['Rank'] = range(1, len(df_sorted) + 1)
@@ -94,19 +114,22 @@ def plot_roi_importance_bar(df_sorted, output_path, top_n=30):
     
     top_df = df_sorted.head(top_n)
     
-    # 为每个网络分配颜色
+    # 为每个网络分配颜色；FDR 显著脑区加斜纹底纹以便区分
     colors = [NETWORK_COLORS.get(net, '#999999') for net in top_df['Network']]
-    
-    bars = ax.barh(range(top_n), top_df['Importance'].values, color=colors, edgecolor='black', linewidth=0.5)
+    hatches = ['///' if sig else '' for sig in top_df['Significant']]
+
+    bars = ax.barh(range(top_n), top_df['Importance'].values, color=colors,
+                   edgecolor='black', linewidth=0.5, hatch=hatches)
     
     # 设置y轴标签
     y_labels = [f"{row['AAL_Name'][:30]}" for _, row in top_df.iterrows()]
     ax.set_yticks(range(top_n))
     ax.set_yticklabels(y_labels, fontsize=9)
     
-    # 添加数值标签
+    # 添加数值标签（显著者加 *）
     for i, (idx, row) in enumerate(top_df.iterrows()):
-        ax.text(row['Importance'] + 0.0001, i, f'{row["Importance"]:.4f}', 
+        star = '*' if row['Significant'] else ''
+        ax.text(row['Importance'] + 0.0001, i, f'{row["Importance"]:.4f}{star}', 
                 va='center', fontsize=8, color='black')
     
     ax.set_xlabel('Importance Score', fontsize=12)
@@ -119,6 +142,9 @@ def plot_roi_importance_bar(df_sorted, output_path, top_n=30):
     legend_elements = [Patch(facecolor=NETWORK_COLORS.get(net, '#999999'), 
                             edgecolor='black', label=NETWORK_NAMES.get(net, net)) 
                       for net in top_df['Network'].unique() if net in NETWORK_COLORS]
+    if top_df['Significant'].any():
+        legend_elements.append(Patch(facecolor='white', edgecolor='black', hatch='///',
+                                     label='FDR 显著（*）'))
     ax.legend(handles=legend_elements, loc='lower right', fontsize=8)
     
     plt.tight_layout()
@@ -291,8 +317,12 @@ def plot_importance_distribution(df, output_path):
 
 def generate_summary_table(df_sorted, network_stats, output_path):
     """生成汇总统计表并保存"""
-    # Top 20 ROI
-    top20 = df_sorted.head(20)[['Rank', 'AAL_Name', 'Network', 'Importance']]
+    # Top 20 ROI（附 p/q 值，若产物提供）
+    cols = ['Rank', 'AAL_Name', 'Network', 'Importance']
+    for extra in ('Pvalue', 'Qvalue'):
+        if df_sorted[extra].notna().any():
+            cols.append(extra)
+    top20 = df_sorted.head(20)[cols]
     
     summary = {
         'top_20_roi': top20.to_dict('records'),
@@ -302,7 +332,8 @@ def generate_summary_table(df_sorted, network_stats, output_path):
             'std_importance': float(df_sorted['Importance'].std()),
             'min_importance': float(df_sorted['Importance'].min()),
             'max_importance': float(df_sorted['Importance'].max()),
-            'median_importance': float(df_sorted['Importance'].median())
+            'median_importance': float(df_sorted['Importance'].median()),
+            'n_significant_fdr': int(df_sorted['Significant'].sum()),
         }
     }
     
@@ -312,21 +343,22 @@ def generate_summary_table(df_sorted, network_stats, output_path):
     print(f"Saved: {output_path}")
     return summary
 
-def main():
+def main(args):
     print("="*60)
     print("ROI重要性可视化")
     print("="*60)
-    
+
     # 加载数据
     print("\n1. 加载数据...")
-    importance_data, aal_df = load_data()
-    
+    importance_data, aal_df = load_data(args)
+
     # 准备数据
     print("2. 准备数据...")
     df, df_sorted = prepare_data(importance_data, aal_df)
-    
-    # 输出路径
-    output_dir = '/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/interpretability/comprehensive_analysis_20260422_230827/visualizations'
+
+    # 输出路径：默认 <input_json 所在目录>/visualizations
+    output_dir = args.output_dir or str(Path(args.input_json).parent / 'visualizations')
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # 生成可视化
     print("\n3. 生成可视化...")

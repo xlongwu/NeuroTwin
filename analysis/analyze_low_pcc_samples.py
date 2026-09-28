@@ -1,7 +1,12 @@
 #!/usr/bin/env python
 """
-低PCC样本临床特征分析
-分析预测PCC较低的样本与临床特征的关联
+低 PCC 被试临床特征分析（next_timepoint 口径）
+
+分析 next-state 预测 spatial PCC（沿 ROI 维）较低的被试与临床特征的关联。输入为
+experiments/evaluate_variant.py 落盘的 next_timepoint 评估产物：
+
+  - per_task_metrics_<split>.csv : 逐任务 t+δ_PCC_spatial（用于被试内 PCC 分布统计）
+  - per_subject_metrics_<split>.csv : 被试级 hamd（作为病理评分）
 """
 
 import argparse
@@ -16,6 +21,9 @@ from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
+# 项目根目录（脚本位于 <root>/analysis/，路径均基于项目内）
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['Times New Roman']
 plt.rcParams['axes.unicode_minus'] = False
@@ -23,40 +31,68 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def parse_args():
     p = argparse.ArgumentParser(description='低 PCC 样本临床特征分析')
-    p.add_argument('--analysis_dir', type=str, default='/data3/Digital_Brain/NeuroTwin/checkpoints/neurotwin_finetune_pred13/interpretability/comprehensive_analysis_20260422_230827',
-                   help='run_comprehensive 输出目录（含 sample_metrics.json）')
+    p.add_argument('--eval_dir', type=str, required=True,
+                   help='evaluate_variant.py 输出目录（含 per_task_metrics_<split>.csv 与 '
+                        'per_subject_metrics_<split>.csv）')
+    p.add_argument('--split', type=str, default='test', choices=['test', 'val'],
+                   help='读取哪个划分的评估 CSV（默认 test）')
+    p.add_argument('--offset', type=int, default=1,
+                   help='使用哪个预测偏移的 spatial PCC 作为主指标（默认 t+1）')
     p.add_argument('--output_dir', type=str, default=None,
-                   help='结果输出目录，默认 <analysis_dir>/low_pcc_analysis')
-    p.add_argument('--v1_file', type=str, default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-V1-MDD.xlsx')
-    p.add_argument('--v2_file', type=str, default='/data3/Digital_Brain/AMD/data/Rest-meta-MDD-V2-MDD.xlsx')
+                   help='结果输出目录，默认 <eval_dir>/low_pcc_analysis')
+    p.add_argument('--v1_file', type=str, default=str(PROJECT_ROOT / 'data' / 'Rest-meta-MDD-V1-MDD.xlsx'))
+    p.add_argument('--v2_file', type=str, default=str(PROJECT_ROOT / 'data' / 'Rest-meta-MDD-V2-MDD.xlsx'))
     return p.parse_args()
 
 
 def load_data(args):
-    """加载所有数据"""
-    # 加载sample metrics
-    with open(Path(args.analysis_dir) / 'sample_metrics.json', 'r') as f:
-        sample_metrics = json.load(f)
+    """加载 next_timepoint 评估产物（任务级 + 被试级 CSV）与 V1/V2 临床量表。"""
+    task_csv = Path(args.eval_dir) / f'per_task_metrics_{args.split}.csv'
+    subj_csv = Path(args.eval_dir) / f'per_subject_metrics_{args.split}.csv'
+    for path in (task_csv, subj_csv):
+        if not path.exists():
+            raise FileNotFoundError(
+                f'未找到 {path}；请先运行 experiments/evaluate_variant.py 生成 '
+                f'per_task_metrics_{args.split}.csv 与 per_subject_metrics_{args.split}.csv')
+
+    task_df = pd.read_csv(task_csv)
+    pcc_col = f't+{args.offset}_PCC_spatial'
+    if pcc_col not in task_df.columns:
+        raise ValueError(f'{task_csv} 缺少列 {pcc_col}；可用列：{list(task_df.columns)}')
+    # next-state spatial PCC（沿 ROI 维）作为逐任务预测质量指标
+    task_df = task_df.rename(columns={pcc_col: 'sample_pcc'})
+
+    # 被试级 CSV 提供 hamd（病理评分，与训练时的 pathology_score 同源）
+    subj_df = pd.read_csv(subj_csv).rename(
+        columns={'subject_id': 'subj_id', 'hamd': 'pathology_score'})
+    if not {'subj_id', 'pathology_score'}.issubset(subj_df.columns):
+        raise ValueError(
+            f'{subj_csv} 缺少 subject_id / hamd 列；可用列：{list(subj_df.columns)}')
 
     # 加载V1和V2 MDD数据
     v1_df = pd.read_excel(args.v1_file)
     v2_df = pd.read_excel(args.v2_file)
 
-    return sample_metrics, v1_df, v2_df
+    return task_df, subj_df[['subj_id', 'pathology_score']], v1_df, v2_df
 
-def process_sample_metrics(sample_metrics):
-    """处理样本metrics，提取PCC信息"""
+def process_sample_metrics(sample_metrics, subj_scores):
+    """处理逐任务 metrics，按被试聚合 PCC 分布并挂上病理评分。
+
+    被试内先对任务取 mean/std/min/max，避免任务数不均时被试被过度加权（与评估协议
+    「被试级为主口径」一致）。
+    """
     df = pd.DataFrame(sample_metrics)
     
-    # 按样本统计平均PCC
+    # 按被试统计 PCC 分布（count 为该被试的有效任务数）
     subj_stats = df.groupby('subj_id').agg({
-        'sample_pcc': ['mean', 'std', 'min', 'max', 'count'],
-        'pathology_score': 'first'
+        'sample_pcc': ['mean', 'std', 'min', 'max', 'count']
     }).reset_index()
+    subj_stats.columns = ['subj_id', 'mean_pcc', 'std_pcc', 'min_pcc', 'max_pcc', 'n_samples']
+
+    score_map = dict(zip(subj_scores['subj_id'], subj_scores['pathology_score']))
+    subj_stats['pathology_score'] = subj_stats['subj_id'].map(score_map)
     
-    subj_stats.columns = ['subj_id', 'mean_pcc', 'std_pcc', 'min_pcc', 'max_pcc', 'n_samples', 'pathology_score']
-    
-    # 定义低PCC阈值（使用10%分位数作为阈值，约0.81）
+    # 定义低PCC阈值（被试级 mean_pcc 的 10% 分位数）
     pcc_threshold = subj_stats['mean_pcc'].quantile(0.10)
     subj_stats['is_low_pcc'] = subj_stats['mean_pcc'] < pcc_threshold
     
@@ -196,9 +232,9 @@ def plot_pcc_distribution(subj_stats, threshold, output_path):
     ax.hist(subj_stats['mean_pcc'], bins=50, edgecolor='black', alpha=0.7, color='steelblue')
     ax.axvline(threshold, color='red', linestyle='--', linewidth=2, label=f'Low PCC threshold ({threshold})')
     ax.axvline(subj_stats['mean_pcc'].mean(), color='green', linestyle='--', linewidth=2, label=f'Mean ({subj_stats["mean_pcc"].mean():.3f})')
-    ax.set_xlabel('Mean Sample PCC', fontsize=12)
+    ax.set_xlabel('Mean Subject PCC', fontsize=12)
     ax.set_ylabel('Frequency', fontsize=12)
-    ax.set_title('Distribution of Mean Sample PCC', fontsize=13, fontweight='bold')
+    ax.set_title('Distribution of Mean Subject PCC', fontsize=13, fontweight='bold')
     ax.legend()
     ax.grid(alpha=0.3)
     
@@ -206,12 +242,13 @@ def plot_pcc_distribution(subj_stats, threshold, output_path):
     ax = axes[1]
     bp = ax.boxplot([subj_stats[subj_stats['is_low_pcc']]['mean_pcc'], 
                      subj_stats[~subj_stats['is_low_pcc']]['mean_pcc']],
-                    labels=['Low PCC\n(< 0.6)', 'Normal PCC\n(>= 0.6)'],
+                    labels=[f'Low PCC\n(< {threshold:.3f})',
+                            f'Normal PCC\n(>= {threshold:.3f})'],
                     patch_artist=True)
     bp['boxes'][0].set_facecolor('lightcoral')
     bp['boxes'][1].set_facecolor('lightgreen')
-    ax.set_ylabel('Mean Sample PCC', fontsize=12)
-    ax.set_title('PCC Comparison', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Mean Subject PCC', fontsize=12)
+    ax.set_title('Subject PCC Comparison', fontsize=13, fontweight='bold')
     ax.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
@@ -326,7 +363,7 @@ def plot_hamd_factors_comparison(low_pcc, normal_pcc, output_path):
     plt.close()
     print(f"Saved: {output_path}")
 
-def plot_pcc_vs_pathology(subj_stats, output_path):
+def plot_pcc_vs_pathology(subj_stats, threshold, output_path):
     """绘制PCC与病理评分的相关性"""
     fig, ax = plt.subplots(figsize=(10, 6))
     
@@ -351,15 +388,17 @@ def plot_pcc_vs_pathology(subj_stats, output_path):
                label=f'r={corr:.3f}, p={pval:.4f}')
     
     ax.set_xlabel('Pathology Score (Normalized HAMD)', fontsize=12)
-    ax.set_ylabel('Mean Sample PCC', fontsize=12)
+    ax.set_ylabel('Mean Subject PCC', fontsize=12)
     ax.set_title('PCC vs Pathology Score', fontsize=13, fontweight='bold')
     ax.legend()
     ax.grid(alpha=0.3)
     
     # 添加图例
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='#C55A11', edgecolor='black', label='Low PCC (< 0.6)'),
-                      Patch(facecolor='#5B9BD5', edgecolor='black', label='Normal PCC (>= 0.6)')]
+    legend_elements = [Patch(facecolor='#C55A11', edgecolor='black',
+                             label=f'Low PCC (< {threshold:.3f})'),
+                       Patch(facecolor='#5B9BD5', edgecolor='black',
+                             label=f'Normal PCC (>= {threshold:.3f})')]
     ax.legend(handles=legend_elements, loc='upper right')
     
     plt.tight_layout()
@@ -397,7 +436,7 @@ def identify_worst_cases(subj_stats, merged_df, top_n=20):
     return worst_cases_detailed
 
 def main(args):
-    out_dir = Path(args.output_dir) if args.output_dir else Path(args.analysis_dir) / 'low_pcc_analysis'
+    out_dir = Path(args.output_dir) if args.output_dir else Path(args.eval_dir) / 'low_pcc_analysis'
     out_dir.mkdir(parents=True, exist_ok=True)
     print("="*60)
     print("低PCC样本临床特征分析")
@@ -405,11 +444,11 @@ def main(args):
     
     # 加载数据
     print("\n1. 加载数据...")
-    sample_metrics, v1_df, v2_df = load_data(args)
+    task_df, subj_scores, v1_df, v2_df = load_data(args)
     
-    # 处理样本metrics
-    print("2. 处理样本metrics...")
-    sample_df, subj_stats, threshold = process_sample_metrics(sample_metrics)
+    # 处理逐任务 metrics
+    print("2. 处理逐任务 metrics...")
+    sample_df, subj_stats, threshold = process_sample_metrics(task_df, subj_scores)
     
     # 合并临床数据
     print("3. 合并临床数据...")
@@ -436,7 +475,7 @@ def main(args):
     plot_hamd_factors_comparison(low_pcc, normal_pcc, out_dir /'hamd_factors_comparison.png')
     
     print("   - PCC与病理评分相关性...")
-    plot_pcc_vs_pathology(subj_stats, out_dir /'pcc_vs_pathology.png')
+    plot_pcc_vs_pathology(subj_stats, threshold, out_dir /'pcc_vs_pathology.png')
     
     # 保存结果
     print("\n6. 保存分析结果...")

@@ -1,12 +1,18 @@
 # coding=utf-8
 """优化器、调度器、EMA 与预训练权重加载等训练基础设施。"""
+import os
 from copy import deepcopy
 
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
+from models import ARCH_VERSION
 from models.neurotwin import NeuroTwin
+
+#: 无 arch_version 元数据的旧检查点按此版本处理
+LEGACY_ARCH_VERSION = 1
+ARCH_POLICIES = ('require_match', 'warn', 'ignore')
 
 
 class ModelEMA:
@@ -20,37 +26,282 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model):
-        for k, v in self.ema.state_dict().items():
-            src = model.state_dict()[k].detach()
-            v.mul_(self.decay).add_(src, alpha=1.0 - self.decay) \
-                if v.dtype.is_floating_point else v.copy_(src)
+        # torch.compile 包装后 state_dict 键带 '_orig_mod.' 前缀，取内层原模型对齐 EMA 键
+        inner = getattr(model, '_orig_mod', model)
+        msd = inner.state_dict()
+        ema_sd = self.ema.state_dict()
+        # _foreach_ 批量融合：避免逐键 mul_/add_ 产生数百次小 kernel launch
+        float_dst, float_src, other_dst, other_src = [], [], [], []
+        for k, v in ema_sd.items():
+            src = msd[k].detach()
+            if v.dtype.is_floating_point:
+                float_dst.append(v)
+                float_src.append(src)
+            else:
+                other_dst.append(v)
+                other_src.append(src)
+        if float_dst:
+            torch._foreach_mul_(float_dst, self.decay)
+            torch._foreach_add_(float_dst, float_src, alpha=1.0 - self.decay)
+        if other_dst:
+            torch._foreach_copy_(other_dst, other_src)
 
 
-def load_backbone_weights(model, pretrained_path, device):
-    """按形状兼容过滤加载预训练权重（MoE 等新增模块自动跳过）。"""
-    pretrained = torch.load(pretrained_path, map_location=device)
+def unwrap_state_dict(obj):
+    """兼容新旧两种检查点格式，返回 (state_dict, arch_version, config)。
+
+    新格式：{'state_dict': ..., 'arch_version': int, 'config': dict}
+    旧格式：裸 state_dict（无元数据，arch_version 记为 None）
+    """
+    if isinstance(obj, dict) and isinstance(obj.get('state_dict', None), dict):
+        return obj['state_dict'], obj.get('arch_version', None), obj.get('config', None)
+    if isinstance(obj, dict):
+        return obj, None, None
+    raise TypeError(f"无法识别的检查点类型: {type(obj)}")
+
+
+def save_backbone_weights(path, model, meta=None):
+    """保存带架构版本元数据的检查点。
+
+    结构改动后 reload 时可按 arch_version 拦截“同 shape 不同语义”的权重，
+    这是裸 state_dict 下唯一可靠的兼容性闸门。
+    """
+    inner = getattr(model, '_orig_mod', model)   # 解包 torch.compile
+    payload = {
+        'state_dict': deepcopy(inner.state_dict()),
+        'arch_version': ARCH_VERSION,
+        'config': dict(meta) if meta else {},
+    }
+    torch.save(payload, path)
+    return path
+
+
+def pretrain_config_signature(saved_args: dict) -> dict:
+    """从检查点保存的参数快照提取「任务口径签名」：任务模式 + 三个结构维度。
+
+    当前唯一口径为 next_timepoint：in_window=1、pred_window=预测偏移数、
+    seq_len=context_max。预测偏移数由 forecast_offsets / enable_mtp 推导
+    （与 utils.common.resolve_forecast_offsets 同一口径）。
+    """
+    saved = dict(saved_args or {})
+    if 'task_mode' not in saved:
+        raise RuntimeError(
+            "检查点缺少 task_mode 字段（旧任务检查点），无法校验任务口径；"
+            "请用当前 next_timepoint 口径重新预训练。")
+    return {'task_mode': str(saved['task_mode']),
+            'in_window': 1,
+            'pred_window': len(saved_forecast_offsets(saved)),
+            'seq_len': int(saved.get('context_max'))}
+
+
+def saved_forecast_offsets(saved_args: dict) -> list:
+    """从检查点参数快照解析 next_timepoint 的预测偏移列表。"""
+    saved = dict(saved_args or {})
+    raw = saved.get('forecast_offsets', None)
+    vals = []
+    if raw:
+        vals = [int(v) for v in str(raw).replace(',', ' ').split() if v.strip()]
+    if not vals:
+        vals = [1, 2, 4, 8] if saved.get('enable_mtp') else [1]
+    return sorted(vals)
+
+
+def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
+                                 arch_policy: str = 'require_match') -> None:
+    """校验预训练权重与当前运行的任务口径是否一致。
+
+    不同 context_max / 预测偏移数对应的输入/输出 shape 不同；若直接交给
+    :func:`load_backbone_weights` 的 shape 过滤，只会打印“跳过 N 个键”而不报错，
+    存在静默错误加载风险。这里显式拦截（``--pretrained_arch_policy warn`` 可强制跳过）。
+    """
+    if arch_policy not in ARCH_POLICIES:
+        raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
+    ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+    _, _, config = unwrap_state_dict(ckpt)
+    saved_args = (config or {}).get('args', None) if isinstance(config, dict) else None
+    if not isinstance(saved_args, dict):
+        print(f"提示: {os.path.basename(str(pretrained_path))} 无 config.args 快照，"
+              "跳过任务口径校验（仅按 shape 过滤加载权重）。")
+        return
+    saved = pretrain_config_signature(saved_args)
+    expected = {'task_mode': expected_dims['task_mode'],
+                'in_window': int(expected_dims['in_window']),
+                'pred_window': int(expected_dims['pred_window']),
+                'seq_len': int(expected_dims['seq_len'])}
+    mismatch = {k: (saved.get(k), expected[k]) for k in expected
+                if saved.get(k) != expected[k]}
+    if not mismatch:
+        print(f"[pretrain 兼容性] 任务口径一致: {expected}")
+        return
+    msg = (f"预训练权重任务口径与当前运行不一致：{mismatch}\n"
+           f"    权重: {saved}\n    当前: {expected}\n"
+           "    next_timepoint 任务（连续 BOLD context → 下一 TR 全脑状态）在不同 "
+           "context_max / 预测偏移数下输入输出 shape 语义不同，权重不可混用，"
+           "否则大量键会因 shape 不匹配被静默跳过。")
+    if arch_policy == 'require_match':
+        raise RuntimeError(
+            msg + "\n请用当前任务口径重新预训练（scripts/Pretrain_HC_next_point.sh），"
+                  "或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
+    print("警告: " + msg + f"（arch_policy={arch_policy}：继续按 shape 过滤加载）")
+
+
+def load_backbone_weights(model, pretrained_path, device, arch_policy='require_match',
+                          skip_pattern=''):
+    """按形状兼容过滤加载预训练权重（MoE 等新增模块自动跳过）。
+
+    Args:
+        arch_policy: 架构版本不匹配时的策略
+            - 'require_match'（默认）：直接报错并提示重新预训练
+            - 'warn'：打印警告后按 shape 过滤加载（逃生舱）
+            - 'ignore'：跳过权重加载
+        skip_pattern: fnmatch 模式（如 ``'future_query.*'``），命中的预训练键
+            不加载、保留随机初始化。用于受控消融：量化「某分支未经预训练」
+            对 finetune 结果的独立影响（如 head_flatten 的对照实验）。
+    Returns:
+        dict，含 loaded / skipped / missing / arch_version / skipped_load
+    """
+    if arch_policy not in ARCH_POLICIES:
+        raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
+    if skip_pattern:
+        import fnmatch
+
+    ckpt = torch.load(pretrained_path, map_location=device)
+    state, arch_version, _ = unwrap_state_dict(ckpt)
+    fname = os.path.basename(str(pretrained_path))
+
+    if arch_version is None:
+        print(f"提示: {fname} 未包含 arch_version 元数据，按 arch_version={LEGACY_ARCH_VERSION} 处理。")
+        arch_version = LEGACY_ARCH_VERSION
+
+    if arch_version != ARCH_VERSION:
+        msg = (f"预训练权重架构版本不匹配: 权重 arch_version={arch_version}, "
+               f"当前代码 ARCH_VERSION={ARCH_VERSION}。"
+               f"结构改动会使部分同名参数语义发生变化，按 shape 加载可能得到错误结果。")
+        if arch_policy == 'require_match':
+            raise RuntimeError(
+                msg + f"\n请用当前代码重新预训练（scripts/Pretrain_HC_next_point.sh），"
+                      f"或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
+        if arch_policy == 'ignore':
+            print(msg + " arch_policy=ignore: 跳过预训练权重加载。")
+            return {'loaded': 0, 'skipped': sorted(state.keys()), 'missing': [],
+                    'arch_version': arch_version, 'skipped_load': True}
+        print(msg + " arch_policy=warn: 继续按 shape 过滤加载。")
+
     model_dict = model.state_dict()
-    filtered   = {k: v for k, v in pretrained.items()
-                  if k in model_dict and model_dict[k].shape == v.shape}
+    filtered = {k: v for k, v in state.items()
+                if k in model_dict and model_dict[k].shape == v.shape}
+    if skip_pattern:
+        # 受控跳过：命中模式的键不加载（保留随机初始化），计入 skipped 以便核对
+        force_skipped = sorted(k for k in filtered if fnmatch.fnmatch(k, skip_pattern))
+        for k in force_skipped:
+            filtered.pop(k)
+        if force_skipped:
+            print(f"受控跳过预训练加载（--pretrained_skip_pattern '{skip_pattern}'）: "
+                  f"{len(force_skipped)} 个键，例如 {force_skipped[:5]}")
+    skipped  = sorted(k for k in state if k not in filtered)
     model_dict.update(filtered)
     model.load_state_dict(model_dict)
+
+    missing = sorted(k for k in model_dict if k not in filtered)
     print(f"成功加载预训练参数: {len(filtered)} 个匹配键")
-    missing = [k for k in model_dict if k not in filtered]
+    if skipped:
+        print(f"提示: {len(skipped)} 个预训练键因名称/形状不匹配被跳过，例如 {skipped[:5]}")
     if missing:
-        print(f"提示: {len(missing)} 个键未从预训练文件加载（如 moe）")
+        print(f"提示: {len(missing)} 个键未从预训练文件加载（如 moe / 新增条件模块）")
+
+    return {'loaded': len(filtered), 'skipped': skipped, 'missing': missing,
+            'arch_version': arch_version, 'skipped_load': False}
+
+
+#: 主干参数键前缀（--load_backbone_only 使用）：不含预测头 / MoE / 条件模块
+BACKBONE_KEY_PREFIXES = (
+    'rev_norm.', 'sc_prior.', 'dfc_adapter.', 'pastmixing.',
+    'ode_blocks.', 'ode_block_scales.', 'post_fusion.', 'feature_norm.',
+)
+
+
+def load_backbone_only(model, pretrained_path, device):
+    """只加载主干权重，预测头 / MoE / 条件模块保持随机初始化（prompt §三十六）。
+
+    用途：跨任务口径复用主干（例如已经用同一 context_max 口径预训练过主干、
+    仅想换预测头）做受控的「主干预训练 + 头部重训」实验。
+
+    与 :func:`load_backbone_weights`（按 shape 过滤、静默跳过不匹配键）不同，
+    这里**显式打印四类清单**：loaded（成功加载）、missing（主干中不存在该键）、
+    incompatible（键存在但形状不匹配，例如旧 ForecastHead）、reinitialized
+    （被有意重新初始化的头部/条件模块），避免 strict=False 的静默忽略。
+    """
+    ckpt = torch.load(pretrained_path, map_location=device)
+    state, arch_version, _ = unwrap_state_dict(ckpt)
+    fname = os.path.basename(str(pretrained_path))
+    model_sd = model.state_dict()
+
+    loaded, missing, incompatible, reinitialized = [], [], [], []
+    for k, v in model_sd.items():
+        if k.startswith(BACKBONE_KEY_PREFIXES):
+            src = state.get(k, None)
+            if src is None:
+                missing.append(k)
+            elif tuple(src.shape) != tuple(v.shape):
+                incompatible.append((k, tuple(src.shape), tuple(v.shape)))
+            else:
+                model_sd[k] = src
+                loaded.append(k)
+        else:
+            reinitialized.append(k)
+    model.load_state_dict(model_sd)
+
+    print(f"[load_backbone_only] {fname}（arch_version={arch_version}）| "
+          f"loaded={len(loaded)} | missing={len(missing)} | "
+          f"incompatible={len(incompatible)} | "
+          f"reinitialized(头部/条件模块)={len(reinitialized)}")
+    print(f"[load_backbone_only] reinitialized 模块前缀: "
+          f"{sorted({k.split('.')[0] for k in reinitialized})}")
+    if missing:
+        print(f"[load_backbone_only] 主干中缺失的键（{len(missing)} 个，例如 "
+              f"{missing[:5]}）：checkpoint 中不存在，已保留随机初始化。")
+    if incompatible:
+        detail = ', '.join(f"{k} {src}→{dst}"
+                           for k, src, dst in incompatible[:5])
+        print(f"[load_backbone_only] 形状不兼容的键（{len(incompatible)} 个，例如 "
+              f"{detail}）：已显式重新初始化（不静默忽略）。")
+    return {'loaded': len(loaded), 'missing': missing,
+            'incompatible': incompatible, 'reinitialized': reinitialized,
+            'arch_version': arch_version}
+
+
+def _iter_conditioning_modules(model):
+    """发现带 `is_conditioning_adapter` 标记的条件模块（AdaLN/LoRA 等）。
+
+    冻结/参数分组基于显式标记而非名字子串匹配，避免重命名导致行为漂移。
+    """
+    seen = set()
+    for _, module in model.named_modules():
+        if getattr(module, 'is_conditioning_adapter', False) and id(module) not in seen:
+            seen.add(id(module))
+            yield module
 
 
 def set_finetune_stage(model: NeuroTwin, backbone_unfrozen: bool = False):
-    """微调分阶段训练：默认仅训练 MoE，backbone_unfrozen 后解冻主干。"""
+    """微调分阶段训练：默认训练 MoE + 条件模块，backbone_unfrozen 后解冻主干。"""
     for p in model.parameters():
         p.requires_grad = False
     if model.moe is not None:
         for p in model.moe.parameters():
             p.requires_grad = True
+    # 条件模块在冻结阶段即参与训练：它们是“让病理条件真正生效”的唯一路径
+    for module in _iter_conditioning_modules(model):
+        for p in module.parameters():
+            p.requires_grad = True
 
     if backbone_unfrozen:
-        for module in [model.dfc_adapter, model.pastmixing, model.ode_blocks,
-                       model.post_fusion, model.feature_norm, model.pretrain_head]:
+        backbone_modules = [model.dfc_adapter, model.pastmixing, model.ode_blocks,
+                            model.post_fusion, model.feature_norm, model.pretrain_head]
+        # SC 软先验（λ / 功能图低秩分解 / ΔA / 概率掩码）属于主干结构组件，
+        # 随主干一起解冻，避免在冻结阶段被误当作条件适配器训练
+        if getattr(model, 'sc_prior', None) is not None:
+            backbone_modules.append(model.sc_prior)
+        for module in backbone_modules:
             for p in module.parameters():
                 p.requires_grad = True
         for p in model.ode_block_scales.parameters():
@@ -61,16 +312,32 @@ def set_finetune_stage(model: NeuroTwin, backbone_unfrozen: bool = False):
 
 
 def get_param_groups(model: NeuroTwin, args):
-    """按预训练/微调模式划分参数组（微调区分 backbone 与 moe 学习率）。"""
+    """按模式划分参数组。
+
+    - pretrain: 单组 'all'
+    - finetune: 'backbone' / 'adapter'（条件模块）/ 'moe'，各自独立学习率
+    """
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if args.mode == 'pretrain':
         return [{'params': [p for _, p in named], 'lr': args.lr_peak, 'name': 'all'}]
-    moe_p      = [p for n, p in named if 'moe' in n]
-    backbone_p = [p for n, p in named if 'moe' not in n]
+
+    adapter_ids = set()
+    for module in _iter_conditioning_modules(model):
+        for p in module.parameters():
+            adapter_ids.add(id(p))
+
+    adapter_p  = [p for _, p in named if id(p) in adapter_ids]
+    moe_p      = [p for n, p in named if 'moe' in n and id(p) not in adapter_ids]
+    backbone_p = [p for n, p in named if 'moe' not in n and id(p) not in adapter_ids]
+
     groups = []
     if backbone_p:
         groups.append({'params': backbone_p,
                        'lr': args.lr_peak * args.backbone_lr_scale, 'name': 'backbone'})
+    if adapter_p:
+        groups.append({'params': adapter_p,
+                       'lr': args.lr_peak * getattr(args, 'adapter_lr_scale', 1.0),
+                       'name': 'adapter'})
     if moe_p:
         groups.append({'params': moe_p, 'lr': args.lr_peak, 'name': 'moe'})
     return groups
