@@ -2,7 +2,6 @@
 """训练基础设施：损失函数、优化器/调度器、EMA 与 MoE 正则。"""
 from train.losses import (
     IntermediateSupervisionLoss,
-    UncertaintyWeightedHybridLoss,
     compute_intermediate_supervision,
     pearson,
 )
@@ -20,7 +19,6 @@ from train.optim import (
 )
 
 __all__ = [
-    'UncertaintyWeightedHybridLoss',
     'IntermediateSupervisionLoss',
     'compute_intermediate_supervision',
     'pearson',

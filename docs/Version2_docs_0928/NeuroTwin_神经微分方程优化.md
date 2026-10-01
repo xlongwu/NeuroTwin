@@ -10,14 +10,14 @@
 
 **最推荐的算法升级不是直接上 Neural SDE、Hamiltonian Net 或 FNO，而是把 NeuroTwin 改造成 SC-guided UDE（Universal Differential Equation）：**
 
-\[
+$$
 \frac{dh}{d\tau}
 =
 -\kappa(h,\tau)L_{\mathrm{SC}}h
 +r_\theta(h,\mathrm{SC},\tau),
 \qquad
 \kappa=\operatorname{softplus}(\kappa_{\rm raw})\ge0.
-\]
+$$
 
 即将 SC 图拉普拉斯扩散作为显式、可审计的耗散结构项，神经网络只拟合机制无法解释的残差。这比“SC 仅作为 attention hard mask/bias”更接近科学机器学习中的机制—数据混合范式，也更适合当前小样本、强结构先验的脑网络场景。UDE 原始工作正是把已知方程结构与可学习项组合，同时支持随机项、延迟、隐式约束和 stiff 系统。citeturn21academia2
 
@@ -54,9 +54,9 @@
 
 这里的首选主线是：
 
-\[
+$$
 \frac{dh}{d\tau} = -\kappa\,L_{\rm SC}h + r_\theta(h,\mathrm{SC},\tau),
-\]
+$$
 
 其中第一项是非负扩散强度控制的、可解释的结构耦合，第二项只学习 SC 机制未覆盖的残差。若需要动态功能连接，再以低秩 `A_func` 作为该残差的一部分，而不是直接释放完整的 `116×116` 自由邻接矩阵。该路线与 UDE 的“机制项 + 可学习项”思想一致，也符合当前小样本、SC 强先验的约束。citeturn21academia2turn24academia0
 
@@ -78,7 +78,7 @@
 
 | 组件 | 当前实现与接口 | 关键参数 | 审计结论 / 问题 |
 |---|---|---|---|
-| `models/common.py::prepare_sc_matrix` | 输入 SC `[F,F]` 或 `[B,F,F]` 与状态 `[B,F,W,S]`；SC 对称化、截负、加 self-loop，并产生 \(D^{-1/2}AD^{-1/2}\) | `eps≈1e-6` | 接口清晰；但后续不同模块分别再次处理 SC，缺少统一的“结构图定义”对象，容易产生预处理语义漂移。fileciteturn7file0L2-L2 |
+| `models/common.py::prepare_sc_matrix` | 输入 SC `[F,F]` 或 `[B,F,F]` 与状态 `[B,F,W,S]`；SC 对称化、截负、加 self-loop，并产生 $D^{-1/2}AD^{-1/2}$ | `eps≈1e-6` | 接口清晰；但后续不同模块分别再次处理 SC，缺少统一的“结构图定义”对象，容易产生预处理语义漂移。fileciteturn7file0L2-L2 |
 | `DFCAdapter` | SC 与全局可学习 `F×F` edge weights 相乘，混合 0/1/2-hop 图传播，再经 SE gate 和 residual blend | `alpha≈0.5` | 对 AAL116 尚可，但 `F²` 自由边参数难扩展到高分辨率 atlas；建议低秩或稀疏动态残差图。fileciteturn7file0L2-L2 |
 | `GraphODE` | `forward(t,h,sc) -> dh_dt`；`h=[B,F,W,S]`；四路：SC 图注意力、局部 temporal conv、window self-attention、FFN | `hidden_dim`、`num_heads=4`、`window_heads=5`、dropout | `t` 被直接丢弃，是自治向量场；合法，但没有物理时间/TR 语义。四个 gate 参数从 0 初始化，经 sigmoid 后实际权重均为 0.5。fileciteturn8file0L2-L2 |
 | `GraphODEDDI` | 固定步长手写 Heun/RK2：循环 `ode_steps` 次 | 内部默认 `step_scale=0.1`、`ode_steps=5`；上层实验常传 `ode_steps=6` | 无 adaptive solver、`rtol/atol`、NFE、stiffness 检查；`step_scale` 与第二 stage 不一致；stochastic depth 在 solver step 内。fileciteturn8file0L2-L2 |
@@ -92,44 +92,44 @@
 
 ### 当前 RK2 实际做了什么
 
-设 `N=ode_steps`、\(\Delta\tau=1/N\)、\(s=\mathrm{softplus}(\text{step\_scale\_raw})\)，现有代码相当于：
+设 `N=ode_steps`、$\Delta\tau=1/N$、$s=\mathrm{softplus}(\text{step\_scale\_raw})$，现有代码相当于：
 
-\[
+$$
 k_1=f_\theta(h_n),\qquad
 k_2=f_\theta(h_n+\Delta\tau k_1),
-\]
+$$
 
-\[
+$$
 h_{n+1}
 =
 h_n+
 s\,\frac{\Delta\tau}{2}(k_1+k_2).
-\]
+$$
 
 随后 `NeuroTwin` 外层又做：
 
-\[
+$$
 x\leftarrow x+
 \sigma(a_{\rm block})
 \left[\Phi_{\rm RK2}(x)-x\right].
-\]
+$$
 
-代码中的 `step_scale` 默认值没有由 `NeuroTwin` 显式传入，因此实际继续采用 `GraphODEDDI` 的默认 `0.1`；与此同时 block raw scale 初始化为 0，故 \(\sigma(a_{\rm block})=0.5\)。fileciteturn8file0L2-L2 fileciteturn10file0L2-L2
+代码中的 `step_scale` 默认值没有由 `NeuroTwin` 显式传入，因此实际继续采用 `GraphODEDDI` 的默认 `0.1`；与此同时 block raw scale 初始化为 0，故 $\sigma(a_{\rm block})=0.5$。fileciteturn8file0L2-L2 fileciteturn10file0L2-L2
 
-若 \(s\)  intended to represent 有效积分速度/步长，更一致的 Heun 应是：
+若 $s$  intended to represent 有效积分速度/步长，更一致的 Heun 应是：
 
-\[
+$$
 \delta\tau=\frac{s}{N},\qquad
 k_1=f_\theta(\tau_n,h_n),
-\]
+$$
 
-\[
+$$
 k_2=f_\theta(\tau_n+\delta\tau,h_n+\delta\tau k_1),
 \qquad
 h_{n+1}=h_n+\frac{\delta\tau}{2}(k_1+k_2).
-\]
+$$
 
-另一种更干净的选择是**完全去掉 solver 内 `step_scale`**，固定积分区间 \([0,1]\)，只保留 ODE block 外的 residual gate；这会减少不可辨识的双重缩放。
+另一种更干净的选择是**完全去掉 solver 内 `step_scale`**，固定积分区间 $[0,1]$，只保留 ODE block 外的 residual gate；这会减少不可辨识的双重缩放。
 
 ```mermaid
 flowchart LR
@@ -172,7 +172,7 @@ HC 预训练脚本当前实际只运行 `pred_window=1`，典型配置为 `batch
 
 | 方向 / 代表工作 | 方法、优势与局限 | 对 NeuroTwin 的适配判断 | 论文 / 代码 |
 |---|---|---|---|
-| **Neural ODE — Chen et al., 2018** | 用 NN 参数化 \(dh/dt\)，由 ODE solver 决定连续深度；可通过 solver 精度—速度权衡。优势是连续深度和求解器可控；缺点是 NFE、数值误差和 adjoint 误差可能成为训练成本。citeturn19academia0 | **必读 / P0**。NeuroTwin 已采用其“共享向量场+积分”形式，但尚缺 solver tolerance、NFE、收敛性诊断。 | [Paper](https://arxiv.org/abs/1806.07366) · [torchdiffeq](https://github.com/rtqichen/torchdiffeq) |
+| **Neural ODE — Chen et al., 2018** | 用 NN 参数化 $dh/dt$，由 ODE solver 决定连续深度；可通过 solver 精度—速度权衡。优势是连续深度和求解器可控；缺点是 NFE、数值误差和 adjoint 误差可能成为训练成本。citeturn19academia0 | **必读 / P0**。NeuroTwin 已采用其“共享向量场+积分”形式，但尚缺 solver tolerance、NFE、收敛性诊断。 | [Paper](https://arxiv.org/abs/1806.07366) · [torchdiffeq](https://github.com/rtqichen/torchdiffeq) |
 | **Augmented Neural ODE — Dupont et al., 2019** | 在状态中加入额外维度，缓解普通 NODE 的拓扑表达限制；原论文报告更好的稳定性、泛化和计算表现。citeturn19academia3 | **P2 候选**。若实验证明当前 `[F,W,S]` latent 存在表达瓶颈，可加小型 augmentation channel；不应在 P0 前先加复杂度。 | [Paper](https://arxiv.org/abs/1904.01681) · [Code](https://github.com/EmilienDupont/augmented-neural-odes) |
 | **Latent ODE — Rubanova et al., 2019** | 用 ODE-RNN/latent variable 建模任意时间间隔观测；适合 irregularly sampled data 和生成式建模。citeturn19academia1 | **条件性 P2**。只有拿到真实时间戳、变长扫描或缺失观测后价值明显；对固定 6×30 窗并非天然优于当前模型。 | [Paper](https://arxiv.org/abs/1907.03907) · [Code](https://github.com/YuliaRubanova/latent_ode) |
 | **Neural CDE — Kidger et al., 2020** | ODE 轨迹主要由初值决定，而 CDE 允许后续观测路径持续驱动隐藏状态；特别适合部分观测、不规则多变量时序。citeturn19academia2 | **数据条件满足时优先于 Latent ODE**。若未来 BOLD 时间戳不齐或存在缺失，CDE 与“观测持续驱动脑状态”更加匹配。 | [Paper](https://arxiv.org/abs/2005.08926) · [torchcde](https://github.com/patrick-kidger/torchcde) |
@@ -190,7 +190,7 @@ HC 预训练脚本当前实际只运行 `pred_window=1`，典型配置为 `batch
 | **Easy-to-solve DE — Kelly et al., 2020** | 直接惩罚使 solver 成本变高的高阶轨迹行为，在精度与求解成本间优化。citeturn22academia1 | 推荐作为 NFE/solver-consistency 优化参考，而非单纯把 `ode_steps` 固定为经验常数。 | [Paper](https://arxiv.org/abs/2007.04504) · [Code](https://github.com/jacobjinkelly/easy-neural-ode) |
 | **Stiff Neural ODE — Kim et al., 2021** | 系统研究尺度分离和 stiffness 导致的训练困难，强调输出尺度、loss scaling 和稳定梯度的重要性。citeturn22academia3 | 先做 stiffness 诊断；只有显式 solver 需要极小步长、Jacobian 谱存在明显尺度分离时才上 implicit/IMEX。 | [Paper](https://arxiv.org/abs/2103.15341) |
 | **Stable Neural Flows — Massaroli et al., 2020** | 以能量函数构造具有渐近稳定保证的 neural flow，并降低输入扰动放大和 solver 负担。citeturn24academia0 | 可作为 SC-UDE 的稳定化参考，尤其用于多步 rollout；首版无需整体替换网络。 | [Paper](https://arxiv.org/abs/2003.08063) |
-| **Neural DDE — Zhu et al., 2021** | 在连续动力学中显式使用延迟状态 \(x(t-\tau)\)，提升有记忆和传播延迟系统的表达力。citeturn24academia1 | 脑网络理论上很契合传播延迟；但只有获得 tract length、传导速度或可靠 delay proxy 后才应尝试。 | [Paper](https://arxiv.org/abs/2102.10801) |
+| **Neural DDE — Zhu et al., 2021** | 在连续动力学中显式使用延迟状态 $x(t-\tau)$，提升有记忆和传播延迟系统的表达力。citeturn24academia1 | 脑网络理论上很契合传播延迟；但只有获得 tract length、传导速度或可靠 delay proxy 后才应尝试。 | [Paper](https://arxiv.org/abs/2102.10801) |
 
 数值工具方面，PyTorch 原生路线最直接的是 `torchdiffeq`：它提供 `dopri5/dopri8/bosh3/adaptive_heun` 等 adaptive 方法以及 Euler、midpoint、RK4、Adams 等固定步方法，同时暴露 `rtol`、`atol` 和 adjoint 接口；官方说明也指出 `dopri5` 或合理小步长的 RK4 是常见选择。citeturn23search0turn23search1 Diffrax 则覆盖 ODE/SDE/CDE、implicit 与 symplectic solver；SciML/DifferentialEquations.jl 进一步覆盖 split/partitioned ODE、IMEX、SDE、DDE 等，适合作为 stiff/split-system 的研究参考。citeturn23search3turn23search5
 
@@ -202,19 +202,19 @@ HC 预训练脚本当前实际只运行 `pred_window=1`，典型配置为 `batch
 
 | 来源领域 | 候选方程 / 技术 | 对 NeuroTwin 的迁移方式 | 价值与主要风险 |
 |---|---|---|---|
-| **控制 / 系统辨识** | Koopman latent dynamics | 学编码 \(z=\phi(x)\)，使 \(dz/dt\approx Kz+r_\theta(z)\)，或作为纯线性 latent baseline | Koopman 方法的核心价值是寻找使非线性动力学近似线性的低维坐标，从而便于预测、稳定性分析和控制。适合 NeuroTwin 建立“是否真的需要复杂 NODE”的强 baseline。citeturn23academia37 |
-| **控制** | Port-Hamiltonian | \( \dot h=[J(h)-R(h)]\nabla H(h)+G(h)u(t) \)，其中 \(R\succeq0\) 表示耗散 | 可将刺激、药物、病理条件放进 \(u(t)\)，比纯 HNN 更适合耗散脑系统；风险是 latent energy 未必具有生理可辨识性。citeturn24academia2 |
-| **控制 / irregular sensing** | Controlled DE | \(dh=f_\theta(h)\,dX(t)\) | 当 BOLD/临床观测存在不等间隔和缺失时，用插值观测路径持续驱动 state，比把全部历史压成初值更自然。citeturn19academia2 |
-| **计算物理** | Graph diffusion / reaction–diffusion | \(\dot h=-\kappa L_{\rm SC}h+r_\theta(h)\) | **最高推荐**。SC 天然定义图 Laplacian；耗散扩散项稳定、可解释，NN 只补未知动力学，符合 UDE 范式。citeturn21academia2 |
-| **计算物理** | Split / IMEX integration | 刚性的线性图扩散隐式求解，神经 residual 显式求解 | 若 \(-\kappa Lh\) 与 neural residual 时间尺度明显分离，可避免 explicit solver 被最稳定步长限制；SciML 已提供成熟 split/IMEX 方法作为参考。citeturn23search5 |
-| **传播 / 波动力学** | Delay DE | \(\dot h_i(t)=f_i(h_i)+\sum_j A_{ij}g(h_j(t-\tau_{ij}))\) | SC + tract length 可产生传播 delay；没有可靠 \(\tau_{ij}\) 时不要凭网络自行“发现生理传导速度”。Neural DDE 显示 delay 本身能提升非 Markov dynamics 表达能力。citeturn24academia1 |
+| **控制 / 系统辨识** | Koopman latent dynamics | 学编码 $z=\phi(x)$，使 $dz/dt\approx Kz+r_\theta(z)$，或作为纯线性 latent baseline | Koopman 方法的核心价值是寻找使非线性动力学近似线性的低维坐标，从而便于预测、稳定性分析和控制。适合 NeuroTwin 建立“是否真的需要复杂 NODE”的强 baseline。citeturn23academia37 |
+| **控制** | Port-Hamiltonian | $ \dot h=[J(h)-R(h)]\nabla H(h)+G(h)u(t) $，其中 $R\succeq0$ 表示耗散 | 可将刺激、药物、病理条件放进 $u(t)$，比纯 HNN 更适合耗散脑系统；风险是 latent energy 未必具有生理可辨识性。citeturn24academia2 |
+| **控制 / irregular sensing** | Controlled DE | $dh=f_\theta(h)\,dX(t)$ | 当 BOLD/临床观测存在不等间隔和缺失时，用插值观测路径持续驱动 state，比把全部历史压成初值更自然。citeturn19academia2 |
+| **计算物理** | Graph diffusion / reaction–diffusion | $\dot h=-\kappa L_{\rm SC}h+r_\theta(h)$ | **最高推荐**。SC 天然定义图 Laplacian；耗散扩散项稳定、可解释，NN 只补未知动力学，符合 UDE 范式。citeturn21academia2 |
+| **计算物理** | Split / IMEX integration | 刚性的线性图扩散隐式求解，神经 residual 显式求解 | 若 $-\kappa Lh$ 与 neural residual 时间尺度明显分离，可避免 explicit solver 被最稳定步长限制；SciML 已提供成熟 split/IMEX 方法作为参考。citeturn23search5 |
+| **传播 / 波动力学** | Delay DE | $\dot h_i(t)=f_i(h_i)+\sum_j A_{ij}g(h_j(t-\tau_{ij}))$ | SC + tract length 可产生传播 delay；没有可靠 $\tau_{ij}$ 时不要凭网络自行“发现生理传导速度”。Neural DDE 显示 delay 本身能提升非 Markov dynamics 表达能力。citeturn24academia1 |
 | **流行病学** | SIR/SEIR compartment flow | 借鉴**非负转移率、状态流守恒、少量可解释参数**，而非直接把脑区当 S/I/R | 若未来建立 E/I、兴奋/抑制或健康/病理 latent compartments，可用 constrained flow 替代无结构 MLP；目前应视为设计范式，不是生理定律。UDE 可自然容纳这种“已知 compartment + unknown neural term”的混合形式。citeturn21academia2 |
-| **金融 / 随机动力学** | OU / Heston 风格 mean-reverting SDE | \(dh=\{\kappa(\mu-h)+r_\theta(h)\}dt+g_\phi(h)dW_t\) | 可把 BOLD 的随机波动从 epistemic/dropout 中分离出来，输出路径分布和预测区间；需要 CRPS/NLL/coverage，而不仅 PCC。Neural SDE 已提供可微 drift/diffusion 学习框架。citeturn20academia0turn20academia2 |
-| **算子学习** | DeepONet / Neural Operator | 学 \((SC,\text{history},u(\cdot))\mapsto y(t,\text{ROI})\) 的函数算子 | 当目标扩展到任意时间查询、不同 atlas/resolution 或多种 stimulation functions 时有价值；当前固定 AAL116 单步预测无需优先投入。citeturn21academia3turn21academia0 |
+| **金融 / 随机动力学** | OU / Heston 风格 mean-reverting SDE | $dh=\{\kappa(\mu-h)+r_\theta(h)\}dt+g_\phi(h)dW_t$ | 可把 BOLD 的随机波动从 epistemic/dropout 中分离出来，输出路径分布和预测区间；需要 CRPS/NLL/coverage，而不仅 PCC。Neural SDE 已提供可微 drift/diffusion 学习框架。citeturn20academia0turn20academia2 |
+| **算子学习** | DeepONet / Neural Operator | 学 $(SC,\text{history},u(\cdot))\mapsto y(t,\text{ROI})$ 的函数算子 | 当目标扩展到任意时间查询、不同 atlas/resolution 或多种 stimulation functions 时有价值；当前固定 AAL116 单步预测无需优先投入。citeturn21academia3turn21academia0 |
 
 其中最有价值的跨域迁移实际上是**“反应扩散 + UDE + 控制输入”组合**：
 
-\[
+$$
 \boxed{
 \frac{dh}{d\tau}
 =
@@ -224,9 +224,9 @@ r_\theta(h,A_{\rm func})
 +
 B_\phi(h)u(\tau)
 }
-\]
+$$
 
-这里 \(L_{\rm SC}\) 提供结构机制，\(r_\theta\) 学未建模生理，\(u(\tau)\) 可在未来接临床评分、刺激或药物条件。它比当前“四个黑盒分支求和后叫 `dh_dt`”更容易回答：**SC 到底贡献了什么、病理改变的是扩散强度还是残差动力学、模型是否稳定。**
+这里 $L_{\rm SC}$ 提供结构机制，$r_\theta$ 学未建模生理，$u(\tau)$ 可在未来接临床评分、刺激或药物条件。它比当前“四个黑盒分支求和后叫 `dh_dt`”更容易回答：**SC 到底贡献了什么、病理改变的是扩散强度还是残差动力学、模型是否稳定。**
 
 ## 优化方案与路线图
 
@@ -237,10 +237,10 @@ B_\phi(h)u(\tau)
 | **P0 — 数值正确性** | 统一 RK2 语义 | 要么令 `effective_dt=softplus(step_scale_raw)/N` 并同时用于所有 Heun stages；要么删除 solver 内 scale，只保留外层 residual gate | 0.5–1 日 | 低 |
 | **P0 — 稳定初始化** | 修正“zero-init≠zero effect” | `ode_block_scale` 改为直接 zero scalar / `tanh(raw)`；或 sigmoid raw 初始化为 -4~-6，使初始贡献接近 0 | 0.5 日 | 低 |
 | **P0 — stochastic depth 位置** | 从数值积分内部移出 | 不再随机跳 RK step；将 DropPath 放到完整 `GraphODEDDI` block 的外层 residual branch | 0.5 日 | 低 |
-| **P0 — solver observability** | 增加统一 SolverConfig | `method, steps, t0,t1, rtol,atol, adjoint, step_scale`；记录 NFE、\(\|f\|\)、\(\|\Delta h\|\)、state norm、NaN/clip 次数 | 1–2 日 | 低 |
+| **P0 — solver observability** | 增加统一 SolverConfig | `method, steps, t0,t1, rtol,atol, adjoint, step_scale`；记录 NFE、$\|f\|$、$\|\Delta h\|$、state norm、NaN/clip 次数 | 1–2 日 | 低 |
 | **P0 — 工程基线** | 补 unit test / test split / device | 线性 ODE 和衰减 ODE 验证阶数；增加 `--device`；正式入口跑 held-out test；补环境锁文件 | 1–2 日 | 低 |
 | **P1 — SC-UDE** | 机制项 + neural residual | `dh=-κ L_SC h + rθ(h,SC)`；κ 为非负可学习 scalar / ROI-wise gate；SC 仍 subject-specific | 4–6 日 | 中 |
-| **P1 — 动态图降维** | 避免全量 \(F^2\) learned edges | `A=A_SC + UU^T`，rank 8/16；或在 SC top-k edges 上学习 residual edge weights | 2–4 日 | 中 |
+| **P1 — 动态图降维** | 避免全量 $F^2$ learned edges | `A=A_SC + UU^T`，rank 8/16；或在 SC top-k edges 上学习 residual edge weights | 2–4 日 | 中 |
 | **P1 — 稳定性正则** | 控制速度/Jacobian/solver sensitivity | kinetic penalty、Hutchinson Jacobian penalty、小扰动 Lipschitz loss、N↔2N solution-consistency | 3–5 日 | 中 |
 | **P1 — solver benchmark** | 固定与 adaptive 对照 | train：RK2/RK4；reference：DOPRI5；steps `{1,2,3,6,12}`；同时报告耗时/NFE/显存 | 2–3 日实现 + 实验 | 低 |
 | **P2 — CDE** | 仅在真实 irregular/missing timestamps 存在时 | spline/interpolation + Neural CDE；把 SC graph vector field 嵌入 CDE | 1–2 周 | 中 |
@@ -251,34 +251,34 @@ B_\phi(h)u(\tau)
 
 ### 推荐的 solver 策略
 
-第一阶段不建议立刻把训练全部交给 adaptive solver。当前状态维度大致为 \(116\times6\times30\)，而向量场又包含 dense graph attention；adaptive method 的多次函数求值成本可能相当高。建议把**正确的固定步 RK2 或 RK4**保留为训练默认，并把 DOPRI5 当高精度 reference。`torchdiffeq` 已提供 DOPRI5、RK4、adaptive Heun 等方法和 `rtol/atol`，因此可以先实现一个兼容 backend，而不需要重写模型。citeturn23search0turn23search1
+第一阶段不建议立刻把训练全部交给 adaptive solver。当前状态维度大致为 $116\times6\times30$，而向量场又包含 dense graph attention；adaptive method 的多次函数求值成本可能相当高。建议把**正确的固定步 RK2 或 RK4**保留为训练默认，并把 DOPRI5 当高精度 reference。`torchdiffeq` 已提供 DOPRI5、RK4、adaptive Heun 等方法和 `rtol/atol`，因此可以先实现一个兼容 backend，而不需要重写模型。citeturn23search0turn23search1
 
 建议首轮 reference 配置从 `dopri5, rtol=1e-3, atol=1e-5` 开始，再用 `1e-4/1e-6` 做 sensitivity sweep；这些数值是**实验起点而非领域标准**。判断固定 6 步够不够的关键不是哪个 solver 的 PCC 更高，而是：
 
-\[
+$$
 \epsilon_{\rm solver}
 =
 \frac{\|\Phi_{N}(h)-\Phi_{\rm ref}(h)\|_2}
 {\|\Phi_{\rm ref}(h)\|_2+\epsilon}
-\]
+$$
 
 是否随 N 增加稳定下降，同时 downstream performance 已经饱和。
 
-若后续 SC-UDE 的图扩散项变得明显 stiff，则不应简单把 RK2 从 6 步增加到几十步，而应考虑 split/IMEX：将可分析的 \(-\kappa L_{\rm SC}h\) 用 implicit/exponential treatment，非线性 residual 用 explicit solver。Stiff NODE 文献说明尺度分离会显著影响训练稳定性，而 SciML 已覆盖 IMEX/split ODE 求解器。citeturn22academia3turn23search5
+若后续 SC-UDE 的图扩散项变得明显 stiff，则不应简单把 RK2 从 6 步增加到几十步，而应考虑 split/IMEX：将可分析的 $-\kappa L_{\rm SC}h$ 用 implicit/exponential treatment，非线性 residual 用 explicit solver。Stiff NODE 文献说明尺度分离会显著影响训练稳定性，而 SciML 已覆盖 IMEX/split ODE 求解器。citeturn22academia3turn23search5
 
 ### 正则化建议
 
 建议新增：
 
-\[
+$$
 L_{\rm vel}
 =
 \mathbb E_\tau\|f_\theta(h_\tau)\|_2^2,
-\]
+$$
 
 用于抑制不必要的高速 latent flow；以及局部扰动稳定性：
 
-\[
+$$
 L_{\rm stab}
 =
 \max\left(
@@ -287,13 +287,13 @@ L_{\rm stab}
 {\|\delta\|+\epsilon}
 -\gamma
 \right)^2 .
-\]
+$$
 
 对 Jacobian 不必显式构造完整矩阵，可用随机向量的 Jacobian-vector product / Hutchinson estimator 做近似。Finlay 等表明 kinetic/Jacobian regularization 可以让 NODE 学到更简单、更容易被 solver 处理的 dynamics；Kelly 等则从“让方程更易求解”的角度建立了类似目标。citeturn22academia0turn22academia1
 
 ### 可扩展性建议
 
-AAL116 上 dense ROI attention 尚可，但复杂度本质上至少包含 \(O(BWF^2)\) 的 graph attention。若未来扩展到 Schaefer-400/1000 或更细粒度 connectome，应优先把 SC 做成 edge-list/top-k sparse graph，并让 learnable graph 只在 SC 邻域或低秩 residual 上工作，而不是继续学习完整 `F×F` edge matrix。当前 `DFCAdapter` 已有全量 learned edge 参数，因此这个问题会随 atlas 分辨率平方增长。fileciteturn7file0L2-L2
+AAL116 上 dense ROI attention 尚可，但复杂度本质上至少包含 $O(BWF^2)$ 的 graph attention。若未来扩展到 Schaefer-400/1000 或更细粒度 connectome，应优先把 SC 做成 edge-list/top-k sparse graph，并让 learnable graph 只在 SC 邻域或低秩 residual 上工作，而不是继续学习完整 `F×F` edge matrix。当前 `DFCAdapter` 已有全量 learned edge 参数，因此这个问题会随 atlas 分辨率平方增长。fileciteturn7file0L2-L2
 
 在反向传播上，当前 `ode_steps≈6` 时直接 autograd 通常比为了“Neural ODE 正统性”强行使用 adjoint 更简单；只有当积分步数、状态长度或显存明显成为瓶颈时再启用 adjoint。`torchdiffeq` 的 adjoint 方法以额外反向 ODE solve 换取 O(1) solver-state memory，因此本质是内存—计算折中，而不是无条件更优。citeturn23search0
 
@@ -338,7 +338,7 @@ gantt
 | **B4** | 完全移除 GraphODEDDI，参数量匹配 MLP/Graph block | 收益来自“连续积分”还是仅来自额外容量 |
 | **B5** | Euler / RK2 / RK4 / DOPRI5 reference | 性能对 solver 是否敏感 |
 | **B6** | RK2 steps `{1,2,3,6,12}` | 是否有数值收敛趋势 |
-| **U0** | 纯 \(-κL_{\rm SC}h\) | SC diffusion 本身能解释多少 |
+| **U0** | 纯 $-κL_{\rm SC}h$ | SC diffusion 本身能解释多少 |
 | **U1** | SC diffusion + local neural residual | 本报告主推荐 UDE |
 | **U2** | U1 + low-rank dynamic graph residual | 是否需要 SC 之外的功能性连接 |
 | **U3** | U2 + kinetic/Jacobian regularization | 更稳定 dynamics 是否改善泛化/求解成本 |
@@ -357,14 +357,14 @@ gantt
 
 **脑网络结构质量。** 对真实和预测 BOLD 分别计算 FC/dFC，比较 edge-wise PCC、MAE/Frobenius norm、top-k edge overlap、network-level connectivity error。否则可能出现“波形 MAE 不大，但预测出的网络拓扑错误”的情况。
 
-**数值质量。** 必须新增 `NFE`、forward latency、峰值显存、\(\|h(t)\|\)、\(\|f(h)\|\)、每步 \(\|\Delta h\|\)、gradient norm、gradient-clip 触发率、NaN/Inf 次数，以及：
+**数值质量。** 必须新增 `NFE`、forward latency、峰值显存、$\|h(t)\|$、$\|f(h)\|$、每步 $\|\Delta h\|$、gradient norm、gradient-clip 触发率、NaN/Inf 次数，以及：
 
-\[
+$$
 E_{N,2N}
 =
 \frac{\|\Phi_N(h)-\Phi_{2N}(h)\|}
 {\|\Phi_{2N}(h)\|+\epsilon}.
-\]
+$$
 
 Neural ODE 的求解器精度—计算权衡正是该模型类的核心特征，而成熟工具都把 step method、tolerance 等作为一等配置。citeturn19academia0turn23search0
 

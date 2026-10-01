@@ -76,6 +76,75 @@ def save_backbone_weights(path, model, meta=None):
     return path
 
 
+def pretrain_config_signature(saved_args: dict) -> dict:
+    """从检查点保存的参数快照提取「任务口径签名」：任务模式 + 三个结构维度。
+
+    当前唯一口径为 next_timepoint：in_window=1、pred_window=预测偏移数、
+    seq_len=context_max。预测偏移数由 forecast_offsets / enable_mtp 推导
+    （与 utils.common.resolve_forecast_offsets 同一口径）。
+    """
+    saved = dict(saved_args or {})
+    if 'task_mode' not in saved:
+        raise RuntimeError(
+            "检查点缺少 task_mode 字段（旧任务检查点），无法校验任务口径；"
+            "请用当前 next_timepoint 口径重新预训练。")
+    return {'task_mode': str(saved['task_mode']),
+            'in_window': 1,
+            'pred_window': len(saved_forecast_offsets(saved)),
+            'seq_len': int(saved.get('context_max'))}
+
+
+def saved_forecast_offsets(saved_args: dict) -> list:
+    """从检查点参数快照解析 next_timepoint 的预测偏移列表。"""
+    saved = dict(saved_args or {})
+    raw = saved.get('forecast_offsets', None)
+    vals = []
+    if raw:
+        vals = [int(v) for v in str(raw).replace(',', ' ').split() if v.strip()]
+    if not vals:
+        vals = [1, 2, 4, 8] if saved.get('enable_mtp') else [1]
+    return sorted(vals)
+
+
+def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
+                                 arch_policy: str = 'require_match') -> None:
+    """校验预训练权重与当前运行的任务口径是否一致。
+
+    不同 context_max / 预测偏移数对应的输入/输出 shape 不同；若直接交给
+    :func:`load_backbone_weights` 的 shape 过滤，只会打印“跳过 N 个键”而不报错，
+    存在静默错误加载风险。这里显式拦截（``--pretrained_arch_policy warn`` 可强制跳过）。
+    """
+    if arch_policy not in ARCH_POLICIES:
+        raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
+    ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+    _, _, config = unwrap_state_dict(ckpt)
+    saved_args = (config or {}).get('args', None) if isinstance(config, dict) else None
+    if not isinstance(saved_args, dict):
+        print(f"提示: {os.path.basename(str(pretrained_path))} 无 config.args 快照，"
+              "跳过任务口径校验（仅按 shape 过滤加载权重）。")
+        return
+    saved = pretrain_config_signature(saved_args)
+    expected = {'task_mode': expected_dims['task_mode'],
+                'in_window': int(expected_dims['in_window']),
+                'pred_window': int(expected_dims['pred_window']),
+                'seq_len': int(expected_dims['seq_len'])}
+    mismatch = {k: (saved.get(k), expected[k]) for k in expected
+                if saved.get(k) != expected[k]}
+    if not mismatch:
+        print(f"[pretrain 兼容性] 任务口径一致: {expected}")
+        return
+    msg = (f"预训练权重任务口径与当前运行不一致：{mismatch}\n"
+           f"    权重: {saved}\n    当前: {expected}\n"
+           "    next_timepoint 任务（连续 BOLD context → 下一 TR 全脑状态）在不同 "
+           "context_max / 预测偏移数下输入输出 shape 语义不同，权重不可混用，"
+           "否则大量键会因 shape 不匹配被静默跳过。")
+    if arch_policy == 'require_match':
+        raise RuntimeError(
+            msg + "\n请用当前任务口径重新预训练（scripts/Pretrain_HC_next_point.sh），"
+                  "或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
+    print("警告: " + msg + f"（arch_policy={arch_policy}：继续按 shape 过滤加载）")
+
+
 def load_backbone_weights(model, pretrained_path, device, arch_policy='require_match',
                           skip_pattern=''):
     """按形状兼容过滤加载预训练权重（MoE 等新增模块自动跳过）。
@@ -110,7 +179,7 @@ def load_backbone_weights(model, pretrained_path, device, arch_policy='require_m
                f"结构改动会使部分同名参数语义发生变化，按 shape 加载可能得到错误结果。")
         if arch_policy == 'require_match':
             raise RuntimeError(
-                msg + f"\n请用当前代码重新预训练（scripts/Pretrain_HC.sh），"
+                msg + f"\n请用当前代码重新预训练（scripts/Pretrain_HC_next_point.sh），"
                       f"或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
         if arch_policy == 'ignore':
             print(msg + " arch_policy=ignore: 跳过预训练权重加载。")
@@ -142,6 +211,63 @@ def load_backbone_weights(model, pretrained_path, device, arch_policy='require_m
 
     return {'loaded': len(filtered), 'skipped': skipped, 'missing': missing,
             'arch_version': arch_version, 'skipped_load': False}
+
+
+#: 主干参数键前缀（--load_backbone_only 使用）：不含预测头 / MoE / 条件模块
+BACKBONE_KEY_PREFIXES = (
+    'rev_norm.', 'sc_prior.', 'dfc_adapter.', 'pastmixing.',
+    'ode_blocks.', 'ode_block_scales.', 'post_fusion.', 'feature_norm.',
+)
+
+
+def load_backbone_only(model, pretrained_path, device):
+    """只加载主干权重，预测头 / MoE / 条件模块保持随机初始化（prompt §三十六）。
+
+    用途：跨任务口径复用主干（例如已经用同一 context_max 口径预训练过主干、
+    仅想换预测头）做受控的「主干预训练 + 头部重训」实验。
+
+    与 :func:`load_backbone_weights`（按 shape 过滤、静默跳过不匹配键）不同，
+    这里**显式打印四类清单**：loaded（成功加载）、missing（主干中不存在该键）、
+    incompatible（键存在但形状不匹配，例如旧 ForecastHead）、reinitialized
+    （被有意重新初始化的头部/条件模块），避免 strict=False 的静默忽略。
+    """
+    ckpt = torch.load(pretrained_path, map_location=device)
+    state, arch_version, _ = unwrap_state_dict(ckpt)
+    fname = os.path.basename(str(pretrained_path))
+    model_sd = model.state_dict()
+
+    loaded, missing, incompatible, reinitialized = [], [], [], []
+    for k, v in model_sd.items():
+        if k.startswith(BACKBONE_KEY_PREFIXES):
+            src = state.get(k, None)
+            if src is None:
+                missing.append(k)
+            elif tuple(src.shape) != tuple(v.shape):
+                incompatible.append((k, tuple(src.shape), tuple(v.shape)))
+            else:
+                model_sd[k] = src
+                loaded.append(k)
+        else:
+            reinitialized.append(k)
+    model.load_state_dict(model_sd)
+
+    print(f"[load_backbone_only] {fname}（arch_version={arch_version}）| "
+          f"loaded={len(loaded)} | missing={len(missing)} | "
+          f"incompatible={len(incompatible)} | "
+          f"reinitialized(头部/条件模块)={len(reinitialized)}")
+    print(f"[load_backbone_only] reinitialized 模块前缀: "
+          f"{sorted({k.split('.')[0] for k in reinitialized})}")
+    if missing:
+        print(f"[load_backbone_only] 主干中缺失的键（{len(missing)} 个，例如 "
+              f"{missing[:5]}）：checkpoint 中不存在，已保留随机初始化。")
+    if incompatible:
+        detail = ', '.join(f"{k} {src}→{dst}"
+                           for k, src, dst in incompatible[:5])
+        print(f"[load_backbone_only] 形状不兼容的键（{len(incompatible)} 个，例如 "
+              f"{detail}）：已显式重新初始化（不静默忽略）。")
+    return {'loaded': len(loaded), 'missing': missing,
+            'incompatible': incompatible, 'reinitialized': reinitialized,
+            'arch_version': arch_version}
 
 
 def _iter_conditioning_modules(model):

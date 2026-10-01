@@ -25,20 +25,17 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.dataloader import NeuroTwinDataset  # noqa: E402  复用 mat 提取逻辑，保证转换与训练读取一致
+from utils.dataloader import read_mat_array  # noqa: E402  复用 mat 提取逻辑，保证转换与训练读取一致
 
 
 def convert_subject(task):
     subj_id, sc_path, window_paths, out_path, seq_len = task
-    ds = NeuroTwinDataset.__new__(NeuroTwinDataset)  # 仅用其 mat 提取方法，绕过 __init__
-    ds.cache_in_memory = False
-    ds._mat_cache = {}
-    sc = ds._read_mat_array(sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
+    sc = read_mat_array(sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
     sc = np.asarray(sc)
 
     windows = []
     for w_path in window_paths:
-        arr = ds._read_mat_array(w_path, preferred_keys=['ROISignals', 'data', 'bold'])
+        arr = read_mat_array(w_path, preferred_keys=['ROISignals', 'data', 'bold'])
         arr = np.asarray(arr)
         if arr.shape[0] == seq_len:
             arr = arr.T                      # [S, F] -> [F, S]

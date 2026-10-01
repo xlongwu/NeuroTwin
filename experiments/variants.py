@@ -9,7 +9,7 @@
 - description:      变体含义
 - requires_pretrain: True 时结构性改动与预训练权重形状不兼容（load_backbone_weights
                     会静默 skip shape 不匹配的键），必须先自预训练再微调；
-                    False 时复用 checkpoints/neurotwin_pretrain_pred1/base_best.pt
+                    False 时复用 checkpoints/neurotwin_nextpoint_pretrain/base_best.pt
 - overrides:        相对 BASE_ARGS 的参数覆盖
 - eval_note:        评估时需要关注的附加指标
 
@@ -34,7 +34,7 @@ def _v(exp_id, group, doc_ref, priority, description, overrides,
 VARIANTS = [
     # ---- 基线（复跑当前最优配置，作为 ΔPCC/ΔMAE 的参照） ----
     _v(BASELINE_ID, 'G0_BASE', '0', 'P0',
-       '基线：与 Finetune_MDD.sh 当前默认一致'
+       '基线：与 Finetune_MDD_next_point.sh 当前默认一致'
        '（2026-09-25 依消融结论调整：ode_steps=3 / delta_refiner_rounds=1 / routed_only；'
        '此前 pred1 基线记录见 registry 历史）',
        {}, requires_pretrain=False,
@@ -203,6 +203,41 @@ VARIANTS = [
        {'inversion_weight': 0.5},
        eval_note='inversion_pred 与病理条件的相关性'),
     # TODO(2.3): 协变量条件化（site/sex/age）与 site split 接入：无现成参数。
+
+    # ---- Phase 9：连续 BOLD → 下一 TR 全脑状态（Experiment B–F，路线图 §35） ----
+    # 对照矩阵（B→F）分离「delta 目标 / rollout 监督 / MTP」各自收益：
+    #   B: next_timepoint（绝对目标）  C: B + delta
+    #   D: C + rollout loss            E: C + MTP          F: C + rollout + MTP
+    # ⚠️ next_timepoint 的模型维度映射为 (in_window←1, pred_window←len(forecast_offsets),
+    #    seq_len←context_max)，B–F 均按该口径自预训练（requires_pretrain=True）。
+    _v('nextpoint_b_abs', 'G20_NEXTPOINT', '3.5', 'P0',
+       'Experiment B：Next-Timepoint，绝对目标（无 delta/rollout/MTP）',
+       {'task_mode': 'next_timepoint', 'prediction_target': 'absolute'},
+       requires_pretrain=True,
+       eval_note='A→B 增量 = 任务改变收益（next MAE / spatial PCC / free rollout）'),
+    _v('nextpoint_c_delta', 'G20_NEXTPOINT', '3.5', 'P0',
+       'Experiment C：B + delta 目标（prediction_target=delta）',
+       {'task_mode': 'next_timepoint', 'prediction_target': 'delta'},
+       requires_pretrain=True,
+       eval_note='delta direction consistency；与 B 对比 delta 目标是否有效'),
+    _v('nextpoint_d_rollout', 'G20_NEXTPOINT', '3.5', 'P0',
+       'Experiment D：C + rollout 监督（enable_rollout_loss）',
+       {'task_mode': 'next_timepoint', 'prediction_target': 'delta',
+        'enable_rollout_loss': True},
+       requires_pretrain=True,
+       eval_note='free rollout MAE 随 horizon 的退化曲线是否改善'),
+    _v('nextpoint_e_mtp', 'G20_NEXTPOINT', '3.5', 'P0',
+       'Experiment E：C + MTP（多偏移 [1,2,4,8]，enable_mtp）',
+       {'task_mode': 'next_timepoint', 'prediction_target': 'delta',
+        'enable_mtp': True},
+       requires_pretrain=True,
+       eval_note='分偏移 loss/PCC 与主指标；MTP 是否有效'),
+    _v('nextpoint_f_all', 'G20_NEXTPOINT', '3.5', 'P0',
+       'Experiment F：C + rollout 监督 + MTP（D+E 全开）',
+       {'task_mode': 'next_timepoint', 'prediction_target': 'delta',
+        'enable_rollout_loss': True, 'enable_mtp': True},
+       requires_pretrain=True,
+       eval_note='最终最复杂模型；与 D/E 对比确认叠加是否仍有增益'),
 ]
 
 

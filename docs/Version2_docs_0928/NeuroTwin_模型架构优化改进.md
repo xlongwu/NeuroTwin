@@ -8,12 +8,12 @@
 
 NeuroTwin 现有模块已经覆盖 SC diffusion、多尺度卷积、graph attention、temporal convolution、window attention、RK2、六路 forecast fusion、iterative refinement、FiLM、sparse MoE 与 shared expert。下一版的主要机会不在再加 Mamba、更多 ODE steps、更多专家或大型 Transformer，而在让四段信息流形成一致逻辑：
 
-\[
+$$
 \boxed{\text{Anatomical Prior}
 \rightarrow\text{State-Dependent Functional Dynamics}
 \rightarrow\text{Structured Future Queries}
 \rightarrow\text{Pathology-State Residual Adaptation}}
-\]
+$$
 
 可将主研究问题归为三项互补改造：
 
@@ -142,9 +142,9 @@ BLIP-2 的 Q-Former、Flamingo 的 gated cross-attention 和 Wings 的低秩平�
 
 若多步 dynamics 的价值确立，才把当前黑盒 derivative 改为显式结构项与学习残差分解：
 
-\[
-\frac{dh}{d\tau}=-\kappa(h)L(A_\tau)h+f_{\rm local}(h)+r_\theta(h)。
-\]
+$$
+\frac{dh}{d\tau}=-\kappa(h)L(A_\tau)h+f_{\rm local}(h)+r_\theta(h)
+$$
 
 ```text
 SC/adaptive graph → explicit Laplacian dynamics

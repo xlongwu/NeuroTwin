@@ -2,9 +2,9 @@
 """消融实验批量执行入口。
 
 用法示例：
-  bash scripts/RunAblation.sh --group G14_MOE --dry-run      # 只打印命令
-  bash scripts/RunAblation.sh --only baseline --smoke        # 端到端冒烟
-  bash scripts/RunAblation.sh --priority P0 --seeds 2024     # 正式 P0 组
+  python -m experiments.run_experiments --group G14_MOE --dry-run      # 只打印命令
+  python -m experiments.run_experiments --only baseline --smoke        # 端到端冒烟
+  python -m experiments.run_experiments --priority P0 --seeds 2024     # 正式 P0 组
 
 流程：合并参数（BASE_ARGS + 变体 overrides + 运行参数）→ 可选自预训练 →
 训练（subprocess，日志落盘）→ 轻量评估（val/test + shuffled 负对照）→
@@ -65,12 +65,11 @@ def merge_run_args(variant, seed, smoke, pretrain_stage=False):
 
 
 def resolve_pretrained_weight(merged, variant):
-    """变体微调的预训练权重来源：结构性变体用自预训练产物，其余复用基线。"""
+    """变体微调的预训练权重来源：结构性变体用自预训练产物，其余复用 next_timepoint 基线。"""
     if variant['requires_pretrain']:
         return str(CHECKPOINT_DIR / f"ablation_pre_{variant['id']}_s{merged['seed']}"
                    / 'base_best.pt')
-    return str(CHECKPOINT_DIR / f"neurotwin_pretrain_pred{merged['pred_window']}"
-               / 'base_best.pt')
+    return str(CHECKPOINT_DIR / 'neurotwin_nextpoint_pretrain' / 'base_best.pt')
 
 
 def resolve_run_ckpt(name, filename='finetuned_best.pt'):
