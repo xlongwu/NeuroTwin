@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from models.common import (
     BrainRevIN, DFCAdapter, BrainMDM, GraphODEDDI,
-    IterativePredictionRefiner,
+    IterativePredictionRefiner, prefix_layernorm, prefix_linear, prefix_proj,
 )
 from models.decoder import FutureQueryDecoder
 from models.graph_prior import SoftAnatomicalPrior
@@ -161,6 +161,7 @@ class NeuroTwinForecastHead(nn.Module):
         future_query_heads: int = 4,
         head_amp_mode: str = 'scale_mod_trend',
         head_scale_granularity: str = 'window',
+        head_anchor_mode: str = 'history_window',
         head_use_history_proj: bool = True,
         head_use_latent_proj: bool = True,
         head_use_temporal: bool = True,
@@ -199,10 +200,21 @@ class NeuroTwinForecastHead(nn.Module):
             raise ValueError(
                 "head_scale_granularity 仅支持 window/timestep，"
                 f"收到 '{head_scale_granularity}'")
+        if head_anchor_mode not in ('history_window', 'last_timestep', 'zero'):
+            raise ValueError(
+                "head_anchor_mode 仅支持 history_window/last_timestep/zero，"
+                f"收到 '{head_anchor_mode}'")
+        if head_anchor_mode == 'last_timestep' and pred_seq_len != 1:
+            raise ValueError(
+                "head_anchor_mode='last_timestep'（next_timepoint 的 x_t 锚点）要求 "
+                f"pred_seq_len == 1，收到 pred_seq_len={pred_seq_len}")
 
         self.head_shape_mode = head_shape_mode
         self.head_amp_mode = head_amp_mode
         self.head_scale_granularity = head_scale_granularity
+        self.head_anchor_mode = head_anchor_mode
+        # 供 NeuroTwin 判断是否走「next-state / delta」语义（next_timepoint 任务）
+        self.is_next_state_head = (head_anchor_mode != 'history_window')
         # head_use_cross_roi=False 等价于 head_cross_roi='skip'
         self.head_cross_roi = 'skip' if not head_use_cross_roi else head_cross_roi
         self.use_history_proj = bool(head_use_history_proj)
@@ -217,6 +229,8 @@ class NeuroTwinForecastHead(nn.Module):
             self.use_history_proj = True
         # 供 NeuroTwin._decode 读取的最近一次幅值统计（AmplitudeConsistencyLoss 使用）
         self.last_amp_stats = None
+        # 供 NeuroTwin 计算 next-state delta 的最近一次锚点（detach，归一化空间）
+        self.last_anchor = None
 
         self.features     = features
         self.in_window    = in_window
@@ -380,7 +394,23 @@ class NeuroTwinForecastHead(nn.Module):
         return torch.bmm(adj.to(dtype=feat.dtype), feat)
 
     def _build_anchor(self, history: torch.Tensor) -> torch.Tensor:
+        """构造预测头的加法锚点（归一化空间），形状 [B, F, pred_window, pred_seq_len]。
+
+        - ``history_window``（旧任务）：最后一窗 + 0.5×一阶趋势外推（`pred_window` 个窗）；
+        - ``last_timestep``（next_timepoint / delta 预测）：context 最后一个 TR x_t
+          广播到全部预测偏移——模型只需学习 Δx̂ = x̂ − x_t，避免直接回归 x_{t+1}
+          时退化成「复制 x_t」；
+        - ``zero``（next_timepoint / absolute 预测）：零锚点，模型直接预测
+          （归一化空间中的）下一状态，用于 delta vs absolute 的公平消融。
+        """
         b, f, w, s = history.shape
+        if self.head_anchor_mode == 'zero':
+            return torch.zeros(b, f, self.pred_window, self.pred_seq_len,
+                               device=history.device, dtype=history.dtype)
+        if self.head_anchor_mode == 'last_timestep':
+            # context 的最后一个 TR（最近时间点）作为 x_t；pred_seq_len 已校验为 1
+            last_tr = history[:, :, -1:, -1:]                    # [B, F, 1, 1]
+            return last_tr.expand(b, f, self.pred_window, self.pred_seq_len)
         last  = history[:, :, -1:, :]
         slope = last - history[:, :, -2:-1, :] if w >= 2 else torch.zeros_like(last)
         anchors, current = [], last
@@ -389,6 +419,30 @@ class NeuroTwinForecastHead(nn.Module):
             anchors.append(current)
         return (torch.cat(anchors, dim=2) if anchors
                 else torch.zeros(b, f, 0, s, device=history.device, dtype=history.dtype))
+
+    def _win_proj_forward(self, history: torch.Tensor) -> torch.Tensor:
+        """win_proj 的变长 S 轴版本（LayerNorm/Linear 按权重前缀切片）。
+
+        ``win_proj = Sequential(LayerNorm(in_seq_len), Linear(in_seq_len, win_hidden), ...)``
+        作用在 ``[B,F,W,S]`` 的最后一维（S）上；next_timepoint 的 context 长度
+        K <= context_max 时走前缀切片，S == in_seq_len 时与直接调用逐位等价。
+        """
+        x = prefix_layernorm(self.win_proj[0], history)
+        x = prefix_linear(self.win_proj[1], x)
+        for layer in list(self.win_proj)[2:]:
+            x = layer(x)
+        return x
+
+    def _maybe_standardize(self, x: torch.Tensor) -> torch.Tensor:
+        """幅值重参数化的标准化；``out_dim == 1`` 时退化为恒等。
+
+        ``standardize_future`` 对 (pred_window, pred_seq_len) 求统计量；单元素
+        （next_timepoint 单步预测）时方差恒为 0，标准化会把输出整体置零，
+        使 ``pred = anchor``（模型失去全部学习信号），因此显式跳过。
+        """
+        if self.out_dim <= 1:
+            return x
+        return standardize_future(x)
 
     def _revin_feature(self, revin_stats, b, f, device, dtype):
         if self.revin_proj is None or revin_stats is None:
@@ -421,18 +475,24 @@ class NeuroTwinForecastHead(nn.Module):
         if latent.ndim != 4 or history.ndim != 4:
             raise ValueError(
                 f"Expected [B,F,W,S], got {tuple(latent.shape)} and {tuple(history.shape)}")
-        b, f, _, _ = latent.shape
+        b, f, w, _ = latent.shape
         dev, dt = latent.device, latent.dtype
+        if w > self.in_window:
+            raise ValueError(
+                f"历史窗口数 {w} 超过预测头建模的 {self.in_window}："
+                "请确认 history_max 与数据 chunk 数一致。")
 
-        history_flat = history.reshape(b, f, -1)
+        history_flat = history.reshape(b, f, -1)      # [B, F, L*S]
         latent_flat  = latent.reshape(b, f, -1)
 
-        hist_feat = (self.history_proj(self.history_norm(history_flat))
-                     if self.history_proj is not None
-                     else self.history_norm(history_flat))
-        lat_feat = (self.latent_proj(self.latent_norm(latent_flat))
-                    if self.latent_proj is not None
-                    else self.latent_norm(latent_flat))
+        # 变长历史（L < in_window）走“权重前缀”路径：第 w 个窗口恒对应权重切片
+        # [w*S:(w+1)*S]；L == in_window 时与旧实现逐位等价（见 models/common.py）。
+        hist_norm = prefix_layernorm(self.history_norm, history_flat)
+        lat_norm  = prefix_layernorm(self.latent_norm, latent_flat)
+        hist_feat = (prefix_proj(self.history_proj, hist_norm)
+                     if self.history_proj is not None else hist_norm)
+        lat_feat = (prefix_proj(self.latent_proj, lat_norm)
+                    if self.latent_proj is not None else lat_norm)
 
         fuse_feats = []
         if self.use_history_proj:
@@ -440,7 +500,8 @@ class NeuroTwinForecastHead(nn.Module):
         if self.use_latent_proj:
             fuse_feats.append(lat_feat)
         if self.temporal_proj is not None:
-            fuse_feats.append(self.temporal_proj(self.temporal_branch(history_flat)))
+            fuse_feats.append(prefix_linear(
+                self.temporal_proj, self.temporal_branch(history_flat)))
         if self.cross_roi_hist is not None:
             cross_hist = self.cross_roi_hist(hist_feat)
             cross_latent = self.cross_roi_latent(lat_feat)
@@ -450,9 +511,11 @@ class NeuroTwinForecastHead(nn.Module):
             fuse_feats.append(cross_hist)
             fuse_feats.append(cross_latent)
         if self.win_flatten_proj is not None:
-            win_x    = self.win_proj(history)
+            win_x    = self._win_proj_forward(history)
             win_ctx  = self.window_temporal_attn(win_x)
-            fuse_feats.append(self.win_flatten_proj(win_ctx.reshape(b, f, -1)))
+            # win_flatten_proj 以 in_window×win_hidden 建模，变长历史走前缀路径
+            fuse_feats.append(prefix_proj(
+                self.win_flatten_proj, win_ctx.reshape(b, f, -1)))
         revin_feat = self._revin_feature(revin_stats, b, f, dev, dt)
         if revin_feat is not None:
             fuse_feats.append(revin_feat)
@@ -473,13 +536,16 @@ class NeuroTwinForecastHead(nn.Module):
             scale = scale_raw.view(b, f, self.pred_window, self.pred_seq_len)
 
         if self.head_amp_mode == 'legacy':
-            pred = anchor + trend_raw + scale * standardize_future(shape_raw)
+            pred = anchor + trend_raw + scale * self._maybe_standardize(shape_raw)
             amp_scale = None
         else:
             # 幅值只由 softplus(scale) 承担；trend 与 shape 都先标准化
-            pred = anchor + scale * (standardize_future(trend_raw)
-                                     + standardize_future(shape_raw))
+            pred = anchor + scale * (self._maybe_standardize(trend_raw)
+                                     + self._maybe_standardize(shape_raw))
             amp_scale = scale
+
+        # 供 NeuroTwin 计算 next-state delta（原始空间）与 refiner 张量流使用
+        self.last_anchor = anchor.detach()
 
         if amp_scale is not None:
             self.last_amp_stats = {'scale': amp_scale.detach(), 'anchor': anchor.detach()}
@@ -601,25 +667,19 @@ class NeuroTwin(nn.Module):
         future_query_heads: int = 4,
         head_amp_mode: str = 'scale_mod_trend',
         head_scale_granularity: str = 'window',
+        head_anchor_mode: str = 'history_window',
         head_use_history_proj: bool = True,
         head_use_latent_proj: bool = True,
         head_use_temporal: bool = True,
         head_use_cross_roi: bool = True,
         head_use_win_attn: bool = True,
         head_use_revin_stats: bool = True,
-        recur_mode: str = 'none',
         pred_head: str = 'gaussian',
         pred_quantiles=(0.1, 0.5, 0.9),
         inversion_weight: float = 0.0,
         inversion_hidden_dim: int = 128,
     ):
         super().__init__()
-        if recur_mode not in ('none', 'terminal_state'):
-            raise ValueError(
-                f"recur_mode 仅支持 none/terminal_state，收到 '{recur_mode}'")
-        self.recur_mode = recur_mode
-        # scheduled sampling 概率：仅在训练态、且 future 可用时生效
-        self._scheduled_sampling_prob = 0.0
         self.features         = features
         self.norm             = norm
         self.pretrain_mode    = pretrain_mode
@@ -743,6 +803,7 @@ class NeuroTwin(nn.Module):
             future_query_heads=future_query_heads,
             head_amp_mode=head_amp_mode,
             head_scale_granularity=head_scale_granularity,
+            head_anchor_mode=head_anchor_mode,
             head_use_history_proj=head_use_history_proj,
             head_use_latent_proj=head_use_latent_proj,
             head_use_temporal=head_use_temporal,
@@ -754,6 +815,12 @@ class NeuroTwin(nn.Module):
             # Phase 7.1：概率输出头（point/gaussian/quantile）
             pred_head=pred_head,
             pred_quantiles=pred_quantiles)
+
+        # next-state（next_timepoint 任务）：预测头以 x_t 或 0 为锚点，
+        # 前向时额外导出归一化空间的 Δx̂ 与「归一化→原始空间」的逐 ROI 斜率，
+        # 供 NextTimepointLoss 的 delta 项与诊断使用；旧任务下恒为 False，
+        # 不产生任何额外计算与 aux 字段。
+        self.next_state_mode = bool(getattr(self.pretrain_head, 'is_next_state_head', False))
 
         if self.pretrain_mode:
             self.moe = None
@@ -813,14 +880,6 @@ class NeuroTwin(nn.Module):
     def set_moe_router_inference_temperature(self, temperature: float) -> None:
         if self.moe is not None:
             self.moe.set_router_inference_temperature(temperature)
-
-    def set_scheduled_sampling_prob(self, prob: float) -> None:
-        """设置 scheduled sampling 概率（--recur_mode terminal_state 下生效）。
-
-        概率为“用真值窗替换模型自回归预测窗”的比例，仅在训练态且 forward
-        收到 `future` 时起作用；评估态恒为纯自回归。
-        """
-        self._scheduled_sampling_prob = float(min(max(prob, 0.0), 1.0))
 
     def _compute_sc_prior(self, h: torch.Tensor, sc_matrix: torch.Tensor):
         """计算 SC 软先验（A_eff）。未启用软先验（--sc_prior_mode scaled）时返回 None。
@@ -939,6 +998,129 @@ class NeuroTwin(nn.Module):
             aux_info.update(moe_aux)
         return base_pred + delta_pred, aux_info
 
+    def _fill_next_state_delta(self, aux_info, pred_norm, history_norm, norm_stats) -> None:
+        """把 next-state delta 写入 aux_info（next_timepoint 任务专用）。
+
+        - ``pred_delta_norm = x̂ − x_t``：归一化空间中的状态变化量（模型的原生输出）；
+        - ``revin_factor``：RevIN 反归一化的逐 ROI 斜率 ``stdev / (affine_weight + eps)``，
+          用于把原始空间的 Δx（损失端由 target − x_t 得到）换算到归一化空间比较。
+
+        两项都只依赖历史（x_t 取自 context 末位），未来 target 不参与；
+        旧任务（next_state_mode=False）下本方法不会被调用。
+        """
+        last_tr = history_norm[:, :, -1:, -1:]                   # [B,F,1,1] = x_t
+        aux_info['pred_delta_norm'] = pred_norm - last_tr        # [B,F,H,1]
+        if self.norm and norm_stats is not None:
+            _, stdev = norm_stats
+            if self.rev_norm.affine:
+                weight = self.rev_norm.affine_weight.view(1, -1, 1, 1)
+                factor = stdev / (weight + self.rev_norm.eps)
+            else:
+                factor = stdev
+            aux_info['revin_factor'] = factor.detach()
+
+    @torch.no_grad()
+    def rollout_forecast(self, history: torch.Tensor, sc_matrix: torch.Tensor,
+                         pathology_score: Optional[torch.Tensor] = None,
+                         horizon: int = None) -> torch.Tensor:
+        """free rollout（自回归滚动预测，仅用于评估，不改变训练主任务）。
+
+        每一步只取预测头的**第 0 个预测窗**作为“下一 chunk”，把它接到历史末位
+        （滑出最早 1 个 chunk，历史长度 L 保持不变）后再前向；滚动 ``horizon`` 步
+        得到自回归轨迹 ``[B, F, horizon, S]``。与 direct multi-horizon 预测对比可
+        量化 error accumulation。
+
+        注意：模型以 ``pred_window = H_max`` 建模，这里每次前向只用其第一个窗口；
+        历史长度为 1 时无法滑动，直接抛出明确错误。
+        """
+        if history.ndim != 4:
+            raise ValueError(f"rollout_forecast 期望 history [B,F,L,S]，收到 {tuple(history.shape)}")
+        if history.shape[2] < 2:
+            raise ValueError("rollout_forecast 至少需要 2 个历史 chunk 才能滑窗。")
+        n_steps = int(horizon) if horizon else int(self.pred_window)
+        preds: List[torch.Tensor] = []
+        cur = history
+        for k in range(n_steps):
+            pred, _ = self.forward(cur, sc_matrix, pathology_score)
+            nxt = pred[:, :, :1, :]
+            preds.append(nxt)
+            if k + 1 >= n_steps:
+                break
+            cur = torch.cat([cur[:, :, 1:, :], nxt], dim=2)
+        return torch.cat(preds, dim=2)
+
+    # ------------------------------------------------------------------
+    # next_timepoint（Next Brain-State Prediction）对外标准接口
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_internal_history(bold_history: torch.Tensor) -> torch.Tensor:
+        """标准输入 [B, K, F] → 主干内部布局 [B, F, W=1, S=K]。
+
+        整段 context 作为**单个窗口**（W=1）、K 个 TR 作为该窗口的时间轴（S=K）：
+        这样 BrainMDM 的时间卷积 / GraphODE 的时间轴算子原样生效，
+        且不需要在多个模块间反复交换维度（变长 K 由 S 轴前缀切片支持）。
+        """
+        if bold_history.ndim != 3:
+            raise ValueError(
+                f"bold_history 期望 [B, K, F]，收到 {tuple(bold_history.shape)}")
+        return bold_history.transpose(1, 2).unsqueeze(2).contiguous()
+
+    def predict_next_state(self, bold_history: torch.Tensor, sc_matrix: torch.Tensor,
+                           pathology_score: Optional[torch.Tensor] = None) -> dict:
+        """下一步全脑状态预测（next_timepoint 任务的标准接口）。
+
+        Args:
+            bold_history: [B, K, F] 连续 BOLD 历史（K = context 长度，含最近 TR x_t）
+            sc_matrix:    [F, F] 或 [B, F, F] 结构连接
+            pathology_score: [B, 1] 或 None（HC 预训练无需）
+        Returns:
+            dict：
+              ``pred_next``  [B, F, H] 下一状态预测（原始空间；H = forecast_offsets 数）
+              ``pred_delta`` [B, F, H] Δx̂ = x̂ − x_t（原始空间）
+              ``pred``       [B, F, H, 1] 内部 4D 张量（与既有 forward 输出同布局）
+              ``aux_info``   模型附加输出（概率头 / MoE 统计 / delta 等）
+        """
+        if not self.next_state_mode:
+            raise RuntimeError(
+                "predict_next_state 仅适用于 --task_mode next_timepoint"
+                "（预测头 head_anchor_mode != 'history_window'）。")
+        x = self._to_internal_history(bold_history)
+        pred, aux_info = self.forward(x, sc_matrix, pathology_score)
+        pred_next = pred[:, :, :, 0]                              # [B,F,H]
+        x_last = bold_history[:, -1, :].unsqueeze(-1)             # [B,F,1] = x_t
+        return {'pred_next': pred_next, 'pred_delta': pred_next - x_last,
+                'pred': pred, 'aux_info': aux_info}
+
+    def rollout_next_states(self, bold_history: torch.Tensor, sc_matrix: torch.Tensor,
+                            pathology_score: Optional[torch.Tensor] = None,
+                            steps: int = 1) -> torch.Tensor:
+        """free rollout：自回归滚动预测未来 ``steps`` 个 TR 的全脑状态。
+
+        每一步用模型自己的预测（第 0 个 offset）接到 context 末尾、滑出最早 1 个 TR，
+        **中间不重新使用任何 ground truth**，返回 ``[B, steps, F]`` 的自回归轨迹。
+        既供评估（H=1,2,4,8,16 的 horizon 指标）复用，也可在
+        ``--enable_rollout_loss`` 下带梯度调用（训练侧短程 rollout 损失）。
+        """
+        if not self.next_state_mode:
+            raise RuntimeError("rollout_next_states 仅适用于 --task_mode next_timepoint。")
+        if bold_history.ndim != 3:
+            raise ValueError(f"bold_history 期望 [B, K, F]，收到 {tuple(bold_history.shape)}")
+        n_steps = int(steps)
+        if n_steps < 1:
+            raise ValueError(f"steps 必须 >= 1，收到 {n_steps}")
+        if bold_history.shape[1] < 2:
+            raise ValueError("rollout_next_states 至少需要 K >= 2 的 context 才能滑窗。")
+        cur = bold_history
+        preds: List[torch.Tensor] = []
+        for k in range(n_steps):
+            out = self.predict_next_state(cur, sc_matrix, pathology_score)
+            nxt = out['pred_next'][:, :, 0]                        # [B,F]（offset=+1）
+            preds.append(nxt)
+            if k + 1 >= n_steps:
+                break
+            cur = torch.cat([cur[:, 1:, :], nxt.unsqueeze(1)], dim=1)
+        return torch.stack(preds, dim=1)                           # [B, steps, F]
+
     def _denorm_aux_rounds(self, aux_info, norm_stats) -> None:
         """把轮间中间预测一并反归一化，使 aux 与最终预测处于同一数值空间。"""
         rounds = aux_info.get('refiner_round_preds', None) if aux_info else None
@@ -966,7 +1148,7 @@ class NeuroTwin(nn.Module):
         - 分位点是对未来值的绝对预测，直接施加同一仿射变换。
 
         ``factor`` 影响均值项与（后续精修后的）最终预测的一致性，因此这里在
-        ``forward`` / ``virtual_intervention`` / ``_recurrent_forward`` 的 ``self.norm``
+        ``forward`` / ``virtual_intervention`` 的 ``self.norm``
         分支统一调用；``--norm False`` 时无需换算。
         """
         if not aux_info or not self.norm:
@@ -996,78 +1178,13 @@ class NeuroTwin(nn.Module):
                 b5 = bias.reshape(1, -1, 1, 1, 1)
                 aux_info['pred_quantiles'] = (q - b5) * f5 + m5
 
-    def _recurrent_forward(
-        self,
-        dfc_data: torch.Tensor,
-        sc_matrix: torch.Tensor,
-        pathology_score: Optional[torch.Tensor] = None,
-        future: Optional[torch.Tensor] = None,
-    ):
-        """窗口间状态递推（``--recur_mode terminal_state``）。
-
-        每一次滚动只取预测头的**第 0 个预测窗**作为“下一窗”，把它接到输入历史
-        末位（滑出最早一窗）后再次前向，共滚动 ``pred_window`` 次；最终预测由
-        各次滚动的单窗结果拼接而成。训练时按 ``self._scheduled_sampling_prob``
-        的概率用真值窗替换自回归窗（scheduled sampling），评估态为纯自回归。
-
-        成本约为单次前向的 ``pred_window`` 倍。aux_info 复用最后一次滚动的结果
-        （含 MoE 正则与轮间监督所需的字段），并附加 ``recur_steps`` 与逐滚动的
-        ``ode_diag``。
-        """
-        cond = self._prepare_pathology_condition(pathology_score)
-        history = dfc_data
-        step_preds: List[torch.Tensor] = []
-        ode_diag_all = {}
-        last_aux = {}
-
-        for t in range(self.pred_window):
-            norm_stats = None
-            h = history
-            if self.norm:
-                h, norm_stats = self.rev_norm(h, 'norm')
-            latent, sc_info, ode_diag = self._encode(h, sc_matrix, cond)
-            for k, v in (ode_diag or {}).items():
-                ode_diag_all[f'roll{t}_{k}'] = v
-            pred_norm, aux_info = self._decode(
-                latent, h, sc_matrix, cond, sc_info, revin_stats=norm_stats)
-            if self.norm:
-                step_pred = self.rev_norm(pred_norm, 'denorm', stats=norm_stats)
-                self._denorm_aux_rounds(aux_info, norm_stats)
-                self._denorm_aux_prob(aux_info, norm_stats)
-            else:
-                step_pred = pred_norm
-            last_aux = aux_info
-            nxt = step_pred[:, :, :1, :]
-            step_preds.append(nxt)
-            if t + 1 >= self.pred_window:
-                break
-            if (future is not None and self.training
-                    and self._scheduled_sampling_prob > 0.0):
-                # 逐样本伯努利选择：真值窗（teacher forcing）或自回归窗
-                gt = future[:, :, t:t + 1, :].to(dtype=nxt.dtype)
-                keep = (torch.rand(nxt.shape[0], 1, 1, 1, device=nxt.device)
-                        < self._scheduled_sampling_prob).to(nxt.dtype)
-                nxt = keep * gt + (1.0 - keep) * nxt
-            history = torch.cat([history[:, :, 1:, :], nxt], dim=2)
-
-        pred = torch.cat(step_preds, dim=2)
-        if ode_diag_all:
-            last_aux['ode_diag'] = ode_diag_all
-        last_aux['recur_steps'] = self.pred_window
-        return pred, last_aux
-
     def forward(
         self,
         dfc_data: torch.Tensor,
         sc_matrix: torch.Tensor,
         pathology_score: Optional[torch.Tensor] = None,
-        future: Optional[torch.Tensor] = None,
     ):
-        """future: 可选的未来真值窗 [B, F, pred_window, S]，仅用于
-        ``--recur_mode terminal_state`` 下的 scheduled sampling（teacher forcing）。"""
-        if self.recur_mode == 'terminal_state':
-            return self._recurrent_forward(
-                dfc_data, sc_matrix, pathology_score, future)
+        """单次前向：整段 context 作为单窗口，并行预测各 offset 的下一时间点。"""
         history = dfc_data
         norm_stats = None
         if self.norm:
@@ -1078,6 +1195,9 @@ class NeuroTwin(nn.Module):
                                           revin_stats=norm_stats)
         if ode_diag:
             aux_info['ode_diag'] = ode_diag
+        if self.next_state_mode:
+            # 必须在反归一化之前：pred_delta_norm / revin_factor 都在归一化空间
+            self._fill_next_state_delta(aux_info, pred_dfc, history, norm_stats)
         if self.norm:
             pred_dfc = self.rev_norm(pred_dfc, 'denorm', stats=norm_stats)
             self._denorm_aux_rounds(aux_info, norm_stats)
@@ -1207,8 +1327,8 @@ class NeuroTwin(nn.Module):
             'preds'[T,B,F,W,S], 'baseline_aux', 'aux'}``。
 
         Note:
-            该方法按**单次前向**计算，与 ``--recur_mode terminal_state`` 的递推
-            路径不同；建议在 ``model.eval()`` 下调用（内部已 ``torch.no_grad``）。
+            该方法按**单次前向**计算（与 forward 相同的并行预测口径）；
+            建议在 ``model.eval()`` 下调用（内部已 ``torch.no_grad``）。
         """
         if self.pathology_normalizer is None:
             raise ValueError("反事实扫掠需要病理条件模块（微调模式）。")

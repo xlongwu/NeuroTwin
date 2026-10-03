@@ -293,7 +293,21 @@ class LowRankDelta(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.linear(self.dropout(x), self.lora_A)
+        """x: [..., in_features] → [..., out_features] 的增量。
+
+        输入最后一维小于 ``in_features`` 时（变长 context 的前缀路径）对
+        ``lora_A`` 取列前缀，语义与 :func:`models.common.prefix_linear` 一致；
+        宽度相等时数值不变。输出宽度恒为 ``out_features``（由调用方按需截断）。
+        """
+        d = int(x.shape[-1])
+        if d == self.in_features:
+            a = self.lora_A
+        elif d < self.in_features:
+            a = self.lora_A[:, :d]
+        else:
+            raise ValueError(
+                f"LoRA 输入宽度 {d} 超过建模宽度 {self.in_features}。")
+        h = F.linear(self.dropout(x), a)
         return F.linear(h, self.lora_B) * self.scaling
 
     def extra_repr(self) -> str:

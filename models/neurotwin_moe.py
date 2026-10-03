@@ -19,7 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.common import IterativePredictionRefiner
+from models.common import (IterativePredictionRefiner, prefix_layernorm,
+                           prefix_linear, prefix_proj)
 
 logger = logging.getLogger(__name__)
 
@@ -460,8 +461,11 @@ class SharedPathologyExpert(nn.Module):
         pathology_embedding: torch.Tensor,
     ) -> torch.Tensor:
         b, f, _, _ = latent.shape
-        x     = self.norm(latent.reshape(b, f, -1))
-        x     = self.dropout(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # 变长历史（L < in_w）走权重前缀路径，L == in_w 时与旧实现逐位等价
+        x_flat = latent.reshape(b, f, -1)
+        x      = prefix_layernorm(self.norm, x_flat)
+        x      = self.dropout(self.act_fn(prefix_linear(self.gate_proj, x))
+                              * prefix_linear(self.up_proj, x))
         delta = self.down_proj(x)
 
         path_scale = self.path_gate(pathology_embedding)  # [B, F]
@@ -501,6 +505,10 @@ class PathologyResidualExpert(nn.Module):
         self.out_dim  = pred_w * pred_s
         self.expert_id = expert_id
         self.act_name  = str(act).lower()
+        # out_dim == 1（next_timepoint 单步 / MTP 的单个偏移）时，base_norm 的
+        # LayerNorm(1) 与 standardize_future 的单元素标准化都会把输入整体置零，
+        # 抹掉 base_pred / shape 信号，因此对这两种情况显式跳过（其余路径不变）。
+        self._scalar_out = (self.out_dim == 1)
 
         self.history_norm = nn.LayerNorm(self.in_dim)
         self.latent_norm  = nn.LayerNorm(self.in_dim)
@@ -574,9 +582,14 @@ class PathologyResidualExpert(nn.Module):
         latent_flat  = latent.reshape(b, f, -1)
         base_flat    = base_pred.reshape(b, f, -1)
 
-        history_feat = self.history_proj(self.history_norm(history_flat))
-        latent_feat  = self.latent_proj(self.latent_norm(latent_flat))
-        base_feat    = self.base_proj(self.base_norm(base_flat))
+        # 历史/潜在分支以 in_w 建模：变长历史（L < in_w）走权重前缀路径，
+        # L == in_w 时与旧实现逐位等价；base_pred 维度固定（pred_w*pred_s）不受影响
+        history_feat = prefix_proj(self.history_proj,
+                                   prefix_layernorm(self.history_norm, history_flat))
+        latent_feat  = prefix_proj(self.latent_proj,
+                                   prefix_layernorm(self.latent_norm, latent_flat))
+        base_feat    = self.base_proj(base_flat if self._scalar_out
+                                      else self.base_norm(base_flat))
         cross_feat   = self.cross_roi(latent_feat)
 
         fused = self.fusion(
@@ -589,7 +602,7 @@ class PathologyResidualExpert(nn.Module):
 
         trend     = self.trend_head(fused).view(b, f, self.pred_w, self.pred_s)
         shape_raw = self.shape_head(fused).view(b, f, self.pred_w, self.pred_s)
-        shape     = standardize_future(shape_raw)
+        shape     = shape_raw if self._scalar_out else standardize_future(shape_raw)
         scale     = F.softplus(self.scale_head(fused)).view(b, f, self.pred_w, 1)
         return trend + scale * shape
 

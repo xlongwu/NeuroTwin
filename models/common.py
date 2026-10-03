@@ -53,6 +53,75 @@ def prepare_sc_matrix(sc_matrix: torch.Tensor, x: torch.Tensor) -> Tuple[torch.T
 
 
 # -------------------------------------------------
+# Variable history length helpers
+# -------------------------------------------------
+
+# 变长前向统一约定（轨迹任务与 next_timepoint 任务共用）：
+#
+# - 窗口轴 W（历史 chunk / 窗口序号）：轨迹任务 history_min..history_max 可变；预测头 /
+#   MoE 专家的扁平化分支按历史长度上限 L_max 建模，第 w 个窗口恒对应权重切片
+#   [w*S : (w+1)*S]（长度不同时权重前缀共享、语义一致；L == L_max 时逐位等价）。
+# - 时间轴 S（一个窗口内的 TR 序号；next_timepoint 任务下整段 context 就是单个
+#   窗口，故 S == context 长度 K，K <= context_max）：所有按 S_max = context_max
+#   建模的线性/LayerNorm 走**前缀切片**——context 的第 i 个时间点恒对应权重切片
+#   中的第 i 个位置（输入侧取权重列前缀，输出侧取权重行前缀）；K == S_max 时与
+#   定长实现逐位等价。卷积核（kernel 3/5）本身与位置无关，无需切片。
+#
+# 注意：这里刻意不把 nn.Linear 包成新 Module，保持 state_dict 键名与旧检查点一致。
+
+
+def prefix_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """输入最后一维 d <= linear.in_features 时用权重前缀做线性投影。"""
+    d = int(x.shape[-1])
+    if d == linear.in_features:
+        return linear(x)
+    if d > linear.in_features:
+        raise ValueError(
+            f"输入宽度 {d} 超过该分支建模的最大宽度 {linear.in_features}："
+            "history_max 配置与数据不一致。")
+    return F.linear(x, linear.weight[:, :d], linear.bias)
+
+
+def prefix_linear_out(linear: nn.Linear, x: torch.Tensor, out_dim: int) -> torch.Tensor:
+    """输出侧前缀截断：只取 linear 输出的前 ``out_dim`` 个通道（权重行前缀）。
+
+    用于把“按最大宽度建模的回投影”（如 GraphODE 的 out_proj / FFN 输出、
+    BrainMDM 的 S 轴池化回投影）对齐回实际宽度；``out_dim`` 等于权重行数时与
+    ``linear(x)`` 逐位等价，保持定长路径数值不变。
+    """
+    n_out = int(linear.out_features)
+    if out_dim == n_out:
+        return linear(x)
+    if out_dim > n_out:
+        raise ValueError(
+            f"目标宽度 {out_dim} 超过该分支建模的最大宽度 {n_out}。")
+    bias = None if linear.bias is None else linear.bias[:out_dim]
+    return F.linear(x, linear.weight[:out_dim], bias)
+
+
+def prefix_layernorm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
+    """按实际宽度做 LayerNorm，仿射参数取前缀（语义同 :func:`prefix_linear`）。"""
+    d = int(x.shape[-1])
+    if d == norm.normalized_shape[0]:
+        return norm(x)
+    if d > norm.normalized_shape[0]:
+        raise ValueError(
+            f"输入宽度 {d} 超过 LayerNorm 建模宽度 {norm.normalized_shape[0]}。")
+    return F.layer_norm(x, (d,), norm.weight[:d], norm.bias[:d], norm.eps)
+
+
+def prefix_proj(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+    """Sequential[Linear, ...] 的前缀版：首层按前缀投影，其余层原样执行。"""
+    head = seq[0]
+    if not isinstance(head, nn.Linear):
+        raise TypeError(f"prefix_proj 期望首层为 nn.Linear，收到 {type(head).__name__}")
+    out = prefix_linear(head, x)
+    for layer in list(seq)[1:]:
+        out = layer(out)
+    return out
+
+
+# -------------------------------------------------
 # Normalization
 # -------------------------------------------------
 
@@ -94,6 +163,16 @@ class BrainRevIN(nn.Module):
         x = x * stdev[:, target_slice, :, :]
         x = x + mean[:, target_slice, :, :]
         return x
+
+    def normalize_with(self, x: torch.Tensor, stats) -> torch.Tensor:
+        """用**外部给定的**统计量归一化 x（不重新估计）。
+
+        用于 latent 动力学监督：把未来真值 chunk 用“历史统计量”归一化后再过编码器，
+        使 z_(t+k) 与历史 latent 处于同一仿射空间——同时保证归一化统计量只来自历史，
+        未来 target 不参与任何统计量估计（无 normalization leakage）。
+        """
+        mean, stdev = stats
+        return self._normalize(x, mean, stdev)
 
     def forward(self, x: torch.Tensor, mode: str, stats=None, target_slice=slice(None)):
         if mode == 'norm':
@@ -311,11 +390,16 @@ class BrainMDM(nn.Module):
         self.scale_gate_temperature = float(max(1e-2, temperature))
 
     def _combine_scales(self, outs, gate_net, x):
-        """多尺度分支合并：无门控时均匀平均，有门控时按样本级 softmax 加权。"""
+        """多尺度分支合并：无门控时均匀平均，有门控时按样本级 softmax 加权。
+
+        门控输入 ``pooled = x.mean(dim=(1,2))`` 宽度等于 S 轴长度：定长任务下
+        恒等于 ``seq_len``；next_timepoint 任务的变长 context 下走前缀切片
+        （``prefix_linear``），宽度相等时为恒等路径、数值不变。
+        """
         if gate_net is None or len(outs) == 1:
             return sum(outs) / max(1, len(outs))
         pooled = x.mean(dim=(1, 2))                       # [B, S]
-        logits = gate_net(pooled) / self.scale_gate_temperature
+        logits = prefix_linear(gate_net, pooled) / self.scale_gate_temperature
         gate = F.softmax(logits, dim=-1)                  # [B, K]
         b = x.shape[0]
         agg = sum(gate[:, i].view(b, 1, 1, 1) * o for i, o in enumerate(outs))
@@ -327,21 +411,43 @@ class BrainMDM(nn.Module):
         return agg
 
     def _pool_along_s(self, x: torch.Tensor) -> torch.Tensor:
+        """时间轴（S）多尺度池化 + 回投影。
+
+        池化目标长度由 ``seq_len``（= 建模的最大 S）在构造期确定，实际 S 轴长度
+        ``s == seq_len`` 时逐位等价于旧实现；``s < seq_len``（next_timepoint 任务
+        的变长 context）时对回投影结果做**前缀截断**（与输入侧前缀切片同一约定：
+        第 i 个时间点恒对应权重第 i 行），池化本身对任意 s 都是良定义的。
+        """
         b, f, w, s = x.shape
         x_s = x.reshape(b * f * w, s)
         outs = []
         for pool, linear in zip(self.pool_s, self.linear_s):
             pooled = pool(x_s.unsqueeze(1)).squeeze(1)
-            outs.append(linear(pooled).reshape(b, f, w, s))
+            out = prefix_linear_out(linear, pooled, s)   # [b*f*w, s]
+            outs.append(out.reshape(b, f, w, s))
         return self._combine_scales(outs, self.scale_gate_s, x)
 
     def _pool_along_w(self, x: torch.Tensor) -> torch.Tensor:
+        """窗口轴多尺度池化 + 回投影。
+
+        池化目标长度由 ``num_window``（= 历史长度上限 L_max）在构造期确定，因此
+        实际窗口数 ``w == num_window`` 时逐位等价于旧实现；``w < num_window``
+        （轨迹任务的变长历史）时对回投影结果做**右对齐截断**（取末 w 个 token，
+        保证最近窗口仍在序列末尾），池化本身对任意 w 都是良定义的。
+        """
         b, f, w, s = x.shape
         x_w = x.permute(0, 1, 3, 2).reshape(b * f * s, w)
         outs = []
         for pool, linear in zip(self.pool_w, self.linear_w):
             pooled = pool(x_w.unsqueeze(1)).squeeze(1)
-            outs.append(linear(pooled).reshape(b, f, s, w).permute(0, 1, 3, 2))
+            out = linear(pooled)                       # [b*f*s, num_window]
+            if w != self.num_window:
+                if w > self.num_window:
+                    raise ValueError(
+                        f"窗口数 {w} 超过 BrainMDM 建模的 {self.num_window}："
+                        "history_max 配置与数据不一致。")
+                out = out[:, self.num_window - w:]
+            outs.append(out.reshape(b, f, s, w).permute(0, 1, 3, 2))
         return self._combine_scales(outs, self.scale_gate_w, x)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
@@ -463,8 +569,12 @@ class GraphODE(nn.Module):
             })
 
     def _proj(self, name: str, base: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-        """基础线性投影 + （可选的）LoRA 低秩增量。"""
-        out = base(x)
+        """基础线性投影 + （可选的）LoRA 低秩增量。
+
+        输入最后一维小于 ``base.in_features`` 时（变长 context）走前缀切片
+        （``prefix_linear`` / ``LowRankDelta`` 内部同理），宽度相等时数值不变。
+        """
+        out = prefix_linear(base, x)
         if self._lora is not None and name in self._lora:
             out = out + self._lora[name](x)
         return out
@@ -523,13 +633,24 @@ class GraphODE(nn.Module):
         attn = F.dropout(attn, p=self.dropout, training=self.training)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().reshape(b * w, n, self.hidden_dim)
-        out = self._proj('out', self.out_proj, out)
-        return out.reshape(b, w, n, s).transpose(1, 2)
+        # out_proj / 对应 LoRA 增量均按 seq_len 建模：变长 context 下取输出前缀
+        # （与输入侧前缀切片同一约定），宽度相等时数值不变。
+        projected = prefix_linear_out(self.out_proj, out, s)
+        if self._lora is not None and 'out' in self._lora:
+            projected = projected + self._lora['out'](out)[..., :s]
+        return projected.reshape(b, w, n, s).transpose(1, 2)
 
     def _window_attention(self, h: torch.Tensor) -> torch.Tensor:
         if self.window_attn is None:
             return torch.zeros_like(h)
         b, n, w, s = h.shape
+        if s != self.seq_len:
+            # nn.MultiheadAttention(embed_dim=seq_len) 的 token 特征维固定，
+            # 变长 context 无法直接进入该分支；next_timepoint 任务的 W=1，
+            # 该分支本身退化为逐 token 线性映射，调用方应关闭 --ode_window_attn。
+            raise ValueError(
+                f"GraphODE 窗口注意力要求 S 轴长度 == seq_len({self.seq_len})，"
+                f"收到 s={s}；变长 context（next_timepoint）请设置 --ode_window_attn off。")
         tokens = h.reshape(b * n, w, s)
         tokens_norm = self.window_norm(tokens)
         out, _ = self.window_attn(tokens_norm, tokens_norm, tokens_norm, need_weights=False)
@@ -542,16 +663,19 @@ class GraphODE(nn.Module):
         if h.ndim != 4:
             raise ValueError(f"Expected h [B, F, W, S], got {tuple(h.shape)}")
 
-        h_norm = self.input_norm(h)
+        s = int(h.shape[-1])
+        # 变长 context（s < seq_len）时全部按 S 轴建模的 LayerNorm/Linear 走前缀切片；
+        # s == seq_len（旧任务 / 轨迹任务）时逐位等价于原实现。
+        h_norm = prefix_layernorm(self.input_norm, h)
         dh_space = self._graph_attention(h_norm, sc_matrix, adj_eff=adj_eff)
         dh_time = self.temporal_branch(h_norm)
         dh_window = self._window_attention(h_norm)
         # FFN 手动展开，以便在两层 Linear 上挂载 LoRA 增量（键名 ffn.0~ffn.4 不变）
-        ffn_in = self.ffn[0](h_norm)
+        ffn_in = prefix_layernorm(self.ffn[0], h_norm)
         ffn_in = self._proj('ffn_in', self.ffn[1], ffn_in)
         ffn_in = self.ffn[2](ffn_in)
         ffn_in = self.ffn[3](ffn_in)
-        dh_ffn = self._proj('ffn_out', self.ffn[4], ffn_in)
+        dh_ffn = self._proj('ffn_out', self.ffn[4], ffn_in)[..., :s]
 
         dh_dt = (
             torch.sigmoid(self.attn_gate) * dh_space +

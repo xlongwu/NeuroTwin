@@ -1,8 +1,8 @@
 # coding=utf-8
-"""消融实验基线配置：镜像 scripts/Finetune_MDD.sh 的 ARGS 数组。
+"""消融实验基线配置：镜像 scripts/Finetune_MDD_next_point.sh 的 ARGS 数组。
 
-⚠️ 与 scripts/Finetune_MDD.sh 需同步维护：该脚本调整训练超参时，本文件必须
-同步修改，否则消融结果与既有基线（neurotwin_finetune_pred1）不可比。
+⚠️ 与 scripts/Finetune_MDD_next_point.sh 需同步维护：该脚本调整训练超参时，本文件
+必须同步修改，否则消融结果与既有基线（neurotwin_nextpoint_finetune）不可比。
 
 约定：
 - 键为 main.py argparse 参数名（不带 --）；未列出的参数回落到 main.py 默认值。
@@ -28,14 +28,13 @@ BASE_ARGS = {
     'num_rois': 116,
     'seq_len': 30,
     'total_windows': 9,
-    'in_window': 6,
-    'pred_window': 1,
     # ---- 模型规模 ----
     'n_block': 2,
     'alpha': 0.5,
-    'norm': True,
+    # 2026-09-27：Normlize 数据已逐 ROI 全序列 z-score，关闭 context 内 BrainRevIN 二次归一化
+    'norm': False,
     'dropout': 0.2,
-    'ode_steps': 3,  # 2026-09-25 消融结论：1/3/6/12 步差 ≤0.002，与 Finetune_MDD.sh 同步取 3
+    'ode_steps': 3,  # 2026-09-25 消融结论：1/3/6/12 步差 ≤0.002，与 Finetune_MDD_next_point.sh 同步取 3
     'ode_hidden_dim': 256,
     'num_scales': 3,
     'stochastic_depth_rate': 0.10,
@@ -60,22 +59,15 @@ BASE_ARGS = {
     'pin_memory': True,
     'cache_in_memory': False,
     'tf32': True,
-    # ---- 不确定度加权损失初值（沿用既有设置） ----
-    'init_log_var_pcc': 0.0,
-    'init_log_var_mae': -1.5,
-    'init_log_var_diff': -2.0,
-    'init_log_var_std': -2.0,
+    # ---- 损失学习率缩放 ----
     'loss_lr_scale': 0.5,
-    'clamp_log_vars': True,
-    'log_var_min': -6.0,
-    'log_var_max': 6.0,
     # ---- Phase 0：协议基础（被试级 8:1:1 划分） ----
     'pretrained_arch_policy': 'require_match',
     'val_ratio': 0.10,
     'test_ratio': 0.10,
     'stratify_bins': 5,
     'refiner_rounds': 3,
-    'delta_refiner_rounds': 1,  # 2026-09-25 消融结论：1 轮与 2 轮等价，与 Finetune_MDD.sh 同步
+    'delta_refiner_rounds': 1,  # 2026-09-25 消融结论：1 轮与 2 轮等价，与 Finetune_MDD_next_point.sh 同步
     'refiner_adaptive': False,
     'refiner_inter_sup_weight': 0.05,
     'refiner_inter_sup_decay': 0.5,
@@ -149,19 +141,47 @@ BASE_ARGS = {
     'moe_expert_stats_interval': 0,
     # 受控消融：finetune 加载预训练权重时强制随机初始化的分支（fnmatch 模式）
     'pretrained_skip_pattern': '',
-    # ---- Phase 6：长程与状态递推（高风险项默认关闭） ----
-    'variable_cutoff': False,
-    'loss_diff_mode': 'per_window',
-    'recur_mode': 'none',
-    'scheduled_sampling_start': 0.0,
-    'scheduled_sampling_end': 0.0,
-    # ---- Phase 7：不确定性 / 辅助反演 ----
+    # ---- Phase 7：不确定性 / 反事实 ----
     'pred_head': 'gaussian',
     'pred_quantiles': '0.1,0.5,0.9',
     'init_log_var_nll': 2.0,
     'inversion_weight': 0.0,
     'inversion_hidden_dim': 128,
     'intervention_mode': 'latent',
+    # ---- Phase 8：任务口径与数据采样（唯一口径 next_timepoint）----
+    'task_mode': 'next_timepoint',
+    'random_context': True,
+    'random_cutoff': True,
+    'bold_source': 'auto',
+    'train_samples_per_subject': 0,      # 0 = auto（min(合法组合数, 12)）
+    'sampling_seed': 2024,
+    'subject_cache_size': 256,
+    'eval_fc': True,
+    'eval_spectral': False,
+    'eval_spectral_tr': 2.0,
+    # ---- Phase 9：连续 BOLD → 下一 TR 全脑状态（next_timepoint）----
+    'context_min': 16,
+    'context_max': 64,
+    'context_lengths': '',               # 空 = 在 [context_min, context_max] 内随机采样
+    'prediction_target': 'delta',
+    'causal_training': 'random_context',
+    'forecast_offsets': '',              # 空 = 按 enable_mtp 取 [1] 或 [1,2,4,8]
+    'enable_mtp': False,
+    'mtp_weights': '',
+    'lambda_abs': 1.0,
+    'lambda_delta': 1.0,
+    'lambda_pcc': 0.1,
+    'lambda_nll': 0.0,
+    'enable_rollout_loss': False,
+    'rollout_train_steps': 2,
+    'lambda_rollout': 0.2,
+    'eval_context_length': 0,            # 0 = auto（=context_max）
+    'eval_anchors_per_subject': 16,
+    'eval_rollout_tasks_per_subject': 2,
+    'eval_rollout_horizons': '1,2,4,8,16',
+    'eval_rollout_steps': 0,             # 0 = auto（max(horizons)，FC 启用时抬到 fc_min_length）
+    'fc_min_length': 32,
+    'load_backbone_only': False,
 }
 
 

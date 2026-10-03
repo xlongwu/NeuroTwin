@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.common import prepare_sc_matrix
+from models.common import prefix_layernorm, prefix_linear, prepare_sc_matrix
 
 
 def prob_to_logit(p: float, eps: float = 1e-4) -> float:
@@ -169,10 +169,14 @@ class SoftAnatomicalPrior(nn.Module):
         不保对称（A_ij 与 A_ji 独立归一化），最后再做一次
         ``0.5 (S + Sᵀ)`` 对称化，使 A_func 严格对称 -> Sinkhorn 之后
         A_eff 才能同时满足“行归一”与“对称”两个要求。
+
+        S 轴长度可变（next_timepoint 的 context 长度 K <= context_max）：节点特征
+        投影全部走前缀切片（``prefix_layernorm`` / ``prefix_linear``），
+        S == seq_len 时逐位等价于原实现。
         """
-        z = self.node_norm(nodes)
-        u = self.u_proj(z)
-        v = self.v_proj(z)
+        z = prefix_layernorm(self.node_norm, nodes)
+        u = prefix_linear(self.u_proj, z)
+        v = prefix_linear(self.v_proj, z)
         scores = torch.matmul(u, v.transpose(-1, -2)) / math.sqrt(self.rank)
         scores = 0.5 * (scores + scores.transpose(-1, -2))
         p = F.softmax(scores, dim=-1)
@@ -186,8 +190,8 @@ class SoftAnatomicalPrior(nn.Module):
             return torch.sigmoid(self.lambda_logit).view(1, 1, 1)
         if self.lambda_mode == 'sample':
             pooled = nodes.mean(dim=1)                       # [B, S]
-            return torch.sigmoid(self.lambda_proj(pooled)).view(-1, 1, 1)
-        return torch.sigmoid(self.lambda_proj(nodes))        # [B, F, 1]
+            return torch.sigmoid(prefix_linear(self.lambda_proj, pooled)).view(-1, 1, 1)
+        return torch.sigmoid(prefix_linear(self.lambda_proj, nodes))    # [B, F, 1]
 
     # ------------------------------------------------------------------
     # 前向
@@ -230,8 +234,10 @@ class SoftAnatomicalPrior(nn.Module):
             a = a_func
 
         if self.delta_scale is not None:
-            z = self.node_norm(nodes)
-            da = torch.matmul(self.dp(z), self.dq(z).transpose(-1, -2)) / math.sqrt(self.delta_rank)
+            z = prefix_layernorm(self.node_norm, nodes)
+            da = torch.matmul(prefix_linear(self.dp, z),
+                              prefix_linear(self.dq, z).transpose(-1, -2)) \
+                / math.sqrt(self.delta_rank)
             da = 0.5 * (da + da.transpose(-1, -2))
             # ΔA 可正可负，裁剪保证非负（Sinkhorn 要求非负）
             a = (a + F.softplus(self.delta_scale) * da).clamp_min(0.0)

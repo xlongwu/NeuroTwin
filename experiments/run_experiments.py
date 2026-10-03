@@ -2,9 +2,9 @@
 """消融实验批量执行入口。
 
 用法示例：
-  bash scripts/RunAblation.sh --group G14_MOE --dry-run      # 只打印命令
-  bash scripts/RunAblation.sh --only baseline --smoke        # 端到端冒烟
-  bash scripts/RunAblation.sh --priority P0 --seeds 2024     # 正式 P0 组
+  python -m experiments.run_experiments --group G14_MOE --dry-run      # 只打印命令
+  python -m experiments.run_experiments --only baseline --smoke        # 端到端冒烟
+  python -m experiments.run_experiments --priority P0 --seeds 2024     # 正式 P0 组
 
 流程：合并参数（BASE_ARGS + 变体 overrides + 运行参数）→ 可选自预训练 →
 训练（subprocess，日志落盘）→ 轻量评估（val/test + shuffled 负对照）→
@@ -64,13 +64,39 @@ def merge_run_args(variant, seed, smoke, pretrain_stage=False):
     return merged, name
 
 
+def resolve_pretrained_dir(name):
+    """解析预训练权重目录：先取 ``checkpoints/<name>``，缺失时回退到最新版本归档
+    ``checkpoints/Version*/<name>``（生产权重归档后，消融仍可引用其预训练产物）。
+
+    Version* 目录用字典序近似时间序（…_0921 → …_1003），倒序取第一个含
+    base_best.pt 的归档；都不存在时返回原路径（让调用方给出可读的报错）。
+    """
+    exact = CHECKPOINT_DIR / name
+    if (exact / 'base_best.pt').exists():
+        return exact
+    for archive in sorted(CHECKPOINT_DIR.glob('Version*'), reverse=True):
+        candidate = archive / name
+        if (candidate / 'base_best.pt').exists():
+            return candidate
+    return exact
+
+
 def resolve_pretrained_weight(merged, variant):
-    """变体微调的预训练权重来源：结构性变体用自预训练产物，其余复用基线。"""
+    """变体微调的预训练权重来源（按优先级）：
+
+    1. 变体显式 ``pretrained_from``：复用指定目录下的 base_best.pt
+       （如 TFM 微调类消融共享生产预训练 neurotwin_tfm_pretrain；目录被
+       归档到 Version* 后自动回退到归档位置）；
+    2. ``requires_pretrain=True``：结构性变体用自预训练产物；
+    3. 其余：复用 legacy next_timepoint 基线。
+    """
+    pretrained_from = variant.get('pretrained_from')
+    if pretrained_from:
+        return str(resolve_pretrained_dir(pretrained_from) / 'base_best.pt')
     if variant['requires_pretrain']:
         return str(CHECKPOINT_DIR / f"ablation_pre_{variant['id']}_s{merged['seed']}"
                    / 'base_best.pt')
-    return str(CHECKPOINT_DIR / f"neurotwin_pretrain_pred{merged['pred_window']}"
-               / 'base_best.pt')
+    return str(resolve_pretrained_dir('neurotwin_nextpoint_pretrain') / 'base_best.pt')
 
 
 def resolve_run_ckpt(name, filename='finetuned_best.pt'):

@@ -201,8 +201,8 @@ class AmplitudeConsistencyLoss(nn.Module):
         - ``timestep``：逐元素比较 ``softplus(scale)`` 与 ``|y - anchor|``
           （元素级幅值代理量）。
 
-        mask: 可选的窗口级掩码 [B, W]（1 有效 / 0 填充）。`--variable_cutoff`
-              下填充窗的目标是占位零，其幅值无意义，需按掩码加权排除。
+        mask: 可选的窗口级掩码 [B, W]（1 有效 / 0 填充）。填充窗的目标是占位零，
+              其幅值无意义，需按掩码加权排除。
         """
         stats = aux_info.get('head_amp', None) if isinstance(aux_info, dict) else None
         if not isinstance(stats, dict):
