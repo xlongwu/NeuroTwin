@@ -542,15 +542,19 @@ class NextPointTrainView(Dataset):
                  samples_per_subject: int = 0, seed: int = 2024,
                  augmentation: Optional[BrainSignalAugmentation] = None,
                  random_context: bool = True, random_cutoff: bool = True,
-                 future_steps: int = 0):
+                 future_steps: int = 0, anchor_max_offset: int = 0):
         self.base = base
         self.subject_indices = list(subject_indices)
         self.augmentation = augmentation
         self.random_context = bool(random_context)
         self.random_cutoff = bool(random_cutoff)
         self.seed = int(seed)
-        # >0 时额外返回未来 R 步真值（供 --enable_rollout_loss 的短程 rollout 监督）
+        # >0 时额外返回未来 R 步真值（供 --enable_rollout_loss 的短程 rollout 监督，
+        # 以及 TFM 的 CPM 全 horizon 监督）
         self.future_steps = int(future_steps)
+        # >0 时锚点采样区间改用该 max_offset（保证 t+anchor_max_offset 处仍有真值，
+        # 供 CPM 全 horizon 监督；0 = 沿用 base.max_offset，legacy 行为不变）
+        self.anchor_max_offset = int(anchor_max_offset)
 
         rng = np.random.RandomState(seed)
         table: List[Tuple[int, int]] = []
@@ -589,7 +593,9 @@ class NextPointTrainView(Dataset):
     def __getitem__(self, idx):
         subj_pos, K = self.table[idx]
         subj_id = self.base.subject_ids[subj_pos]
-        lo, hi = self.base.legal_anchor_range(subj_id, K)
+        lo, hi = self.base.legal_anchor_range(
+            subj_id, K,
+            max_offset=(self.anchor_max_offset or None))
         t = int(np.random.randint(lo, hi + 1)) if self.random_cutoff else int(hi)
         sample = self.base.make_sample(subj_pos, K, t,
                                        future_steps=self.future_steps)
@@ -610,13 +616,17 @@ class NextPointEvalView(Dataset):
 
     def __init__(self, base: NeuroTwinNextPointDataset, subject_indices: List[int],
                  context_length: int, anchors_per_subject: int = 16,
-                 rollout_tasks_per_subject: int = 0, rollout_steps: int = 0):
+                 rollout_tasks_per_subject: int = 0, rollout_steps: int = 0,
+                 all_future_steps: int = 0):
         self.base = base
         self.subject_indices = list(subject_indices)
         self.context_length = int(context_length)
         self.anchors_per_subject = int(anchors_per_subject)
         self.rollout_tasks_per_subject = int(rollout_tasks_per_subject)
         self.rollout_steps = int(rollout_steps)
+        # >0 时**所有** anchor 都返回未来真值（供 TFM 的 CPM 逐 horizon 指标；
+        # 与 rollout_steps 取大者统一宽度，0 = legacy 行为）
+        self.all_future_steps = int(all_future_steps)
 
         tasks: List[Tuple[int, int, int]] = []       # (subj_pos, t, rollout_flag)
         per_subject: Dict[str, int] = defaultdict(int)
@@ -675,12 +685,15 @@ class NextPointEvalView(Dataset):
 
     def __getitem__(self, idx):
         subj_pos, t, rollout_flag = self.tasks[idx]
-        sample = self.base.make_sample(
-            subj_pos, self.context_length, t,
-            future_steps=(self.rollout_steps if rollout_flag else 0))
+        # 所有 anchor 返回同一宽度的 future（batch collate 要求维度一致）；
+        # rollout_steps（rollout/FC 用，通常更长）与 all_future_steps（CPM 用）取大者
+        future_steps = max(self.rollout_steps, self.all_future_steps)
+        sample = self.base.make_sample(subj_pos, self.context_length, t,
+                                       future_steps=future_steps)
         if 'future' not in sample:
-            # 非 rollout 锚点也返回同形张量（全零 + 掩码全 0），保证 batch collate 一致；
-            # 这些行不会参与 rollout/FC/频谱指标（rollout_flag=0 会被显式筛掉）
+            # future_steps=0 的情形（legacy 且非 rollout 锚点）也返回同形张量
+            # （全零 + 掩码全 0），保证 batch collate 一致；这些行不参与
+            # rollout/FC/频谱/CPM 指标（显式筛掉）
             n_rois = int(sample['sc'].shape[0])
             steps = max(1, int(self.rollout_steps))
             sample['future'] = torch.zeros(n_rois, steps)
@@ -785,6 +798,8 @@ class NeuroTwinDataLoader:
         eval_rollout_tasks_per_subject: int = 2,
         eval_rollout_steps: int = 32,
         train_rollout_steps: int = 0,
+        train_anchor_max_offset: int = 0,
+        eval_all_future_steps: int = 0,
     ):
         task_mode = str(task_mode)
         if task_mode != 'next_timepoint':
@@ -808,6 +823,9 @@ class NeuroTwinDataLoader:
         self.eval_rollout_tasks_per_subject = int(eval_rollout_tasks_per_subject)
         self.eval_rollout_steps = int(eval_rollout_steps)
         self.train_rollout_steps = int(train_rollout_steps)
+        # TFM 的 CPM 支持：训练锚点按 cpm_horizon 右移上界、评估全 anchor 带 future
+        self.train_anchor_max_offset = int(train_anchor_max_offset)
+        self.eval_all_future_steps = int(eval_all_future_steps)
         self.seed = seed
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size if eval_batch_size else batch_size * 4
@@ -860,19 +878,22 @@ class NeuroTwinDataLoader:
             samples_per_subject=self.train_samples_per_subject,
             seed=self.sampling_seed, augmentation=augmentation,
             random_context=self.random_context, random_cutoff=self.random_cutoff,
-            future_steps=self.train_rollout_steps)
+            future_steps=self.train_rollout_steps,
+            anchor_max_offset=self.train_anchor_max_offset)
         self.val_dataset = NextPointEvalView(
             self.base_dataset, val_indices,
             context_length=self.eval_context_length,
             anchors_per_subject=self.eval_anchors_per_subject,
             rollout_tasks_per_subject=self.eval_rollout_tasks_per_subject,
-            rollout_steps=self.eval_rollout_steps)
+            rollout_steps=self.eval_rollout_steps,
+            all_future_steps=self.eval_all_future_steps)
         self.test_dataset = NextPointEvalView(
             self.base_dataset, test_indices,
             context_length=self.eval_context_length,
             anchors_per_subject=self.eval_anchors_per_subject,
             rollout_tasks_per_subject=self.eval_rollout_tasks_per_subject,
-            rollout_steps=self.eval_rollout_steps)
+            rollout_steps=self.eval_rollout_steps,
+            all_future_steps=self.eval_all_future_steps)
 
         # 持久化被试划分结果：供归一化统计量拟合、分析脚本与实验记录复用
         self.train_subjects: List[str] = sorted(train_subjects)

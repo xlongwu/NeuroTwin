@@ -33,28 +33,34 @@
 
 ```
 NeuroTwin/
-├── main.py                     # 训练入口：main 训练/验证循环、evaluate_next_point 验证与 CLI 定义
+├── main.py                     # 训练入口：main 训练/验证循环、evaluate 与 CLI 定义（--model_arch 分派）
 ├── models/
-│   ├── neurotwin.py            # 主模型 NeuroTwin（编码器 + 预测头 + MoE 挂载）
+│   ├── neurotwin.py            # 主模型 NeuroTwin（legacy 主干：编码器 + 预测头 + MoE 挂载）
 │   ├── neurotwin_moe.py        # NeuroTwinMoE：病理感知 MoDE 专家模块
+│   ├── tfm.py                  # NeuroTwinTFM（model_arch=tfm）：TimesFM-3 风格主干 + One-Step/CPM 双头
+│   ├── tfm_backbone.py         # TFM 构件：TemporalPatchEmbed / CausalTemporalAttention / SCGuidedROIAttention / TFMEncoderBlock
+│   ├── graph_prior.py          # SoftAnatomicalPrior：SC 软解剖先验（A_eff，legacy 与 TFM 共用）
 │   └── common.py               # BrainRevIN / DFCAdapter / BrainMDM / GraphODE 等公共模块
 ├── train/
-│   ├── losses.py               # NextTimepointLoss 下一时间点预测损失 + rollout 损失
-│   ├── optim.py                # AdamW 参数组 / Warmup+Cosine 调度 / ModelEMA / 分阶段微调
+│   ├── losses.py               # NextTimepointLoss（legacy）+ TFMDualLoss（TFM 的 One-Step+CPM 双目标）+ rollout 损失
+│   ├── optim.py                # AdamW 参数组 / Warmup+Cosine 调度 / ModelEMA / 分阶段微调（按 model_arch 分派）
 │   └── moe.py                  # 路由温度调度（Hold-then-Decay）+ 负载均衡/Z-Loss/熵/多样性正则
 ├── utils/
-│   ├── dataloader.py           # NeuroTwinNextPointDataset / NeuroTwinDataLoader（连续 context 样本、subject-level 划分）
+│   ├── dataloader.py           # NeuroTwinNextPointDataset / NeuroTwinDataLoader（连续 context 样本、subject-level 划分；支持 CPM future 目标）
 │   ├── augmentation.py         # BrainSignalAugmentation 训练集增强
 │   └── common.py               # set_seed / 任务维度推导 / 通用工具
+├── tests/                      # 单元测试（pytest）：TFM backbone / 完整模型 / 双目标损失
 ├── analysis/
 │   ├── analyzer.py / metrics.py / checkpoint.py / visualizer.py
-│   ├── next_point_eval.py            # next-state 指标 + 被试级聚合 + persistence/trend/AR(1) baseline + rollout + FC
+│   ├── next_point_eval.py            # next-state 指标 + 被试级聚合 + baselines + free rollout + FC + CPM 逐 horizon（TFM）
 │   ├── analyze_low_pcc_samples.py    # 低 PCC 被试临床特征关联分析（消费 per_subject/per_task CSV）
 │   ├── visualize_roi_importance.py   # 结合 AAL116 图谱的 ROI 重要性可视化（消费 feature_importance_<split>.json）
 │   └── visualize_sig_region.py       # 按脑网络分组的显著脑区玻璃脑图（消费 feature_importance_<split>.json）
+├── experiments/                # evaluate_variant：从 checkpoint 重建模型（legacy/tfm）并统一评估
 ├── scripts/
-│   └── Pretrain_HC_next_point.sh / Finetune_MDD_next_point.sh # 阶段一 / 阶段二训练脚本
-├── docs/                       # 模型架构、机理与可解释性实验设计文档（见文末索引）
+│   ├── Pretrain_HC_next_point.sh / Finetune_MDD_next_point.sh   # legacy 两阶段训练
+│   └── Pretrain_HC_tfm.sh / Finetune_MDD_tfm.sh                 # TFM（model_arch=tfm）两阶段训练
+├── docs/                       # 模型架构、机理与可解释性文档（见文末索引）
 └── checkpoints/                # 权重与 TensorBoard 日志（runs/）输出目录
 ```
 
@@ -336,10 +342,60 @@ Raw ROI BOLD [F, T=150]（data/Normlize，已逐 ROI z-score）
 完整协议（shape、变长 S 轴前缀切片、损失数学定义与设计取舍、评估产物、参数表、
 运行命令、已知限制）见 [docs/next_timepoint_forecasting.md](docs/next_timepoint_forecasting.md)。
 
+## NeuroTwin-TFM（`--model_arch tfm`，TimesFM-3 风格主干）
+
+> 设计方案：[docs/NeuroTwin_TimesFM3_改进方案.md](docs/NeuroTwin_TimesFM3_改进方案.md)（§30 V1：只做四项——`[B,F,K]`+temporal patching、Causal Temporal Attention、SC-guided ROI Attention、One-Step + CPM 双头；quantile / intervention 训练 / assimilation / 新 MoE / SDE 暂不加入）。
+
+`--model_arch tfm` 选择新的 TFM 主干（默认 `legacy` 保持原 NeuroTwin 不变，两套主干的任务口径签名互不兼容，权重不可混用）：
+
+```
+BOLD context [B,F,K]
+  → Context-only RevIN（μ/σ 只由历史 context 估计，方案 §15；--norm True）
+  → A_eff = SoftAnatomicalPrior（λ·A_SC + (1-λ)·A_func + ΔA，一次计算全层共享，§7）
+  → Temporal Patching（--tfm_patch_len p∈{1,4,8} 消融，K 非 p 整数倍时开头补零）
+  → [B,F,P,D] token grid
+  → SC-guided Temporal–Variate Block × N（--tfm_layers）
+      RMSNorm → Causal Temporal Attention（逐 ROI 沿 patch 轴，严格 causal mask）
+      → RMSNorm → SC-guided ROI Attention（加性偏置 β·log(ε+A_eff)，β 逐头可学习）
+      → RMSNorm → FFN
+  ├─ One-Step 头：z_t = 最后 causal token → z_(t+1)=F_θ(z_t, A_eff, c)（A_eff 图混合 + FiLM）
+  │              → x̂_(t+1) = x_t + Δ̂（零初始化残差，初始=persistence）
+  └─ CPM 头：q_{i,h} = e^ROI_i + e^horizon_h → 交叉注意力到全部 context token
+             → 一次非自回归输出 x̂_(t+1:t+H)（--cpm_horizon，默认 8）
+患者条件 c = [HAMD]（finetune）→ PathologyNormalizer → FiLM（零初始化，冻结期仍训练）
+```
+
+- **任务口径**：one-step 头只建模 +1 偏移（方案 §10），`--forecast_offsets` 必须为 1；
+  稀疏偏移 {1,2,4,8} 的监督/评估由 CPM 头的 horizon 覆盖（Task C 降级为 CPM 子集）。
+- **损失**（`TFMDualLoss`，方案 §20）：`L = λ_one·(Huber + λ_pcc·(1−PCC_sp)) + λ_cpm·(γ^(h−1) 加权逐 horizon Huber)`；
+  不再使用数学等价的 abs+delta 双计。`--lambda_cpm 0` 可退化 Stage 0（纯 one-step）基线。
+- **训练/评估**：`python main.py --model_arch tfm --mode pretrain|finetune ...`（完整参数
+  `--tfm_dim/--tfm_layers/--tfm_heads/--tfm_patch_len/--cpm_horizon/--lambda_one/--lambda_cpm/--cpm_gamma` 等）；
+  两阶段脚本 [scripts/Pretrain_HC_tfm.sh](scripts/Pretrain_HC_tfm.sh) 与
+  [scripts/Finetune_MDD_tfm.sh](scripts/Finetune_MDD_tfm.sh)（微调 = 冻结主干训 FiLM → 解冻联合优化，
+  无 MoE 分支）。
+- **评估**：统一入口不变，checkpoint 按 `model_arch` 自动分派重建；`metrics_<split>.json`
+  额外输出 `cpm_horizon` 段（模型 vs persistence 的逐 horizon MAE/RMSE/spatial PCC/
+  delta_direction 及 improvement），summary 键 `test_cpm_mae_H*` / `test_cpm_pcc_H*`。
+- **干预接口预留**：`--cpm_intervention True` 构建 future-known covariate 嵌入
+  （`forecast_horizon(..., future_control=[B,F,H])`），V1 默认关闭、不作为治疗预测训练
+  （方案 §13.1：无真实刺激数据不得宣称疗效预测）。
+- **单元测试**：`python -m pytest tests/ -q`（backbone 因果性/SC 偏置语义、模型双头契约、
+  初始化不变量、FiLM 条件通路、损失闭式核对）。
+
 ## 变更记录
 
 | 变更日期 | 文件名 | 主要修改 |
 | --- | --- | --- |
+| 2026-10-02 | models/tfm_backbone.py、models/tfm.py | 新建：TimesFM-3 风格 TFM 主干（TemporalPatchEmbed / CausalTemporalAttention / SCGuidedROIAttention / TFMEncoderBlock，方案 §4–§7）与 NeuroTwinTFM 完整模型（Context-only RevIN + SoftAnatomicalPrior 共享 A_eff + One-Step/CPM 双头 + 病理 FiLM 条件 + intervention 接口预留，方案 §8–§16/§30 V1） |
+| 2026-10-02 | train/losses.py | 新增 `TFMDualLoss`：L_one = Huber + λ_pcc·(1−spatial PCC)（不再 abs+delta 双计）+ L_CPM = γ 加权逐 horizon Huber（方案 §20），含逐 horizon 明细与配置校验 |
+| 2026-10-02 | utils/dataloader.py | `NextPointTrainView` 新增 `anchor_max_offset`（训练锚点保证 t+H 全 horizon 真值）、`NextPointEvalView` 新增 `all_future_steps`（所有 anchor 返回 future，宽度与 rollout_steps 取大者保证 collate 一致）；`NeuroTwinDataLoader` 透传 |
+| 2026-10-02 | main.py | 新增 `--model_arch {legacy,tfm}` 与 TFM 全套 CLI（tfm_dim/layers/heads/patch_len/ff_ratio/one_step_hidden_dim、cpm_horizon/layers/intervention、lambda_one/lambda_cpm/cpm_gamma/cpm_huber_delta）；模型构建 / 损失 / 训练循环 / `evaluate_tfm` 验证循环（one-step 主指标 + CPM 逐 horizon MAE + persistence 对照）按架构分派；TFM 下自动关闭 rollout 训练损失；legacy 路径行为不变 |
+| 2026-10-02 | train/optim.py、train/moe.py | `pretrain_config_signature` 纳入 model_arch/patch_len/cpm_horizon（legacy↔tfm 权重互斥校验）；`set_finetune_stage` / `load_backbone_only` 按 model_arch 分派（TFM 主干前缀 + FiLM 条件适配器冻结期训练）；`update_router_temperature` 对无 MoE 模型安全返回 None |
+| 2026-10-02 | utils/common.py | `resolve_task_dims` 新增 model_arch 解析与 TFM 校验（offsets==[1]、patch_len 范围、cpm_horizon≥1），dims 附 model_arch/patch_len/cpm_horizon |
+| 2026-10-02 | analysis/next_point_eval.py、experiments/evaluate_variant.py | 评估链路支持 TFM：`run_inference(collect_cpm)` 收集 CPM 全 horizon 预测，报告新增 `cpm_horizon` 段（模型 vs persistence 逐 horizon + improvement），summary 键 `*_cpm_mae_H*`；`build_model_from_args` 按 model_arch 分派（TFM 签名自省重建），评估 loader 传入 `eval_all_future_steps` |
+| 2026-10-02 | scripts/{Pretrain_HC_tfm,Finetune_MDD_tfm}.sh、tests/{test_tfm_backbone,test_tfm,test_tfm_loss}.py、README.md | 新建 TFM 两阶段训练脚本（D=256/N=4/patch=4/H=8 起点配置）与三套单元测试（21→29 用例：因果性、SC 偏置语义、双头契约、初始化不变量、损失闭式核对）；README 新增 TFM 章节 |
+| 2026-09-28 | docs/Version1_docs_0921/NeuroTwin_任务重构路线图.md | 新增「0. 实现状态总览」逐节对照表（46 节按【已实现】/【部分实现】/【未实现】/【已删除】标注，以当前代码为准，注明与现行协议文档的差异）+ 10 处关键节行内状态标注（§8/18/31/32/34/35/36/39/41/45） |
 | 2026-09-21 | README.md | 新建：补全项目简介、目录结构、环境依赖、数据准备、训练/评估流程、架构概览、超参数与文档索引 |
 | 2026-09-27 | utils/dataloader.py | 新增 `NeuroTwinNextPointDataset` / `NextPointTrainView` / `NextPointEvalView` 与 `next_timepoint` 数据路径（连续 BOLD context → 下一 TR，按 K 分桶；确定性评估 anchor 与 rollout 子集） |
 | 2026-09-27 | models/{common,graph_prior,pathology,neurotwin,neurotwin_moe}.py | S 轴（context TR 轴）变长前缀/行前缀支持（`prefix_linear_out`）、预测头 `head_anchor_mode`（last_timestep/zero）与单点输出保护、`predict_next_state` / `rollout_next_states` 标准接口、MoE 单点退化保护 |

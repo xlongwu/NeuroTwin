@@ -435,3 +435,136 @@ def compute_rollout_amp_loss(pred_rollout: torch.Tensor, target_future: torch.Te
     loss = rel_sq[valid].mean() if bool(valid.any()) else torch.zeros(
         (), device=pred_rollout.device)
     return loss * float(weight), {'rollout_amp': loss.detach()}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  NeuroTwin-TFM 双目标损失（model_arch='tfm'，方案 §19 / §20）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _huber_elementwise(pred: torch.Tensor, target: torch.Tensor,
+                       delta: float) -> torch.Tensor:
+    """逐元素 Huber：|e|≤δ 取 0.5e²，否则 δ(|e|−0.5δ)（与 F.huber_loss 同式）。"""
+    e = (pred - target).abs()
+    return torch.where(e <= delta, 0.5 * e ** 2, delta * (e - 0.5 * delta))
+
+
+class TFMDualLoss(nn.Module):
+    """One-Step + CPM 双目标损失（方案 §9 Dual Dynamics Objective / §20）。
+
+    数学定义（pred/target 均为原始空间；``x_t`` 为 context 末位 TR）::
+
+        L_one = Huber(x̂_(t+1), x_(t+1)) + λ_pcc·(1 − corr_ROI(x̂_(t+1), x_(t+1)))
+        L_cpm = Σ_h w_h·Huber(x̂_(t+h), x_(t+h)) / Σ_h w_h,   w_h = γ^(h−1)·mask_h
+        L     = λ_one·L_one + λ_cpm·L_cpm
+
+    与 NextTimepointLoss 的区别（§20.1）：不再同时使用数学等价的
+    ``L_abs + L_delta`` 双计项（prediction_target=delta 时二者数值重合），
+    改为单一 Huber + spatial PCC；CPM 项逐 horizon 加权（§20.2，γ=1 即均匀，
+    <1 时对远期 horizon 降权）。权重 α=β 的取值由验证集调优（§23：禁止第一版
+    全部打开——此处仅两项，λ_cpm=0 可退化为纯 one-step 的 Stage 0 基线）。
+    """
+
+    def __init__(self, lambda_one: float = 1.0, lambda_cpm: float = 1.0,
+                 lambda_pcc: float = 0.1, cpm_gamma: float = 1.0,
+                 huber_delta: float = 1.0, eps: float = 1e-8):
+        super().__init__()
+        if lambda_one < 0 or lambda_cpm < 0 or lambda_pcc < 0:
+            raise ValueError(
+                f"lambda_one/lambda_cpm/lambda_pcc 不允许负数："
+                f"{lambda_one}/{lambda_cpm}/{lambda_pcc}")
+        if lambda_one == 0 and lambda_cpm == 0:
+            raise ValueError("lambda_one 与 lambda_cpm 不能同时为 0。")
+        if cpm_gamma <= 0 or cpm_gamma > 1.0:
+            raise ValueError(
+                f"cpm_gamma 应在 (0, 1]（1=均匀权重），收到 {cpm_gamma}")
+        if huber_delta <= 0:
+            raise ValueError(f"huber_delta 必须 > 0，收到 {huber_delta}")
+        self.lambda_one = float(lambda_one)
+        self.lambda_cpm = float(lambda_cpm)
+        self.lambda_pcc = float(lambda_pcc)
+        self.cpm_gamma = float(cpm_gamma)
+        self.huber_delta = float(huber_delta)
+        self.eps = float(eps)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                cpm_pred: torch.Tensor, cpm_target: torch.Tensor,
+                cpm_mask: torch.Tensor = None) -> tuple:
+        """
+        Args:
+            pred/target: [B, F, 1, 1] one-step 预测与真值（原始空间）
+            cpm_pred:    [B, F, H]   CPM 全 horizon 预测（原始空间）
+            cpm_target:  [B, F, H]   t+1..t+H 真值（原始空间，序列末尾截断补零）
+            cpm_mask:    [B, H]      各 horizon 是否有真值（None = 全有效）
+        Returns:
+            (total, stats dict)
+        """
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"one-step pred/target 形状不一致：{tuple(pred.shape)} vs "
+                f"{tuple(target.shape)}")
+        if pred.ndim != 4 or pred.shape[-1] != 1 or pred.shape[2] != 1:
+            raise ValueError(
+                f"one-step pred 期望 [B,F,1,1]（TFM 的 one-step 头只建模 +1 偏移），"
+                f"收到 {tuple(pred.shape)}")
+        if cpm_pred.shape != cpm_target.shape:
+            raise ValueError(
+                f"CPM pred/target 形状不一致：{tuple(cpm_pred.shape)} vs "
+                f"{tuple(cpm_target.shape)}")
+        if cpm_pred.ndim != 3:
+            raise ValueError(
+                f"CPM pred 期望 [B,F,H]，收到 {tuple(cpm_pred.shape)}")
+
+        stats = {}
+        # ---- L_one（§20.1：Huber + spatial PCC）----
+        loss_one = _huber_elementwise(pred[:, :, 0, 0], target[:, :, 0, 0],
+                                      self.huber_delta).mean()
+        corr_one = spatial_pcc(pred, target, self.eps).mean()      # [1] → 标量
+        loss_one_pcc = 1.0 - corr_one
+        total = self.lambda_one * (loss_one + self.lambda_pcc * loss_one_pcc)
+        stats['loss_one'] = loss_one.detach()
+        stats['loss_one_pcc'] = loss_one_pcc.detach()
+        stats['pcc_one'] = corr_one.detach()
+
+        # ---- L_CPM（§20.2：γ 加权逐 horizon Huber）----
+        n_valid = cpm_pred.shape[0]
+        if n_valid > 0 and self.lambda_cpm > 0:
+            h = cpm_pred.shape[2]
+            w = torch.ones(cpm_pred.shape[0], h, device=cpm_pred.device,
+                           dtype=cpm_pred.dtype)
+            if self.cpm_gamma < 1.0:
+                gamma_pows = self.cpm_gamma ** torch.arange(
+                    h, device=cpm_pred.device, dtype=cpm_pred.dtype)
+                w = w * gamma_pows.view(1, h)
+            if cpm_mask is not None:
+                if tuple(cpm_mask.shape) != (cpm_pred.shape[0], h):
+                    raise ValueError(
+                        f"cpm_mask 形状 {tuple(cpm_mask.shape)} 与 "
+                        f"[B,{h}] 不一致")
+                w = w * cpm_mask.to(cpm_pred.dtype)
+            # 逐元素 Huber [B,F,H] × 逐 (样本,horizon) 权重
+            hub = _huber_elementwise(cpm_pred, cpm_target, self.huber_delta)
+            w3 = w.view(w.shape[0], 1, h)
+            loss_cpm = (hub * w3).sum() / (w3.sum().clamp_min(self.eps)
+                                           * cpm_pred.shape[1])
+            # 逐 horizon 明细 + spatial PCC（远期 horizon 的不确定性来源之一）
+            corr_cpm = spatial_pcc(cpm_pred.unsqueeze(-1),
+                                   cpm_target.unsqueeze(-1), self.eps)  # [B,H]
+            for hi in range(h):
+                n_h = float(w[:, hi].sum().item())
+                if n_h <= 0:
+                    continue
+                stats[f'loss_cpm_h{hi + 1}'] = (
+                    (hub[:, :, hi] * w[:, hi:hi + 1]).sum()
+                    / (n_h * cpm_pred.shape[1])).detach()
+                stats[f'pcc_cpm_h{hi + 1}'] = (
+                    (corr_cpm[:, hi] * w[:, hi]).sum() / n_h).detach()
+            loss_cpm_pcc = 1.0 - (corr_cpm * w).sum() / w.sum().clamp_min(self.eps)
+            total = total + self.lambda_cpm * (loss_cpm + self.lambda_pcc * loss_cpm_pcc)
+            stats['loss_cpm'] = loss_cpm.detach()
+            stats['loss_cpm_pcc'] = loss_cpm_pcc.detach()
+        else:
+            stats['loss_cpm'] = torch.zeros((), device=pred.device)
+            stats['loss_cpm_pcc'] = torch.zeros((), device=pred.device)
+        stats['loss_total'] = total.detach()
+        return total, stats

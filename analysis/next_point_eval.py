@@ -668,6 +668,9 @@ def build_next_point_loader(args, split, refresh_split_manifest=False):
             getattr(args, 'eval_rollout_tasks_per_subject', 2)),
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
+        eval_all_future_steps=(int(getattr(args, 'cpm_horizon', 0) or 0)
+                               if str(getattr(args, 'model_arch', 'legacy')) == 'tfm'
+                               else 0),
     )
     if split == 'test':
         return loader.get_test(), loader.get_test_subjects(), loader
@@ -678,7 +681,7 @@ def build_next_point_loader(args, split, refresh_split_manifest=False):
 
 @torch.no_grad()
 def run_inference(model, data_loader, device, offsets, rollout_steps,
-                  ar1=None, eval_rollout=True):
+                  ar1=None, eval_rollout=True, collect_cpm=False):
     """跑一遍 next_state 评估集，收集模型/基线预测与 rollout 子集。
 
     返回 dict（numpy）：
@@ -689,6 +692,9 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         subj_ids/cutoff/context_len/hamd
         roll_pred/roll_target/roll_baselines [n, R, F]（仅 rollout 锚点）
         roll_mask [n, R] / roll_subj [n] / roll_cutoff [n]
+        cpm_pred [N, F, Hc] / cpm_target [N, F, R] / cpm_mask [N, R]
+                                       （仅 collect_cpm=True：TFM 的 CPM 头输出，
+                                         要求评估视图为所有 anchor 提供 future）
     """
     model.eval()
     chunk = defaultdict(list)
@@ -705,7 +711,39 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         if pathology is not None:
             pathology = pathology.to(device, non_blocking=True)
 
-        pred, _ = model(x, sc, pathology)                         # [B,F,H,1]
+@torch.no_grad()
+def run_inference(model, data_loader, device, offsets, rollout_steps,
+                  ar1=None, eval_rollout=True, collect_cpm=False):
+    """跑一遍 next_state 评估集，收集模型/基线预测与 rollout 子集。
+
+    返回 dict（numpy）：
+        pred/target   [N, F, H]        模型与真值的 next-state 预测（原始空间）
+        mask          [N, H]           目标有效性
+        baselines     {name: [N, F, H]} persistence / trend / ar1
+        x_last/x_prev [N, F]           context 末位/次末位（供核对）
+        subj_ids/cutoff/context_len/hamd
+        roll_pred/roll_target/roll_baselines [n, R, F]（仅 rollout 锚点）
+        roll_mask [n, R] / roll_subj [n] / roll_cutoff [n]
+        cpm_pred [N, F, Hc] / cpm_target [N, F, R] / cpm_mask [N, R]
+                                       （仅 collect_cpm=True：TFM 的 CPM 头输出，
+                                         要求评估视图为所有 anchor 提供 future）
+    """
+    model.eval()
+    chunk = defaultdict(list)
+    for batch in tqdm(data_loader, desc='[NextPoint eval]', leave=False):
+        x = batch['x'].to(device, non_blocking=True)              # [B,F,1,K]
+        y = batch['y'].to(device, non_blocking=True)              # [B,F,H]
+        x_last = batch['x_last'].to(device, non_blocking=True)    # [B,F]
+        x_prev = x[:, :, 0, -2].contiguous()                      # [B,F]
+        mask = batch.get('target_mask', None)
+        mask = (torch.ones(y.shape[:2], device=device) if mask is None
+                else mask.to(device, non_blocking=True))
+        sc = batch['sc'].to(device, non_blocking=True)
+        pathology = batch.get('pathology_score', None)
+        if pathology is not None:
+            pathology = pathology.to(device, non_blocking=True)
+
+        pred, aux_info = model(x, sc, pathology)                  # [B,F,H,1]
         pred = pred[:, :, :, 0]                                   # [B,F,H]
         bases = baseline_next_state(x_last, x_prev, offsets, ar1=ar1)
 
@@ -721,6 +759,20 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         chunk['ctx_len'].append(batch['context_len'].numpy())
         if pathology is not None:
             chunk['hamd'].append(pathology.detach().cpu().numpy().reshape(-1))
+
+        # ---- CPM 全 horizon 预测（TFM；评估视图须为所有 anchor 提供 future）----
+        if collect_cpm:
+            if 'future' not in batch:
+                raise ValueError(
+                    "collect_cpm=True 要求评估视图为所有 anchor 提供 future 真值"
+                    "（NeuroTwinDataLoader 的 eval_all_future_steps > 0）")
+            cpm = (aux_info.get('cpm_pred', None)
+                   if isinstance(aux_info, dict) else None)
+            if not torch.is_tensor(cpm):
+                raise ValueError("模型未输出 cpm_pred（collect_cpm 仅适用于 TFM）")
+            chunk['cpm_pred'].append(cpm.float().cpu().numpy())   # [B,F,Hc]
+            chunk['cpm_target'].append(batch['future'].float().numpy())   # [B,F,R]
+            chunk['cpm_mask'].append(batch['future_mask'].float().numpy())  # [B,R]
 
         # ---- free rollout（仅 rollout 锚点；模型自由滚动，中间不使用真值）----
         if eval_rollout and rollout_steps > 0 and 'rollout_flag' in batch:
@@ -772,6 +824,13 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         'roll_cutoff': (np.concatenate(chunk['roll_cutoff'], axis=0)
                         if chunk['roll_cutoff'] else None),
     }
+    if collect_cpm:
+        data['cpm_pred'] = (np.concatenate(chunk['cpm_pred'], axis=0)
+                            if chunk['cpm_pred'] else None)
+        data['cpm_target'] = (np.concatenate(chunk['cpm_target'], axis=0)
+                              if chunk['cpm_target'] else None)
+        data['cpm_mask'] = (np.concatenate(chunk['cpm_mask'], axis=0)
+                            if chunk['cpm_mask'] else None)
     return data
 
 
@@ -819,8 +878,11 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
     horizons = eval_horizons(args)
     rollout_steps = eval_rollout_steps(args, horizons)
     fc_min_len = int(getattr(args, 'fc_min_length', 32))
+    is_tfm = (str(getattr(args, 'model_arch', 'legacy')) == 'tfm')
+    cpm_horizon = int(getattr(args, 'cpm_horizon', 0) or 0)
     data = run_inference(model, data_loader, device, offsets, rollout_steps,
-                         ar1=ar1, eval_rollout=eval_rollout)
+                         ar1=ar1, eval_rollout=eval_rollout,
+                         collect_cpm=is_tfm)
 
     pred, target, mask = data['pred'], data['target'], data['mask']
     subj_idx = np.array([str(s) for s in data['subj_ids']], dtype=object)
@@ -940,6 +1002,46 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
     else:
         report['rollout'] = {'enabled': False,
                              'reason': '--eval_rollout_tasks_per_subject <= 0 或 eval_rollout=False'}
+
+    # ---- CPM 全 horizon（TFM；非自回归一次输出 t+1..t+H，方案 §8）----
+    if is_tfm and data.get('cpm_pred') is not None:
+        cpm_labels = [f'H{h}' for h in range(1, cpm_horizon + 1)]
+        cpm_pred = data['cpm_pred'][:, :, :cpm_horizon]
+        cpm_target = data['cpm_target'][:, :, :cpm_horizon]
+        cpm_mask = data['cpm_mask'][:, :cpm_horizon]
+        cpm_arrays = per_task_next_state(cpm_pred, cpm_target, cpm_mask,
+                                         anchor=anchor)
+        cpm_agg = aggregate_columns(cpm_arrays, subj_idx, cpm_labels)
+        # persistence 基线同口径（x̂ = x_t），供 §25.3 的预测模式对比
+        pers_pred = np.repeat(data['x_last'][:, :, None], cpm_horizon, axis=2)
+        pers_arrays = per_task_next_state(pers_pred, cpm_target, cpm_mask,
+                                          anchor=anchor)
+        pers_agg = aggregate_columns(pers_arrays, subj_idx, cpm_labels)
+        cpm_block = OrderedDict((label, _block_summary(cpm_agg, label))
+                                for label in cpm_labels
+                                if _block_summary(cpm_agg, label))
+        pers_block = OrderedDict((label, _block_summary(pers_agg, label))
+                                 for label in cpm_labels
+                                 if _block_summary(pers_agg, label))
+        report['cpm_horizon'] = OrderedDict([
+            ('enabled', True), ('horizon', int(cpm_horizon)),
+            ('model', cpm_block),
+            ('persistence', pers_block),
+            ('improvement_vs_persistence', {
+                label: {'delta_MAE': float(
+                            cpm_block.get(label, {}).get('MAE', float('nan'))
+                            - pers_block.get(label, {}).get('MAE', float('nan'))),
+                        'delta_PCC': float(
+                            cpm_block.get(label, {}).get('PCC_spatial', float('nan'))
+                            - pers_block.get(label, {}).get('PCC_spatial', float('nan')))}
+                for label in cpm_labels}),
+            ('note', 'CPM = 非自回归全 horizon 预测（一次 forward 输出 t+1..t+H）；'
+                     '与 rollout（自回归滚动）对比可量化 error accumulation'),
+        ])
+    else:
+        report['cpm_horizon'] = {'enabled': False,
+                                 'reason': ('仅 model_arch=tfm 且评估视图提供 '
+                                            'all_future_steps 时计算')}
 
     # ---- FC（rollout 轨迹；长度不足则不计算） ----
     if eval_fc and data['roll_pred'] is not None:
@@ -1147,6 +1249,11 @@ def summarize(report):
     for label, blk in roll.items():
         summary[f'{split}_rollout_mae_{label}'] = blk.get('MAE')
         summary[f'{split}_rollout_pcc_{label}'] = blk.get('PCC_spatial')
+    cpm = report.get('cpm_horizon', {})
+    if cpm.get('enabled'):
+        for label, blk in cpm.get('model', {}).items():
+            summary[f'{split}_cpm_mae_{label}'] = blk.get('MAE')
+            summary[f'{split}_cpm_pcc_{label}'] = blk.get('PCC_spatial')
     fc = report.get('fc', {}).get('model', {}) if isinstance(report.get('fc'), dict) else {}
     if isinstance(fc, dict) and fc.get('available'):
         summary[f'{split}_fc_upper_mae'] = fc.get('fc_mae')

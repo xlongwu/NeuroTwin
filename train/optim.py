@@ -9,10 +9,22 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from models import ARCH_VERSION
 from models.neurotwin import NeuroTwin
+from models.tfm import NeuroTwinTFM
 
 #: 无 arch_version 元数据的旧检查点按此版本处理
 LEGACY_ARCH_VERSION = 1
 ARCH_POLICIES = ('require_match', 'warn', 'ignore')
+
+#: legacy 主干参数键前缀（--load_backbone_only 使用）：不含预测头 / MoE / 条件模块
+BACKBONE_KEY_PREFIXES = (
+    'rev_norm.', 'sc_prior.', 'dfc_adapter.', 'pastmixing.',
+    'ode_blocks.', 'ode_block_scales.', 'post_fusion.', 'feature_norm.',
+)
+
+#: TFM 主干参数键前缀：不含 one-step / CPM 预测头与条件模块
+TFM_BACKBONE_KEY_PREFIXES = (
+    'rev_norm.', 'sc_prior.', 'patch_embed.', 'blocks.', 'final_norm.',
+)
 
 
 class ModelEMA:
@@ -77,21 +89,28 @@ def save_backbone_weights(path, model, meta=None):
 
 
 def pretrain_config_signature(saved_args: dict) -> dict:
-    """从检查点保存的参数快照提取「任务口径签名」：任务模式 + 三个结构维度。
+    """从检查点保存的参数快照提取「任务口径签名」：任务模式 + 模型架构 + 结构维度。
 
-    当前唯一口径为 next_timepoint：in_window=1、pred_window=预测偏移数、
+    next_timepoint 公共维度：in_window=1、pred_window=预测偏移数、
     seq_len=context_max。预测偏移数由 forecast_offsets / enable_mtp 推导
     （与 utils.common.resolve_forecast_offsets 同一口径）。
+    ``model_arch``（缺省按 legacy 处理）区分 legacy 主干与 TFM 主干；TFM 额外
+    纳入 patch_len / cpm_horizon（决定 patch 网格与 CPM 头的输出 shape）。
     """
     saved = dict(saved_args or {})
     if 'task_mode' not in saved:
         raise RuntimeError(
             "检查点缺少 task_mode 字段（旧任务检查点），无法校验任务口径；"
             "请用当前 next_timepoint 口径重新预训练。")
-    return {'task_mode': str(saved['task_mode']),
-            'in_window': 1,
-            'pred_window': len(saved_forecast_offsets(saved)),
-            'seq_len': int(saved.get('context_max'))}
+    sig = {'task_mode': str(saved['task_mode']),
+           'model_arch': str(saved.get('model_arch', 'legacy')),
+           'in_window': 1,
+           'pred_window': len(saved_forecast_offsets(saved)),
+           'seq_len': int(saved.get('context_max'))}
+    if sig['model_arch'] == 'tfm':
+        sig['patch_len'] = int(saved.get('tfm_patch_len'))
+        sig['cpm_horizon'] = int(saved.get('cpm_horizon'))
+    return sig
 
 
 def saved_forecast_offsets(saved_args: dict) -> list:
@@ -125,9 +144,13 @@ def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
         return
     saved = pretrain_config_signature(saved_args)
     expected = {'task_mode': expected_dims['task_mode'],
+                'model_arch': str(expected_dims.get('model_arch', 'legacy')),
                 'in_window': int(expected_dims['in_window']),
                 'pred_window': int(expected_dims['pred_window']),
                 'seq_len': int(expected_dims['seq_len'])}
+    if expected['model_arch'] == 'tfm':
+        expected['patch_len'] = int(expected_dims['patch_len'])
+        expected['cpm_horizon'] = int(expected_dims['cpm_horizon'])
     mismatch = {k: (saved.get(k), expected[k]) for k in expected
                 if saved.get(k) != expected[k]}
     if not mismatch:
@@ -213,13 +236,6 @@ def load_backbone_weights(model, pretrained_path, device, arch_policy='require_m
             'arch_version': arch_version, 'skipped_load': False}
 
 
-#: 主干参数键前缀（--load_backbone_only 使用）：不含预测头 / MoE / 条件模块
-BACKBONE_KEY_PREFIXES = (
-    'rev_norm.', 'sc_prior.', 'dfc_adapter.', 'pastmixing.',
-    'ode_blocks.', 'ode_block_scales.', 'post_fusion.', 'feature_norm.',
-)
-
-
 def load_backbone_only(model, pretrained_path, device):
     """只加载主干权重，预测头 / MoE / 条件模块保持随机初始化（prompt §三十六）。
 
@@ -230,7 +246,10 @@ def load_backbone_only(model, pretrained_path, device):
     这里**显式打印四类清单**：loaded（成功加载）、missing（主干中不存在该键）、
     incompatible（键存在但形状不匹配，例如旧 ForecastHead）、reinitialized
     （被有意重新初始化的头部/条件模块），避免 strict=False 的静默忽略。
+    按 ``model_arch`` 选择主干键前缀（legacy / tfm）。
     """
+    prefixes = (TFM_BACKBONE_KEY_PREFIXES
+                if isinstance(model, NeuroTwinTFM) else BACKBONE_KEY_PREFIXES)
     ckpt = torch.load(pretrained_path, map_location=device)
     state, arch_version, _ = unwrap_state_dict(ckpt)
     fname = os.path.basename(str(pretrained_path))
@@ -238,7 +257,7 @@ def load_backbone_only(model, pretrained_path, device):
 
     loaded, missing, incompatible, reinitialized = [], [], [], []
     for k, v in model_sd.items():
-        if k.startswith(BACKBONE_KEY_PREFIXES):
+        if k.startswith(prefixes):
             src = state.get(k, None)
             if src is None:
                 missing.append(k)
@@ -282,16 +301,36 @@ def _iter_conditioning_modules(model):
             yield module
 
 
-def set_finetune_stage(model: NeuroTwin, backbone_unfrozen: bool = False):
-    """微调分阶段训练：默认训练 MoE + 条件模块，backbone_unfrozen 后解冻主干。"""
+def set_finetune_stage(model, backbone_unfrozen: bool = False):
+    """微调分阶段训练：默认训练条件模块，backbone_unfrozen 后解冻主干。
+
+    按 ``model_arch`` 分派：
+    - legacy（NeuroTwin）：冻结期训练 MoE + 条件模块（AdaLN/LoRA）；
+    - tfm（NeuroTwinTFM）：冻结期训练病理 FiLM（head 内条件适配器），
+      无 MoE 分支。
+    """
     for p in model.parameters():
         p.requires_grad = False
-    if model.moe is not None:
-        for p in model.moe.parameters():
-            p.requires_grad = True
     # 条件模块在冻结阶段即参与训练：它们是“让病理条件真正生效”的唯一路径
     for module in _iter_conditioning_modules(model):
         for p in module.parameters():
+            p.requires_grad = True
+
+    if isinstance(model, NeuroTwinTFM):
+        # TFM 无 MoE 分支：冻结期仅 FiLM 条件适配器训练，解冻后放开全部主干
+        if backbone_unfrozen:
+            backbone_modules = [model.patch_embed, model.blocks, model.final_norm,
+                                model.one_step_head, model.cpm_head,
+                                model.sc_prior]
+            if model.rev_norm is not None:
+                backbone_modules.append(model.rev_norm)
+            for module in backbone_modules:
+                for p in module.parameters():
+                    p.requires_grad = True
+        return
+
+    if model.moe is not None:
+        for p in model.moe.parameters():
             p.requires_grad = True
 
     if backbone_unfrozen:

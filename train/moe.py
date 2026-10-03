@@ -25,8 +25,9 @@ def update_router_temperature(model: NeuroTwin, args, epoch: int,
     - 若专家使用变异系数 CV > 0.5（不均衡），临时升温最多 +0.5 重新探索。
 
     仅在 finetune 且存在 MoE 时生效，返回当前温度（float）或 None。
+    （TFM 等无 MoE 模型返回 None，不参与调度。）
     """
-    if args.mode != 'finetune' or model.moe is None:
+    if args.mode != 'finetune' or getattr(model, 'moe', None) is None:
         return None
 
     temp_start = args.moe_gate_temp_start

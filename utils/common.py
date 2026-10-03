@@ -10,6 +10,9 @@ import torch
 #: 当前唯一任务口径：连续 BOLD context → 下一 TR 全脑状态
 TASK_MODES = ('next_timepoint',)
 
+#: 主干架构：legacy=原 NeuroTwin（BrainMDM/GraphODE）；tfm=TimesFM-3 风格 TFM 主干
+MODEL_ARCHES = ('legacy', 'tfm')
+
 #: next_timepoint 任务下 --enable_mtp 未显式给出 --forecast_offsets 时的默认预测偏移
 DEFAULT_MTP_OFFSETS = (1, 2, 4, 8)
 
@@ -92,12 +95,36 @@ def resolve_task_dims(args):
         seq_len = args.context_max（context TR 数上界，= 模型 S 轴建模宽度）
 
     说明：实际 context 长度 K 可以是任意 K <= context_max（S 轴前缀切片支持），
-    参数集合不随 K 变化。
+    参数集合不随 K 变化。``model_arch`` 区分 legacy / tfm 主干；tfm 的
+    one-step 头只建模 +1 偏移（方案 §10），要求 forecast_offsets == [1]，
+    稀疏偏移 {1,2,4,8} 由 CPM 头的 horizon 覆盖（§18 Task C）。
     """
     task_mode = str(getattr(args, 'task_mode', 'next_timepoint'))
     if task_mode not in TASK_MODES:
         raise ValueError(f"task_mode 仅支持 {TASK_MODES}，收到 '{task_mode}'")
-    return _resolve_next_timepoint_dims(args)
+    model_arch = str(getattr(args, 'model_arch', 'legacy'))
+    if model_arch not in MODEL_ARCHES:
+        raise ValueError(f"model_arch 仅支持 {MODEL_ARCHES}，收到 '{model_arch}'")
+    dims = _resolve_next_timepoint_dims(args)
+    dims['model_arch'] = model_arch
+    if model_arch == 'tfm':
+        if dims['pred_window'] != 1:
+            raise ValueError(
+                f"--model_arch tfm 的 one-step 头只建模 +1 偏移（方案 §10），"
+                f"要求 forecast_offsets == [1]，收到 {dims['pred_window']} 个偏移；"
+                "多步预测请用 --cpm_horizon 控制 CPM 头的 horizon。")
+        patch_len = int(getattr(args, 'tfm_patch_len', 4))
+        cpm_horizon = int(getattr(args, 'cpm_horizon', 8))
+        if patch_len < 1 or patch_len > dims['seq_len']:
+            raise ValueError(
+                f"--tfm_patch_len 须在 [1, context_max={dims['seq_len']}] 内，"
+                f"收到 {patch_len}")
+        if cpm_horizon < 1:
+            raise ValueError(
+                f"--cpm_horizon 必须 >= 1，收到 {cpm_horizon}")
+        dims['patch_len'] = patch_len
+        dims['cpm_horizon'] = cpm_horizon
+    return dims
 
 
 def _resolve_next_timepoint_dims(args):

@@ -27,6 +27,7 @@ import torch
 
 from analysis.metrics import NETWORK_GROUPS
 from models.neurotwin import NeuroTwin
+from models.tfm import NeuroTwinTFM
 from utils.common import parse_pred_quantiles, set_seed
 from utils.dataloader import NeuroTwinDataLoader
 
@@ -51,12 +52,18 @@ def _next_point_model_dims(args) -> dict:
 
     in_window=1（整段 context 作为单窗口）、pred_window=len(forecast_offsets)、
     in_seq_len=context_max（S 轴建模宽度）、pred_seq_len=1（每个偏移 1 个时间点）。
+    TFM（model_arch=tfm）额外附 patch_len / cpm_horizon（结构签名分量）。
     """
     from utils.common import resolve_forecast_offsets
-    return {'in_window': 1,
+    dims = {'in_window': 1,
             'pred_window': len(resolve_forecast_offsets(args)),
             'in_seq_len': int(getattr(args, 'context_max')),
             'pred_seq_len': 1}
+    if str(getattr(args, 'model_arch', 'legacy')) == 'tfm':
+        dims['model_arch'] = 'tfm'
+        dims['patch_len'] = int(args.tfm_patch_len)
+        dims['cpm_horizon'] = int(args.cpm_horizon)
+    return dims
 
 
 def load_train_args(ckpt_path):
@@ -72,7 +79,10 @@ def load_train_args(ckpt_path):
 
 
 def build_model_from_args(args, device):
-    """按 inspect.signature 自省从参数快照重建与训练一致的 NeuroTwin。"""
+    """按 inspect.signature 自省从参数快照重建与训练一致的模型（legacy / tfm）。"""
+    model_arch = str(getattr(args, 'model_arch', 'legacy'))
+    if model_arch == 'tfm':
+        return _build_tfm_from_args(args, device)
     sig = inspect.signature(NeuroTwin.__init__).parameters
     alias, dims_override = _KWARG_ALIAS_NEXT_POINT, _next_point_model_dims(args)
     kwargs = {}
@@ -97,6 +107,41 @@ def build_model_from_args(args, device):
     kwargs['pretrain_mode'] = (str(getattr(args, 'mode', 'finetune')) == 'pretrain')
     kwargs['pred_quantiles'] = parse_pred_quantiles(args.pred_quantiles)
     return NeuroTwin(**kwargs).to(device)
+
+
+# NeuroTwinTFM 构造参数 → 训练快照键的别名（其余同名参数直接取自快照）
+_KWARG_ALIAS_TFM = {
+    'features': 'num_rois',
+    'patch_len': 'tfm_patch_len',
+    'dim': 'tfm_dim',
+    'num_layers': 'tfm_layers',
+    'num_heads': 'tfm_heads',
+    'ff_ratio': 'tfm_ff_ratio',
+    'one_step_hidden_dim': 'tfm_one_step_hidden_dim',
+    'use_revin': 'norm',
+}
+
+
+def _build_tfm_from_args(args, device):
+    """按 NeuroTwinTFM 的构造签名从参数快照重建 TFM 模型。"""
+    sig = inspect.signature(NeuroTwinTFM.__init__).parameters
+    kwargs = {}
+    for name, param in sig.items():
+        if name == 'self':
+            continue
+        if name == 'features':
+            kwargs[name] = int(args.num_rois)
+        elif name == 'context_max':
+            # 任务维度由配置推导，优先于快照中的同名键（与 legacy 路径一致）
+            kwargs[name] = int(getattr(args, 'context_max'))
+        else:
+            alias = _KWARG_ALIAS_TFM.get(name, name)
+            if hasattr(args, alias):
+                kwargs[name] = getattr(args, alias)
+            elif param.default is inspect.Parameter.empty:
+                raise ValueError(f'参数快照缺少必填构造参数：{name}')
+    kwargs['pretrain_mode'] = (str(getattr(args, 'mode', 'finetune')) == 'pretrain')
+    return NeuroTwinTFM(**kwargs).to(device)
 
 
 def build_eval_loader(args, eval_split, refresh_split_manifest=False):
@@ -139,6 +184,9 @@ def build_eval_loader(args, eval_split, refresh_split_manifest=False):
             getattr(args, 'eval_rollout_tasks_per_subject', 2)),
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
+        eval_all_future_steps=(int(getattr(args, 'cpm_horizon', 0) or 0)
+                               if str(getattr(args, 'model_arch', 'legacy')) == 'tfm'
+                               else 0),
     )
     if eval_split == 'test':
         return loader.get_test(), loader.get_test_subjects()
