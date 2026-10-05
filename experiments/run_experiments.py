@@ -40,13 +40,16 @@ LOGS_DIR = registry.RESULTS_DIR / 'logs'
 EVAL_DIR = registry.RESULTS_DIR / 'eval'
 
 
-def merge_run_args(variant, seed, smoke, pretrain_stage=False):
+def merge_run_args(variant, seed, smoke, pretrain_stage=False, device=None):
     """合并 BASE_ARGS + 变体 overrides + 运行参数，返回 (args_dict, name)。"""
     merged = dict(BASE_ARGS)
     merged.update(variant['overrides'])
     if smoke:
         merged.update(SMOKE_OVERRIDES)
     merged['seed'] = seed
+    if device:
+        # 多卡并行：--device 透传给 main.py（空 = 维持历史默认 cuda:1）
+        merged['device'] = device
     if pretrain_stage:
         name = f"ablation_pre_{variant['id']}_s{seed}"
         merged['mode'] = 'pretrain'
@@ -64,12 +67,39 @@ def merge_run_args(variant, seed, smoke, pretrain_stage=False):
     return merged, name
 
 
+def resolve_pretrained_dir(name):
+    """解析预训练权重目录：先取 ``checkpoints/<name>``，缺失时回退到最新版本归档
+    ``checkpoints/Version*/<name>``（生产权重归档后，消融仍可引用其预训练产物）。
+
+    Version* 目录用字典序近似时间序（…_0921 → …_1003），倒序取第一个含
+    base_best.pt 的归档；都不存在时返回原路径（让调用方给出可读的报错）。
+    """
+    exact = CHECKPOINT_DIR / name
+    if (exact / 'base_best.pt').exists():
+        return exact
+    for archive in sorted(CHECKPOINT_DIR.glob('Version*'), reverse=True):
+        candidate = archive / name
+        if (candidate / 'base_best.pt').exists():
+            return candidate
+    return exact
+
+
 def resolve_pretrained_weight(merged, variant):
-    """变体微调的预训练权重来源：结构性变体用自预训练产物，其余复用 next_timepoint 基线。"""
+    """变体微调的预训练权重来源（按优先级）：
+
+    1. 变体显式 ``pretrained_from``：复用指定目录下的 base_best.pt
+       （如 TFM 微调类消融共享生产预训练 neurotwin_tfm_pretrain；目录被
+       归档到 Version* 后自动回退到归档位置）；
+    2. ``requires_pretrain=True``：结构性变体用自预训练产物；
+    3. 其余：复用 legacy next_timepoint 基线。
+    """
+    pretrained_from = variant.get('pretrained_from')
+    if pretrained_from:
+        return str(resolve_pretrained_dir(pretrained_from) / 'base_best.pt')
     if variant['requires_pretrain']:
         return str(CHECKPOINT_DIR / f"ablation_pre_{variant['id']}_s{merged['seed']}"
                    / 'base_best.pt')
-    return str(CHECKPOINT_DIR / 'neurotwin_nextpoint_pretrain' / 'base_best.pt')
+    return str(resolve_pretrained_dir('neurotwin_nextpoint_pretrain') / 'base_best.pt')
 
 
 def resolve_run_ckpt(name, filename='finetuned_best.pt'):
@@ -109,20 +139,20 @@ def tail_log(log_path, n_lines=30):
     return '\n'.join(lines[-n_lines:])
 
 
-def run_variant(variant, seed, smoke=False, dry_run=False):
+def run_variant(variant, seed, smoke=False, dry_run=False, device=None):
     """执行单个变体：训练（+可选自预训练）→ 评估 → 登记。返回 True/False。"""
     exp_id = variant['id']
     log_path = LOGS_DIR / f"{exp_id}_s{seed}.log"
     started = registry.now_str()
 
     if dry_run:
-        merged, _ = merge_run_args(variant, seed, smoke)
+        merged, _ = merge_run_args(variant, seed, smoke, device=device)
         validate_overrides(variant['overrides'])
         cmd = [sys.executable, '-u', 'main.py'] + build_cli_args(merged)
         print(f"[CMD] {' '.join(cmd)}")
         if variant['requires_pretrain']:
             merged_pre, _ = merge_run_args(variant, seed, smoke,
-                                           pretrain_stage=True)
+                                           pretrain_stage=True, device=device)
             cmd_pre = [sys.executable, '-u', 'main.py'] + build_cli_args(merged_pre)
             print(f"[CMD] {' '.join(cmd_pre)}   # 自预训练（先行）")
         return True
@@ -137,7 +167,7 @@ def run_variant(variant, seed, smoke=False, dry_run=False):
 
     try:
         # 前置检查：复用的基线预训练权重必须存在（结构性变体则自产）
-        merged_ft, ft_name = merge_run_args(variant, seed, smoke)
+        merged_ft, ft_name = merge_run_args(variant, seed, smoke, device=device)
         validate_overrides(variant['overrides'])
         if not variant['requires_pretrain'] and \
                 not os.path.exists(merged_ft['pretrained_weight']):
@@ -146,7 +176,8 @@ def run_variant(variant, seed, smoke=False, dry_run=False):
 
         if variant['requires_pretrain']:
             merged_pre, pre_name = merge_run_args(variant, seed, smoke,
-                                                  pretrain_stage=True)
+                                                  pretrain_stage=True,
+                                                  device=device)
             print(f"=== [{exp_id} s{seed}] 自预训练（结构变体）: {pre_name} ===")
             code, cmd_str = run_training(
                 merged_pre, LOGS_DIR / f"{exp_id}_s{seed}_pre.log")
@@ -214,6 +245,9 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help='只打印命令不执行')
     ap.add_argument('--force', action='store_true', help='重跑已 success 的变体')
     ap.add_argument('--stop-on-fail', action='store_true', help='首个失败即中止')
+    ap.add_argument('--device', default=None,
+                    help='本执行器的训练设备（如 cuda:0 / cuda:1，透传 main.py --device）。'
+                         '多卡并行时为每个执行器指定不同设备、--only 拆分互不相交的变体集合。')
     ns = ap.parse_args()
 
     seeds = [int(s) for s in ns.seeds.split(',') if s.strip()]
@@ -228,7 +262,7 @@ def main():
         return 0
 
     print(f'待执行 {len(variants)} 个变体 x {len(seeds)} 个 seed '
-          f'（smoke={ns.smoke}, dry_run={ns.dry_run}）')
+          f'（smoke={ns.smoke}, dry_run={ns.dry_run}, device={ns.device or "默认 cuda:1"}）')
     failed = []
     for variant in variants:
         for seed in seeds:
@@ -236,7 +270,8 @@ def main():
                     registry.is_done(variant['id'], seed):
                 print(f"[SKIP] {variant['id']} s{seed} 已 success（--force 重跑）")
                 continue
-            ok = run_variant(variant, seed, smoke=ns.smoke, dry_run=ns.dry_run)
+            ok = run_variant(variant, seed, smoke=ns.smoke, dry_run=ns.dry_run,
+                             device=ns.device)
             if not ok:
                 failed.append((variant['id'], seed))
                 if ns.stop_on_fail:

@@ -118,6 +118,7 @@ _KWARG_ALIAS_TFM = {
     'num_heads': 'tfm_heads',
     'ff_ratio': 'tfm_ff_ratio',
     'one_step_hidden_dim': 'tfm_one_step_hidden_dim',
+    'use_patho_cond': 'tfm_use_patho_cond',
     'use_revin': 'norm',
 }
 
@@ -291,10 +292,6 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
     n_params = int(sum(p.numel() for p in model.parameters()))
 
     extra = {
-        'shuffled_hamd': ({'available': False,
-                           'reason': 'next_timepoint 协议尚未接入 shuffled-HAMD 负对照'
-                                     '（见文档未完成事项）'} if run_shuffled
-                          else {'available': False, 'reason': '未请求'}),
         'conformal_calibration': {'available': False,
                                   'reason': 'next_timepoint 协议未接入 conformal 校准（P3）'},
     }
@@ -315,7 +312,9 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
             extra_report=extra, ar1=ar1, compute_importance=compute_importance,
             importance_max_tasks=importance_max_tasks,
             importance_permutations=importance_permutations,
-            importance_fdr_alpha=importance_fdr_alpha)
+            importance_fdr_alpha=importance_fdr_alpha,
+            run_shuffled=bool(run_shuffled), base_loader=loader,
+            shuffle_seed=int(seed))
         summary.update(npe.summarize(report))
         if split == 'test':
             first = f"t+{report['protocol']['forecast_offsets'][0]}"

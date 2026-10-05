@@ -283,6 +283,8 @@ class NeuroTwinTFM(nn.Module):
         pathology_norm_mode: str = 'robust_z',
         pathology_norm_quantiles: int = 64,
         pathology_norm_rbf_knots: int = 8,
+        # ---- 条件消融（§25.4）----
+        use_patho_cond: bool = True,
         # ---- 归一化（§15）----
         use_revin: bool = True,
     ):
@@ -315,9 +317,12 @@ class NeuroTwinTFM(nn.Module):
         )
 
         # ---- 病理条件（仅 finetune；HC 预训练无条件模块）----
+        # use_patho_cond=False 为方案 §25.4 条件消融开关：不构建 PathologyNormalizer
+        # 与 FiLM，前向收到的 pathology_score 一律忽略（与条件开启的对照实验
+        # 共用同一 HC 预训练权重，隔离「条件通路」本身的贡献）
         self.pathology_normalizer = None
         cond_dim = 0
-        if not self.pretrain_mode:
+        if not self.pretrain_mode and use_patho_cond:
             self.pathology_normalizer = PathologyNormalizer(
                 input_dim=pathology_input_dim,
                 mode=pathology_norm_mode,
@@ -409,10 +414,11 @@ class NeuroTwinTFM(nn.Module):
             x_norm4, norm_stats = self.rev_norm(x, 'norm')     # context-only 统计（§15）
             x_grid = x_norm4[:, :, 0, :]
         cond = self._prepare_condition(pathology_score)
-        if pathology_score is not None and self.pathology_normalizer is None:
+        if pathology_score is not None and self.pretrain_mode:
             raise ValueError(
                 "收到 pathology_score 但当前为预训练模式（无条件模块）；"
                 "HC 预训练不应提供病理评分。")
+        # use_patho_cond=False 的条件消融：评分到达但被忽略（cond=None）
 
         tokens, sc_info = self._encode(x_grid, sc_matrix)
         # One-Step 头（§10）：最后 causal token 为 z_t

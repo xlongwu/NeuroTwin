@@ -2,10 +2,16 @@
 """消融实验结果集中登记：registry.jsonl（追加式主档）+ registry.csv（透视用）。
 
 主键为 (exp_id, seed)；upsert_record 以主键覆盖旧记录，保证重跑幂等。
+
+并发约定：多卡并行时会同时运行多个 run_experiments 进程（各自写同一 registry），
+upsert_record（写）与 load_registry（读）都经 results/ablation/.registry.lock 的
+flock 串行化，避免"读全表→重写"交错导致记录丢失。
 """
 import csv
+import fcntl
 import json
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +20,7 @@ from experiments.base_config import ROOT
 RESULTS_DIR = ROOT / 'results' / 'ablation'
 REGISTRY_JSONL = RESULTS_DIR / 'registry.jsonl'
 REGISTRY_CSV = RESULTS_DIR / 'registry.csv'
+LOCK_PATH = RESULTS_DIR / '.registry.lock'
 
 # 登记字段（固定列序，csv 表头与此一致）
 FIELDS = [
@@ -41,8 +48,26 @@ def get_git_commit():
         return 'unknown'
 
 
+@contextmanager
+def _registry_lock(exclusive: bool):
+    """跨进程文件锁：写 upsert 用排他锁，读 load 用共享锁。"""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH, 'a+') as lock_f:
+        fcntl.flock(lock_f.fileno(),
+                    fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
 def load_registry():
     """读取全部登记记录；文件不存在返回空列表。"""
+    with _registry_lock(exclusive=False):
+        return _load_registry_unlocked()
+
+
+def _load_registry_unlocked():
     if not REGISTRY_JSONL.exists():
         return []
     records = []
@@ -69,19 +94,20 @@ def _write_csv(records):
 
 
 def upsert_record(record):
-    """按 (exp_id, seed) 主键插入或覆盖记录，并重写 jsonl 与 csv。"""
+    """按 (exp_id, seed) 主键插入或覆盖记录，并重写 jsonl 与 csv（排他锁保护）。"""
     missing = [k for k in ('exp_id', 'seed') if k not in record]
     if missing:
         raise ValueError(f'登记记录缺少主键字段：{missing}')
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     key = (record['exp_id'], str(record['seed']))
-    records = [r for r in load_registry()
-               if (r.get('exp_id'), str(r.get('seed'))) != key]
-    records.append(record)
-    with REGISTRY_JSONL.open('w', encoding='utf-8') as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + '\n')
-    _write_csv(records)
+    with _registry_lock(exclusive=True):
+        records = [r for r in _load_registry_unlocked()
+                   if (r.get('exp_id'), str(r.get('seed'))) != key]
+        records.append(record)
+        with REGISTRY_JSONL.open('w', encoding='utf-8') as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        _write_csv(records)
 
 
 def is_done(exp_id, seed):

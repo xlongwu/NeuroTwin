@@ -10,6 +10,8 @@
 - requires_pretrain: True 时结构性改动与预训练权重形状不兼容（load_backbone_weights
                     会静默 skip shape 不匹配的键），必须先自预训练再微调；
                     False 时复用 checkpoints/neurotwin_nextpoint_pretrain/base_best.pt
+- pretrained_from:  显式指定预训练权重目录名（优先于上面两条规则）；TFM 微调类
+                    消融用它共享生产预训练 neurotwin_tfm_pretrain/base_best.pt
 - overrides:        相对 BASE_ARGS 的参数覆盖
 - eval_note:        评估时需要关注的附加指标
 
@@ -24,11 +26,12 @@ BASELINE_ID = 'baseline'
 
 
 def _v(exp_id, group, doc_ref, priority, description, overrides,
-       requires_pretrain=False, eval_note=''):
+       requires_pretrain=False, eval_note='', pretrained_from=None):
     return dict(
         id=exp_id, group=group, doc_ref=doc_ref, priority=priority,
         description=description, requires_pretrain=requires_pretrain,
-        overrides=overrides, eval_note=eval_note)
+        overrides=overrides, eval_note=eval_note,
+        pretrained_from=pretrained_from)
 
 
 VARIANTS = [
@@ -238,6 +241,118 @@ VARIANTS = [
         'enable_rollout_loss': True, 'enable_mtp': True},
        requires_pretrain=True,
        eval_note='最终最复杂模型；与 D/E 对比确认叠加是否仍有增益'),
+
+    # ---- NeuroTwin-TFM 消融（TimesFM3 改进方案 §25 / §30，2026-10-03） ----
+    # 对照矩阵分离四个 V1 组件各自的贡献（doc_ref = 方案文档小节号）：
+    #   §25.1 patching    → tfm_patch1 / tfm_patch8（基线 p=4）
+    #   §25.2 ROI 交互    → tfm_sc_adaptive / tfm_sc_functional（基线 soft_prior）
+    #   §25.3 预测模式    → tfm_no_cpm（基线 One-Step + CPM）
+    #   §25.4 条件        → tfm_no_cond（no-HAMD；shuffled-HAMD 由评估端
+    #                        shuffled_hamd 段自动产出，无需单独训练变体）
+    # 微调类变体通过 pretrained_from 共享生产预训练权重（同 legacy 组约定），
+    # 结构性变体 requires_pretrain=True 自预训练（patch/SC 先验改动参数形状）。
+    _v('tfm_baseline', 'G30_TFM', '§30', 'P0',
+       'TFM 基线：p=4 / soft_prior / One-Step+CPM(H=8) / 病理 FiLM，'
+       '配置与 Pretrain_HC_tfm.sh 一致',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': True},
+       pretrained_from='neurotwin_tfm_pretrain',
+       eval_note='G30 组参照行；shuffled-HAMD 负对照随评估自动产出'),
+    _v('tfm_patch1', 'G30_TFM', '§25.1', 'P0',
+       'patch 长度 p=1（逐 TR token，无 patching 压缩）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 1,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': True},
+       requires_pretrain=True,
+       eval_note='与基线对比 patching 的收益（temporal token 数 64→16）'),
+    _v('tfm_patch8', 'G30_TFM', '§25.1', 'P0',
+       'patch 长度 p=8（temporal token 64→8）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 8,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': True},
+       requires_pretrain=True,
+       eval_note='p∈{1,4,8} 三点消融的远点'),
+    _v('tfm_sc_adaptive', 'G30_TFM', '§25.2', 'P0',
+       'no-SC 消融：ROI attention 无结构先验（纯自适应功能图）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'adaptive_only', 'sc_delta_a': True},
+       requires_pretrain=True,
+       eval_note='§30 V2 判据：no-SC 显著下降则确认 SC-guided 价值'),
+    _v('tfm_sc_functional', 'G30_TFM', '§25.2', 'P1',
+       '功能图不做事后双随机化（row-softmax 原始尺度对照）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'functional_only', 'sc_delta_a': True},
+       requires_pretrain=True,
+       eval_note='分离「归一化本身」与「SC 信息」的贡献'),
+    _v('tfm_no_cpm', 'G30_TFM', '§25.3', 'P0',
+       'One-step only（lambda_cpm=0，§24 Stage 0 基线）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 0.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': True},
+       pretrained_from='neurotwin_tfm_pretrain',
+       eval_note='CPM 辅助监督对 one-step 主任务的互作（正迁移/干扰）'),
+    _v('tfm_cpm_gamma_decay', 'G30_TFM', '§20.2', 'P1',
+       'CPM 逐 horizon 损失远期降权（gamma=0.9）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 0.9, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': True},
+       pretrained_from='neurotwin_tfm_pretrain',
+       eval_note='远期 horizon 指标 vs 均匀权重（gamma=1）'),
+    _v('tfm_no_cond', 'G30_TFM', '§25.4', 'P0',
+       'no-HAMD 条件消融（不构建 PathologyNormalizer/FiLM，前向忽略评分）',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': True,
+        'tfm_use_patho_cond': False},
+       pretrained_from='neurotwin_tfm_pretrain',
+       eval_note='与基线差 = 病理条件通路的训练期贡献；评估端 shuffled_hamd '
+                 '将标记不可用（无通路）'),
+    _v('tfm_no_delta_a', 'G30_TFM', '§25.2', 'P1',
+       '关闭 subject-specific 低秩邻接残差 ΔA',
+       {'model_arch': 'tfm', 'norm': True, 'dropout': 0.1,
+        'tfm_dim': 256, 'tfm_layers': 4, 'tfm_heads': 4, 'tfm_patch_len': 4,
+        'tfm_one_step_hidden_dim': 256, 'cpm_horizon': 8, 'cpm_layers': 2,
+        'forecast_offsets': '1',
+        'lambda_one': 1.0, 'lambda_cpm': 1.0, 'lambda_pcc': 0.1,
+        'cpm_gamma': 1.0, 'cpm_huber_delta': 1.0,
+        'sc_prior_mode': 'soft_prior', 'sc_delta_a': False},
+       requires_pretrain=True,
+       eval_note='个体化图残差的贡献（MDD 小样本过拟合风险对照）'),
 ]
 
 

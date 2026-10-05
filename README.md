@@ -344,7 +344,7 @@ Raw ROI BOLD [F, T=150]（data/Normlize，已逐 ROI z-score）
 
 ## NeuroTwin-TFM（`--model_arch tfm`，TimesFM-3 风格主干）
 
-> 设计方案：[docs/NeuroTwin_TimesFM3_改进方案.md](docs/NeuroTwin_TimesFM3_改进方案.md)（§30 V1：只做四项——`[B,F,K]`+temporal patching、Causal Temporal Attention、SC-guided ROI Attention、One-Step + CPM 双头；quantile / intervention 训练 / assimilation / 新 MoE / SDE 暂不加入）。
+> 设计方案：[docs/Version3_docs_1003/NeuroTwin_TimesFM3_改进方案.md](docs/Version3_docs_1003/NeuroTwin_TimesFM3_改进方案.md)（§30 V1：只做四项——`[B,F,K]`+temporal patching、Causal Temporal Attention、SC-guided ROI Attention、One-Step + CPM 双头；quantile / intervention 训练 / assimilation / 新 MoE / SDE 暂不加入）。
 
 `--model_arch tfm` 选择新的 TFM 主干（默认 `legacy` 保持原 NeuroTwin 不变，两套主干的任务口径签名互不兼容，权重不可混用）：
 
@@ -380,13 +380,35 @@ BOLD context [B,F,K]
 - **干预接口预留**：`--cpm_intervention True` 构建 future-known covariate 嵌入
   （`forecast_horizon(..., future_control=[B,F,H])`），V1 默认关闭、不作为治疗预测训练
   （方案 §13.1：无真实刺激数据不得宣称疗效预测）。
+- **消融实验（方案 §25）**：
+  - 已有开关：`--tfm_patch_len 1|4|8`（§25.1）、`--sc_prior_mode adaptive_only|functional_only|soft_prior`
+    （§25.2）、`--lambda_cpm 0`（§25.3 One-step only）、`--tfm_use_patho_cond False`
+    （§25.4 no-HAMD，关闭时微调自动跳过冻结阶段、从第一步全量微调）；
+  - **shuffled-HAMD 负对照已内建**：凡带条件通路的 checkpoint，`evaluate_variant` 会自动
+    把被试间病理评分随机置换后重评（`--no_shuffled` 跳过），`metrics_<split>.json` 输出
+    `shuffled_hamd` 段——`delta_shuffled_minus_true` 的 MAE 增量 > 0 才说明条件通路真正
+    被使用（≈0 需结合 `tfm_no_cond` 训练消融解释）；summary 键
+    `test_shuffled_hamd_mae / test_shuffled_delta_mae`；
+  - **批量执行**：消融矩阵注册于 `experiments/variants.py` 的 `G30_TFM` 组，沿用电隔离
+    框架批量运行与登记：
+    ```bash
+    python -m experiments.run_experiments --group G30_TFM --dry-run   # 预览命令
+    python -m experiments.run_experiments --group G30_TFM             # 正式批量
+    python -m experiments.compare --group G30_TFM                     # 对比报告
+    ```
+    微调类变体（tfm_baseline/no_cpm/no_cond/cpm_gamma_decay）通过 `pretrained_from`
+    共享生产预训练 `checkpoints/neurotwin_tfm_pretrain/base_best.pt`；结构性变体
+    （patch/SC 消融）自预训练后再微调。
 - **单元测试**：`python -m pytest tests/ -q`（backbone 因果性/SC 偏置语义、模型双头契约、
-  初始化不变量、FiLM 条件通路、损失闭式核对）。
+  初始化不变量、FiLM 条件通路、损失闭式核对、条件消融开关与重建往返、变体注册表校验）。
 
 ## 变更记录
 
 | 变更日期 | 文件名 | 主要修改 |
 | --- | --- | --- |
+| 2026-10-03 | models/tfm.py、main.py、train/optim.py、experiments/evaluate_variant.py | 新增 `--tfm_use_patho_cond`（§25.4 条件消融开关：不构建 Normalizer/FiLM、前向忽略评分）；`set_finetune_stage` 对无条件适配器的 TFM 自动跳过冻结阶段（避免优化器空参数组）；`_KWARG_ALIAS_TFM` 补 `use_patho_cond` 别名（修复快照重建 strict 加载失败） |
+| 2026-10-03 | analysis/next_point_eval.py、experiments/evaluate_variant.py | shuffled-HAMD 负对照内建：`run_inference(pathology_override)` 按被试置换评分重评，`metrics_<split>.json` 新增 `shuffled_hamd` 段（TFM 附 CPM 逐 horizon 对照），summary 键 `*_shuffled_hamd_mae / *_shuffled_delta_mae`；顺带清除 run_inference 的历史重复定义（死代码） |
+| 2026-10-03 | experiments/variants.py、experiments/run_experiments.py、tests/test_ablation.py | 注册 `G30_TFM` 消融组（§25 矩阵 9 变体：patch 1/8、no-SC/functional-only/无 ΔA、no-CPM、gamma=0.9、no-HAMD）；变体支持 `pretrained_from` 共享生产预训练；新增 6 项测试（条件开关/评分重映射/变体合法性/重建往返） |
 | 2026-10-02 | models/tfm_backbone.py、models/tfm.py | 新建：TimesFM-3 风格 TFM 主干（TemporalPatchEmbed / CausalTemporalAttention / SCGuidedROIAttention / TFMEncoderBlock，方案 §4–§7）与 NeuroTwinTFM 完整模型（Context-only RevIN + SoftAnatomicalPrior 共享 A_eff + One-Step/CPM 双头 + 病理 FiLM 条件 + intervention 接口预留，方案 §8–§16/§30 V1） |
 | 2026-10-02 | train/losses.py | 新增 `TFMDualLoss`：L_one = Huber + λ_pcc·(1−spatial PCC)（不再 abs+delta 双计）+ L_CPM = γ 加权逐 horizon Huber（方案 §20），含逐 horizon 明细与配置校验 |
 | 2026-10-02 | utils/dataloader.py | `NextPointTrainView` 新增 `anchor_max_offset`（训练锚点保证 t+H 全 horizon 真值）、`NextPointEvalView` 新增 `all_future_steps`（所有 anchor 返回 future，宽度与 rollout_steps 取大者保证 collate 一致）；`NeuroTwinDataLoader` 透传 |

@@ -318,6 +318,16 @@ def set_finetune_stage(model, backbone_unfrozen: bool = False):
 
     if isinstance(model, NeuroTwinTFM):
         # TFM 无 MoE 分支：冻结期仅 FiLM 条件适配器训练，解冻后放开全部主干
+        cond_params = [p for module in _iter_conditioning_modules(model)
+                       for p in module.parameters()]
+        if not cond_params and not backbone_unfrozen:
+            # 条件消融（--tfm_use_patho_cond False）下没有条件适配器：
+            # 冻结阶段无可训练参数（优化器空参数组会直接报错），
+            # 语义上唯一合理的解释是跳过冻结、从第一步起全量微调
+            print("[set_finetune_stage] TFM 微调模型不含任何条件适配器"
+                  "（--tfm_use_patho_cond False）：冻结阶段无可训练参数，"
+                  "自动改为全量微调（等效 --freeze_backbone_epochs 0）。")
+            backbone_unfrozen = True
         if backbone_unfrozen:
             backbone_modules = [model.patch_embed, model.blocks, model.final_norm,
                                 model.one_step_head, model.cpm_head,

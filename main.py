@@ -338,7 +338,11 @@ def fit_pathology_normalizer(model, dl, args):
 
 
 def main(args):
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    if getattr(args, 'device', ''):
+        device = torch.device(args.device)
+    else:
+        # 缺省维持历史行为（多卡机器上训练集中到 cuda:1）；可用 --device 覆盖
+        device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     amp_enabled = (device.type == 'cuda' and args.amp)
     torch.set_num_threads(args.num_threads)
     if device.type == 'cuda' and args.tf32:
@@ -492,6 +496,7 @@ def main(args):
             pathology_norm_mode=args.pathology_norm_mode,
             pathology_norm_quantiles=args.pathology_norm_quantiles,
             pathology_norm_rbf_knots=args.pathology_norm_rbf_knots,
+            use_patho_cond=args.tfm_use_patho_cond,
             use_revin=args.norm,
         ).to(device)
     else:
@@ -1085,6 +1090,9 @@ def main(args):
 def parse_args():
     p = argparse.ArgumentParser(description='NeuroTwin: Pathology-Conditioned Mixture-of-Denoising-Experts Digital Twin for Brain Dynamics')
     p.add_argument('--mode', default='pretrain', choices=['pretrain', 'finetune'])
+    p.add_argument('--device', default='',
+                   help='训练设备（如 cuda:0）。空 = 历史默认（有 GPU 时用 cuda:1）。'
+                        '用于多卡并行跑消融：不同执行器指定不同 --device。')
     p.add_argument('--pretrained_weight', default='./checkpoints/neurotwin_pretrain/base_best.pt')
     p.add_argument('--pathology_input_dim', type=int, default=1)
     p.add_argument('--pathology_dim', type=int, default=32)
@@ -1404,6 +1412,10 @@ def parse_args():
                    help='构建 future-known covariate（intervention lookahead）嵌入'
                         '接口（方案 §12.4/§13）。V1 默认关闭：无真实干预数据，'
                         '仅保留接口，不作为治疗预测任务训练（方案 §13.1）。')
+    p.add_argument('--tfm_use_patho_cond', type=str2bool, default=True,
+                   help='TFM 病理条件通路开关（方案 §25.4 条件消融）：False 时'
+                        '不构建 PathologyNormalizer 与 FiLM，前向忽略评分。'
+                        '与条件开启的对照实验共用同一 HC 预训练权重。')
     p.add_argument('--lambda_one', type=float, default=1.0,
                    help='TFM 损失：one-step Huber 项权重（方案 §20.1）。')
     p.add_argument('--lambda_cpm', type=float, default=1.0,
