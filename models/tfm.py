@@ -18,9 +18,8 @@ assimilation、新 MoE、SDE、更复杂的 graph learning。仅预留
 future-known covariate（intervention lookahead，§12.4/§13）的**接口**
 （``cpm_intervention=True`` 时构建嵌入，默认关闭、不参与训练）。
 
-对外接口与 :class:`models.neurotwin.NeuroTwin` 的 next_timepoint 协议对齐
-（``forward`` / ``predict_next_state`` / ``rollout_next_states`` 同形），
-使训练入口与评估链路可以按 ``--model_arch`` 直接分派。
+对外提供 next_timepoint 标准协议（``forward`` / ``predict_next_state`` /
+``rollout_next_states``），训练入口与评估链路按同一接口消费。
 """
 from typing import List, Optional
 
@@ -240,7 +239,7 @@ class _CrossAttention(nn.Module):
 class NeuroTwinTFM(nn.Module):
     """NeuroTwin-TFM V1 主模型（方案 §16）。
 
-    与 :class:`models.neurotwin.NeuroTwin` 的差异（方案 §27 映射）：
+    相对早期 NeuroTwin 主干的设计差异（方案 §27 映射；legacy 主干已移除，此处保留设计溯源）：
     - 删除 window 轴结构（BrainMDM window pathway / ODE window attention）；
     - BrainMDM temporal pathway / GraphODE → Causal Temporal Attention；
     - DFCAdapter / GraphODE graph branch / 多处 SC 注入 → 统一 SoftAnatomicalPrior
@@ -283,8 +282,6 @@ class NeuroTwinTFM(nn.Module):
         pathology_norm_mode: str = 'robust_z',
         pathology_norm_quantiles: int = 64,
         pathology_norm_rbf_knots: int = 8,
-        # ---- 条件消融（§25.4）----
-        use_patho_cond: bool = True,
         # ---- 归一化（§15）----
         use_revin: bool = True,
     ):
@@ -317,12 +314,9 @@ class NeuroTwinTFM(nn.Module):
         )
 
         # ---- 病理条件（仅 finetune；HC 预训练无条件模块）----
-        # use_patho_cond=False 为方案 §25.4 条件消融开关：不构建 PathologyNormalizer
-        # 与 FiLM，前向收到的 pathology_score 一律忽略（与条件开启的对照实验
-        # 共用同一 HC 预训练权重，隔离「条件通路」本身的贡献）
         self.pathology_normalizer = None
         cond_dim = 0
-        if not self.pretrain_mode and use_patho_cond:
+        if not self.pretrain_mode:
             self.pathology_normalizer = PathologyNormalizer(
                 input_dim=pathology_input_dim,
                 mode=pathology_norm_mode,
@@ -384,7 +378,7 @@ class NeuroTwinTFM(nn.Module):
         return out.squeeze(-1)
 
     # ------------------------------------------------------------------
-    # 前向（与 NeuroTwin 的 next_timepoint 协议同形：[B,F,1,K] → [B,F,1,1]）
+    # 前向（next_timepoint 协议同形：[B,F,1,K] → [B,F,1,1]）
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, sc_matrix: torch.Tensor,
                 pathology_score: Optional[torch.Tensor] = None,
@@ -392,14 +386,14 @@ class NeuroTwinTFM(nn.Module):
         """单次前向：one-step 主输出 + CPM 全 horizon 辅助输出。
 
         Args:
-            x: [B, F, 1, K] context（内部布局与 NeuroTwin 一致，K ≤ context_max）
+            x: [B, F, 1, K] context（K ≤ context_max）
             sc_matrix: [F, F] 或 [B, F, F]
             pathology_score: [B, D] 或 None（HC 预训练 / 未提供评分）
             future_control: [B, F, cpm_horizon] 未来已知控制量（仅
                 ``cpm_intervention=True`` 时生效；V1 默认 None）
         Returns:
-            pred: [B, F, 1, 1] one-step 下一状态预测（原始空间，与 NeuroTwin
-                  next_timepoint 输出同形，供既有评估/损失直接消费）
+            pred: [B, F, 1, 1] one-step 下一状态预测（原始空间，
+                  供既有评估/损失直接消费）
             aux_info: dict：
                 ``cpm_pred``  [B, F, H] CPM 全 horizon 预测（原始空间）
                 ``sc_prior``  SoftAnatomicalPrior 输出（图正则消费）
@@ -414,11 +408,10 @@ class NeuroTwinTFM(nn.Module):
             x_norm4, norm_stats = self.rev_norm(x, 'norm')     # context-only 统计（§15）
             x_grid = x_norm4[:, :, 0, :]
         cond = self._prepare_condition(pathology_score)
-        if pathology_score is not None and self.pretrain_mode:
+        if pathology_score is not None and self.pathology_normalizer is None:
             raise ValueError(
                 "收到 pathology_score 但当前为预训练模式（无条件模块）；"
                 "HC 预训练不应提供病理评分。")
-        # use_patho_cond=False 的条件消融：评分到达但被忽略（cond=None）
 
         tokens, sc_info = self._encode(x_grid, sc_matrix)
         # One-Step 头（§10）：最后 causal token 为 z_t
@@ -443,7 +436,7 @@ class NeuroTwinTFM(nn.Module):
         return one_pred, aux_info
 
     # ------------------------------------------------------------------
-    # next_timepoint 对外标准接口（与 NeuroTwin 同形）
+    # next_timepoint 对外标准接口
     # ------------------------------------------------------------------
     @staticmethod
     def _to_internal_history(bold_history: torch.Tensor) -> torch.Tensor:
@@ -486,7 +479,7 @@ class NeuroTwinTFM(nn.Module):
                             steps: int = 1) -> torch.Tensor:
         """free rollout：one-step 头自回归滚动 ``steps`` 步（中间不用真值）。
 
-        与 NeuroTwin.rollout_next_states 同语义：每步取 +1 偏移预测接到
+        每步取 +1 偏移预测接到
         context 末尾、滑出最早 1 个 TR，返回 [B, steps, F]。
         """
         if bold_history.ndim != 3:

@@ -40,8 +40,7 @@ if [ "$#" -gt 0 ]; then
   ckpts=("$@")
 else
   ckpts=(
-    "$checkpoint_dir/neurotwin_nextpoint_finetune/finetuned_best.pt"
-    "$checkpoint_dir/neurotwin_nextpoint_finetune_rollamp/finetuned_best.pt"
+    "$checkpoint_dir/Version3_weights_and_results_1003/neurotwin_tfm_finetune/finetuned_best.pt"
   )
 fi
 

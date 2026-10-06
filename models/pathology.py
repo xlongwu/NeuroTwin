@@ -9,11 +9,10 @@ buffer 中 `fitted` 使用 int8：`ModelEMA` 对非浮点 buffer 走 copy 而非
 从而不会把“是否已拟合”的标志平均成无意义的小数。
 """
 import math
-from typing import Optional, Union
+from typing import Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class PathologyNormalizer(nn.Module):
@@ -94,7 +93,7 @@ class PathologyNormalizer(nn.Module):
     # ------------------------------------------------------------------
     @property
     def out_dim(self) -> int:
-        """归一化后条件向量的宽度，供下游 `pathology_input_dim` 使用。"""
+        """归一化后条件向量的宽度，供下游条件模块使用。"""
         if self.mode == 'zscore_quadratic':
             return self.input_dim * 2
         if self.mode == 'zscore_rbf':
@@ -193,166 +192,3 @@ class PathologyNormalizer(nn.Module):
             return z
         zz = z[..., :self.input_dim]
         return zz * self.scale + self.center
-
-
-class AdaLNConditioner(nn.Module):
-    """特征级病理条件调制（AdaLN / FiLM）。
-
-    把病理条件向量映射为逐通道的 `gamma/beta/alpha`，对特征张量做仿射调制：
-
-        y = alpha · (x · (1 + gamma) + beta)
-
-    初始化策略（identity-at-init）
-    ────────────────────────────
-    最后一层零初始化 → `gamma = beta = 0`、`alpha_raw = 0` → `alpha = 1`，
-    因此**初始状态下该模块恒等**，预训练主干行为被完整保留。`alpha` 用
-    `1 + tanh(·)` 而非 `sigmoid(·)` 是为了让初值恰为 1（sigmoid(0)=0.5 会
-    直接把特征减半）。
-
-    `cond=None` 时不做任何计算，直接返回输入，保证无条件（预训练）路径
-    与加入该模块前的数值逐位一致。
-
-    标记 `is_conditioning_adapter = True`：`set_finetune_stage` 的分阶段冻结
-    与 `get_param_groups` 的参数分组据此发现并单独处理这些条件模块。
-    """
-
-    is_conditioning_adapter = True
-
-    def __init__(self, cond_dim: int, num_channels: int,
-                 hidden_dim: Optional[int] = None, dropout: float = 0.0):
-        super().__init__()
-        if cond_dim < 1:
-            raise ValueError(f"cond_dim must be >= 1, got {cond_dim}")
-        if num_channels < 1:
-            raise ValueError(f"num_channels must be >= 1, got {num_channels}")
-        self.cond_dim = int(cond_dim)
-        self.num_channels = int(num_channels)
-        hidden = int(hidden_dim) if hidden_dim else max(32, self.cond_dim * 2)
-
-        self.net = nn.Sequential(
-            nn.Linear(self.cond_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 2 * self.num_channels + 1),
-        )
-        last = self.net[-1]
-        nn.init.zeros_(last.weight)
-        nn.init.zeros_(last.bias)
-
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x: [B, C, ...]；cond: [B, cond_dim] 或 [B, 1, cond_dim]。
-
-        cond 为 None 时返回输入本身（不产生额外计算）。
-        """
-        if cond is None:
-            return x
-        if cond.ndim == 3:
-            cond = cond.reshape(cond.shape[0], -1)
-        if cond.ndim == 1:
-            cond = cond.unsqueeze(-1)
-
-        b = x.shape[0]
-        gamma, beta, alpha_raw = self.net(cond).split(
-            [self.num_channels] * 2 + [1], dim=-1)
-        # gamma/beta 逐通道；alpha 为 per-sample 全局增益（初值 1）
-        c_view = (b, self.num_channels) + (1,) * (x.ndim - 2)
-        s_view = (b, 1) + (1,) * (x.ndim - 2)
-        alpha = 1.0 + torch.tanh(alpha_raw)
-        return alpha.view(s_view) * (x * (1.0 + gamma.view(c_view)) + beta.view(c_view))
-
-    def extra_repr(self) -> str:
-        return f"cond_dim={self.cond_dim}, num_channels={self.num_channels}"
-
-
-class LowRankDelta(nn.Module):
-    """LoRA 风格低秩增量（只输出 ΔW·x，与基础权重相加）。
-
-    设计上与 `nn.Linear` 解耦：本模块**只产生增量**，基础投影仍由原
-    `nn.Linear` 计算。这样预训练权重键名与形状完全不变，`--lora_rank`
-    可随时开关而不影响 backbone 检查点的加载。
-
-    `lora_B` 零初始化 → 初始增量恒为 0（identity-at-init），
-    因此 finetune 起点的行为与预训练完全一致。
-    """
-
-    is_conditioning_adapter = True
-
-    def __init__(self, in_features: int, out_features: int,
-                 rank: int = 8, alpha: Optional[float] = None, dropout: float = 0.0):
-        super().__init__()
-        if rank < 1:
-            raise ValueError(f"rank must be >= 1, got {rank}")
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
-        self.rank = int(rank)
-        self.scaling = (float(alpha) / self.rank) if alpha is not None else 1.0 / self.rank
-
-        self.lora_A = nn.Parameter(torch.empty(self.rank, self.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, self.rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [..., in_features] → [..., out_features] 的增量。
-
-        输入最后一维小于 ``in_features`` 时（变长 context 的前缀路径）对
-        ``lora_A`` 取列前缀，语义与 :func:`models.common.prefix_linear` 一致；
-        宽度相等时数值不变。输出宽度恒为 ``out_features``（由调用方按需截断）。
-        """
-        d = int(x.shape[-1])
-        if d == self.in_features:
-            a = self.lora_A
-        elif d < self.in_features:
-            a = self.lora_A[:, :d]
-        else:
-            raise ValueError(
-                f"LoRA 输入宽度 {d} 超过建模宽度 {self.in_features}。")
-        h = F.linear(self.dropout(x), a)
-        return F.linear(h, self.lora_B) * self.scaling
-
-    def extra_repr(self) -> str:
-        return (f"in_features={self.in_features}, out_features={self.out_features}, "
-                f"rank={self.rank}, scaling={self.scaling:.4f}")
-
-
-class AuxInversionHead(nn.Module):
-    """辅助反演头：从池化潜在状态回归病理条件向量。
-
-    动机：若主干潜在状态真的编码了病理严重度，则应能从池化特征反演出评分。
-    该头只作为**辅助正则**使用（``--inversion_weight``，默认 0 关闭），
-    不参与任何推断路径，避免给纯预测任务强加第二个目标。
-
-    反演目标是与 `NeuroTwin._decode` 中一致的**归一化后条件向量**
-    （宽度 = `PathologyNormalizer.out_dim`），因此可对 `robust_z` 等可逆模式
-    再调用 ``normalizer.inverse`` 还原到原始评分空间。
-    """
-
-    def __init__(self, latent_dim: int, out_dim: int = 1,
-                 hidden_dim: int = 128, dropout: float = 0.1):
-        super().__init__()
-        if latent_dim < 1 or out_dim < 1:
-            raise ValueError(
-                f"latent_dim/out_dim 必须为正，收到 {latent_dim}/{out_dim}")
-        self.latent_dim = int(latent_dim)
-        self.out_dim = int(out_dim)
-        self.net = nn.Sequential(
-            nn.LayerNorm(self.latent_dim),
-            nn.Linear(self.latent_dim, hidden_dim), nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.out_dim),
-        )
-
-    @staticmethod
-    def pool(latent: torch.Tensor) -> torch.Tensor:
-        """[B, F, ...] -> [B, F]，对除 batch/ROI 之外的所有维度取均值。"""
-        if latent.ndim < 3:
-            raise ValueError(f"latent 至少需要 3 维 [B, F, ...]，收到 {tuple(latent.shape)}")
-        dims = tuple(range(2, latent.ndim))
-        return latent.mean(dim=dims) if dims else latent
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """latent [B, F, ...] -> 归一化条件向量 [B, out_dim]"""
-        return self.net(self.pool(latent))
-
-    def extra_repr(self) -> str:
-        return f"latent_dim={self.latent_dim}, out_dim={self.out_dim}"

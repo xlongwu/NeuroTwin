@@ -1,5 +1,57 @@
 # NeuroTwin Next-Timepoint Autoregressive Task 重构方案
 
+# 0. 实现状态总览（2026-09-28 核对，以当前代码为准）
+
+> 本节为事后核对补充；正文各节保留原始设计表述（Version1，0921）供溯源。现行任务协议与参数以 [docs/next_timepoint_forecasting.md](../next_timepoint_forecasting.md) 为准。
+>
+> 标记含义：**【已实现】**代码已落地 ｜ **【部分实现】**接口或子集已落地、其余未做 ｜ **【未实现】**按计划暂缓（P3 等）｜ **【已删除】**随 2026-09-27 任务口径统一被整体移除或被推翻。
+
+| 章节 | 状态 | 与当前代码的对应 / 差异 |
+|---|---|---|
+| 1 文档目的 | 【已实现】 | 重构已落地，`next_timepoint` 为唯一任务口径（`main.py` 默认值） |
+| 2 当前任务定义（旧 6→1 滑窗） | 【已删除】 | 旧任务连同代码、评估模块、脚本与文档已于 2026-09-27 整体移除 |
+| 3 旧任务问题分析 | 【已实现】 | 动机结论仍有效，作为设计依据保留 |
+| 4 新任务定义 | 【已实现】 | 数据流与 shape 见协议文档 §1；`NextPointTrainView` / `NextPointEvalView` |
+| 5 数据组织 | 【已实现】 | Subject 级 Dataset + 动态 context 采样，不再离线生成滑窗样本 |
+| 6 Subject-Level Split | 【已实现】 | 版本化 `subject_split_<mode>.json` manifest，配置不一致直接报错 |
+| 7 Historical Context | 【已实现】 | `K∈[--context_min,--context_max]`（默认 16–64）随机采样或 `--context_lengths` 离散集合；按 K 分桶组 batch |
+| 8 两种训练实现方式 | 【部分实现】 | 仅「随机 context→下一时间点」落地；full-sequence causal 未实现（`--causal_training full_sequence` 显式报错）；本节方案 A/B 命名与协议文档 §9.1 相反 |
+| 9 Causal Constraint | 【部分实现】 | 因果性由数据构造保证（未来不进前向）；独立 causal leakage test 脚本未实现 |
+| 10 Normalization | 【部分实现】 | BrainRevIN 仅用当前 context 统计量（含反归一化）；`data/Normlize` 逐 ROI 全序列 z-score 属预处理固定仿射，模型侧无法撤销（协议文档 §2.1） |
+| 11 模型标准输入输出 | 【已实现】 | 入口一次 transpose 至 `[B,F,1,K]`；W=1、S=K 前缀切片；单点输出保护 |
+| 12 Residual / Delta Prediction | 【已实现】 | `--prediction_target delta`（默认，x_t 锚点）/ `absolute`（零锚点消融） |
+| 13 新训练目标 | 【已实现】 | `NextTimepointLoss`：L_abs+L_delta+L_pcc（λ 默认 1/1/0.1）；delta 锚点下 L_delta 与 L_abs 数值重合（协议文档 §4）；NLL 默认关闭 |
+| 14 旧 Loss 的处理 | 【已删除】 | 随旧任务删除 |
+| 15 HC Pretraining | 【已实现】 | `scripts/Pretrain_HC_next_point.sh` |
+| 16 MDD Finetuning | 【已实现】 | `scripts/Finetune_MDD_next_point.sh`；病理残差 = 下一状态残差 delta_HC + delta_MDD |
+| 17 Pathology MoE | 【部分实现】 | HAMD-conditioned routing 保留；state-aware router（HAMD+z_t）未实现（P3） |
+| 18 GraphODE 重新定位 | 【部分实现】 | 审计结论成立（`t` 被丢弃、自治向量场）；真实 Δt 未实现，未伪装连续时间语义（协议文档 §9.2） |
+| 19–20 评估与 Next-State 指标 | 【已实现】 | `analysis/next_point_eval.py`：MAE/RMSE/spatial PCC/R² + delta_direction，被试级聚合 |
+| 21–23 Baselines | 【已实现】 | persistence / linear trend / AR(1)（仅 train subjects 拟合，n_pairs 入报告）；VAR 未实现 |
+| 24–25 Free Rollout | 【已实现】 | horizons 1/2/4/8/16；MAE/RMSE/spatial PCC/temporal PCC/R²/variance ratio + degradation + vs persistence improvement；baselines 递归生成 |
+| 26 FC 评估 | 【已实现】 | rollout ≥ `--fc_min_length`(32) 才计算；上三角边 fc_mae/fc_rmse/edge_pcc + within/between-network（AAL116「对应网络」列，缺失自动跳过） |
+| 27 Spectral 评估 | 【已实现】 | `--eval_spectral` 可选（Welch PSD） |
+| 28 Val/Test Protocol | 【已实现】 | 固定 K_eval + 确定性 anchor（`--eval_anchors_per_subject`，0=枚举全部） |
+| 29 Subject-Level 聚合 | 【已实现】 | `per_subject_metrics_<split>.csv` 主表、per_task 供调试 |
+| 30–31 MTP | 【部分实现】 | Parallel MTP 已实现（`--enable_mtp` + `--mtp_weights`，同一 hidden 并行输出多偏移）；Sequential MTP 未实现（P3） |
+| 32 Short Rollout Training | 【已实现】 | `--enable_rollout_loss`（默认关闭；steps=2、λ_rollout=0.2，成本约 (1+steps) 倍） |
+| 33 新配置参数 | 【已实现】 | CLI 参数名与设计一致（`main.py --help` / 协议文档 §6） |
+| 34 兼容旧任务 | 【已删除】 | 被后续决策推翻：旧任务（window_forecast）完全删除，`--task_mode` 仅支持 `next_timepoint`；Experiment A 不再可复现 |
+| 35 推荐消融实验 | 【部分实现】 | `experiments/variants.py` 已注册 `G20_NEXTPOINT`（Experiment B–F 全组合）；Experiment A 因旧任务删除不可运行 |
+| 36 工程重构优先级 | 【部分实现】 | P0/P1 全部完成；P2 中 AR(1)、FC rollout、频谱、短 rollout loss 已完成，latent transition supervision 未做；P3 均未实现 |
+| 37 Sanity Checks | 【部分实现】 | 多数约束由实现与数据构造保证；独立 causal leakage test 无脚本 |
+| 38 Smoke Tests | 【已删除】 | 旧冒烟脚本随任务统一删除；`smoke_test_next_point.py` 尚未补齐（已知缺口） |
+| 39 Checkpoint Compatibility | 【已实现】 | `--load_backbone_only`：显式 loaded / missing / incompatible / reinitialized 四类清单；strict=False 静默过滤已移除 |
+| 40 推荐日志 | 【已实现】 | `train/loss_abs|delta|pcc`、`val next_*`、`Val/Rollout_MAE_H*`；MTP 分偏移日志 |
+| 41 Checkpoint Selection | 【已实现】 | 判据 = val next-state MAE，并打印 vs persistence 的 ΔMAE |
+| 42 新任务整体数据流 | 【已实现】 | 与实现一致（协议文档 §1） |
+| 43–44 科学问题 / 与数字孪生关系 | — | 概念性内容，无实现对应 |
+| 45 本轮重构的最终边界 | 【已实现】 | 「本轮必须完成」清单全部落地；「暂缓」清单仍按计划暂缓 |
+| 46 最终目标 | 【已实现】 | 默认任务已切换为 next_timepoint（连续 BOLD → 下一 TR 全脑状态） |
+
+---
+
+
 ## 1. 文档目的
 
 本文档定义 NeuroTwin 下一阶段的任务重构方案。
@@ -20,21 +72,19 @@ Historical Continuous BOLD States → Next Whole-Brain BOLD State
 
 即直接基于连续原始 BOLD 序列进行自回归脑状态建模：
 
-\[
-p(x_{t+1}\mid x_{\leq t}, SC)
-\]
+$$p(x_{t+1}\mid x_{\leq t}, SC)$$
 
 对于 MDD 阶段进一步建模：
 
-\[
+$$
 p(x_{t+1}\mid x_{\leq t}, SC, HAMD)
-\]
+$$
 
 其中：
 
-- \(x_t\in\mathbb{R}^{F}\) 表示第 \(t\) 个 TR 时刻所有 ROI 的联合 BOLD 状态；
-- \(F\) 为 ROI 数，例如 AAL116 时 \(F=116\)；
-- \(SC\in\mathbb{R}^{F\times F}\) 为个体结构连接；
+- $x_t\in\mathbb{R}^{F}$ 表示第 $t$ 个 TR 时刻所有 ROI 的联合 BOLD 状态；
+- $F$ 为 ROI 数，例如 AAL116 时 $F=116$；
+- $SC\in\mathbb{R}^{F\times F}$ 为个体结构连接；
 - HAMD 为 MDD 个体病理条件。
 
 本轮重构的目标不是立即重写整个 NeuroTwin 模型，而是首先建立更加合理、统一且可扩展的任务基础，为后续 Multi-Timepoint Prediction、长程 rollout、个体化病理动力学和干预模拟提供统一接口。
@@ -45,15 +95,15 @@ p(x_{t+1}\mid x_{\leq t}, SC, HAMD)
 
 当前典型训练输入为：
 
-\[
+$$
 x\in\mathbb{R}^{F\times 6\times 30}
-\]
+$$
 
 目标为：
 
-\[
+$$
 y\in\mathbb{R}^{F\times 1\times 30}
-\]
+$$
 
 即：
 
@@ -183,41 +233,41 @@ BOLD 信号具有明显的低频性和时间自相关。
 
 将每一个真实 TR 时刻的全脑 ROI vector 视为一个 brain-state token：
 
-\[
+$$
 x_t=[x_t^1,\ldots,x_t^F]
-\]
+$$
 
 其中：
 
-\[
+$$
 x_t\in\mathbb{R}^{F}
-\]
+$$
 
 对于完整 BOLD：
 
-\[
+$$
 X=[x_1,x_2,\ldots,x_T]
-\]
+$$
 
 新的核心任务定义为：
 
-\[
+$$
 x_{\leq t}\rightarrow x_{t+1}
-\]
+$$
 
 即：
 
-\[
+$$
 p(x_{t+1}\mid x_{\leq t},SC)
-\]
+$$
 
 HC 阶段学习一般脑动力学；
 
 MDD 阶段进一步学习：
 
-\[
+$$
 p(x_{t+1}\mid x_{\leq t},SC,HAMD)
-\]
+$$
 
 ---
 
@@ -314,17 +364,17 @@ Subjects
 
 要求：
 
-\[
+$$
 Train\cap Val=\varnothing
-\]
+$$
 
-\[
+$$
 Train\cap Test=\varnothing
-\]
+$$
 
-\[
+$$
 Val\cap Test=\varnothing
-\]
+$$
 
 禁止采用：
 
@@ -340,29 +390,29 @@ Val\cap Test=\varnothing
 
 虽然预测目标是下一个 TR：
 
-\[
+$$
 x_{t+1}
-\]
+$$
 
 但输入不应只包含：
 
-\[
+$$
 x_t
-\]
+$$
 
 而应使用一定长度的历史上下文：
 
-\[
+$$
 x_{t-K+1:t}
-\]
+$$
 
 任务变成：
 
-\[
+$$
 x_{t-K+1:t}\rightarrow x_{t+1}
-\]
+$$
 
-其中 \(K\) 是 context length。
+其中 $K$ 是 context length。
 
 ---
 
@@ -395,15 +445,15 @@ x83
 
 输入 shape：
 
-\[
+$$
 [B,K,F]
-\]
+$$
 
 目标：
 
-\[
+$$
 [B,F]
-\]
+$$
 
 ---
 
@@ -422,6 +472,7 @@ K = 30
 ---
 
 # 8. 两种训练实现方式
+> **实现状态（2026-09-28）：【部分实现】** 仅「随机 context → 下一时间点」落地（本节 8.1 思路）；full-sequence causal training 未实现，`--causal_training full_sequence` 显式报错（协议文档 §9.1）。注意本节方案 A/B 命名与协议文档 §9.1 相反（协议文档 A=全序列 causal，B=随机 context）。
 
 ## 8.1 方案 A：Random Context → Next State
 
@@ -430,10 +481,10 @@ K = 30
 每次训练：
 
 1. 随机选择 subject；
-2. 随机选择 context length \(K\)；
-3. 随机选择预测位置 \(t\)；
-4. 输入 \(x_{t-K+1:t}\)；
-5. 预测 \(x_{t+1}\)。
+2. 随机选择 context length $K$；
+3. 随机选择预测位置 $t$；
+4. 输入 $x_{t-K+1:t}$；
+5. 预测 $x_{t+1}$。
 
 优点：
 
@@ -452,15 +503,15 @@ K = 30
 
 输入：
 
-\[
+$$
 [x_1,x_2,\ldots,x_{T-1}]
-\]
+$$
 
 目标右移：
 
-\[
+$$
 [x_2,x_3,\ldots,x_T]
-\]
+$$
 
 通过 causal mask，一次 forward 同时计算多个位置的 next-state loss。
 
@@ -482,21 +533,21 @@ K = 30
 
 新任务的基本原则：
 
-\[
+$$
 \hat x_{t+1}
-\]
+$$
 
 只能使用：
 
-\[
+$$
 x_{\leq t}
-\]
+$$
 
 禁止模型看到：
 
-\[
+$$
 x_{t+1:T}
-\]
+$$
 
 如果采用完整序列训练，则需要严格 causal mask。
 
@@ -522,9 +573,9 @@ Changing future observations must not change prediction at t.
 
 禁止使用完整 subject：
 
-\[
+$$
 x_{1:T}
-\]
+$$
 
 计算 mean/std 后，再预测其中的未来时间点。
 
@@ -548,15 +599,15 @@ inverse transform using history statistics
 
 即 normalization statistics 必须只来自：
 
-\[
+$$
 x_{t-K+1:t}
-\]
+$$
 
 目标：
 
-\[
+$$
 x_{t+1}
-\]
+$$
 
 不得参与。
 
@@ -602,31 +653,31 @@ latent_state [...]
 
 由于：
 
-\[
+$$
 x_{t+1}\approx x_t
-\]
+$$
 
 直接预测 absolute BOLD 容易产生 identity shortcut。
 
 因此建议默认预测：
 
-\[
+$$
 \Delta x_t=x_{t+1}-x_t
-\]
+$$
 
 模型输出：
 
-\[
+$$
 \Delta \hat{x}_t
-\]
+$$
 
 最终：
 
-\[
+$$
 \hat{x}_{t+1}
 =
 x_t+\Delta\hat{x}_t
-\]
+$$
 
 即：
 
@@ -662,23 +713,23 @@ prediction_target = absolute
 
 预测：
 
-\[
+$$
 \hat{x}_{t+1}
-\]
+$$
 
 与真实：
 
-\[
+$$
 x_{t+1}
-\]
+$$
 
 计算：
 
-\[
+$$
 L_{abs}
 =
 \|\hat{x}_{t+1}-x_{t+1}\|_1
-\]
+$$
 
 默认优先 MAE / Huber。
 
@@ -688,25 +739,25 @@ L_{abs}
 
 真实变化：
 
-\[
+$$
 \Delta x_t
 =
 x_{t+1}-x_t
-\]
+$$
 
 预测变化：
 
-\[
+$$
 \Delta\hat{x}_t
-\]
+$$
 
 定义：
 
-\[
+$$
 L_{\Delta}
 =
 \|\Delta\hat{x}_t-\Delta x_t\|_1
-\]
+$$
 
 该 loss 用于强化真正的状态变化建模。
 
@@ -718,15 +769,15 @@ L_{\Delta}
 
 对于单个时间点：
 
-\[
+$$
 x_{t+1}\in\mathbb{R}^{F}
-\]
+$$
 
 PCC 应沿 ROI 维计算：
 
-\[
+$$
 PCC(\hat{x}_{t+1},x_{t+1})
-\]
+$$
 
 此时衡量的是：
 
@@ -736,11 +787,11 @@ PCC(\hat{x}_{t+1},x_{t+1})
 
 建议：
 
-\[
+$$
 L_{spatial}
 =
 1-PCC(\hat{x}_{t+1},x_{t+1})
-\]
+$$
 
 作为辅助，而非唯一主 loss。
 
@@ -748,7 +799,7 @@ L_{spatial}
 
 ## 13.4 第一版推荐总损失
 
-\[
+$$
 L_{total}
 =
 \lambda_{abs}L_{abs}
@@ -756,7 +807,7 @@ L_{total}
 \lambda_{\Delta}L_{\Delta}
 +
 \lambda_{pcc}L_{spatial}
-\]
+$$
 
 推荐初始值：
 
@@ -788,9 +839,9 @@ lambda_pcc   = 0.1
 
 HC 阶段定义：
 
-\[
+$$
 p(x_{t+1}\mid x_{t-K+1:t},SC)
-\]
+$$
 
 目标：
 
@@ -798,23 +849,23 @@ p(x_{t+1}\mid x_{t-K+1:t},SC)
 
 可表示为：
 
-\[
+$$
 z_t
 =
 E(x_{t-K+1:t},SC)
-\]
+$$
 
-\[
+$$
 \Delta \hat{x}_{t}
 =
 F_{HC}(z_t,SC)
-\]
+$$
 
-\[
+$$
 \hat{x}_{t+1}
 =
 x_t+\Delta\hat{x}_{t}
-\]
+$$
 
 HC 阶段不需要 HAMD。
 
@@ -824,9 +875,9 @@ HC 阶段不需要 HAMD。
 
 MDD 阶段定义：
 
-\[
+$$
 p(x_{t+1}\mid x_{t-K+1:t},SC,HAMD)
-\]
+$$
 
 建议保持：
 
@@ -838,25 +889,25 @@ Pathology-Conditioned Residual
 
 新的动态解释为：
 
-\[
+$$
 \Delta\hat{x}_t
 =
 \Delta\hat{x}^{HC}_t
 +
 \Delta\hat{x}^{MDD}_t
-\]
+$$
 
 其中：
 
-\[
+$$
 \Delta\hat{x}^{HC}_t
-\]
+$$
 
 表示一般脑动力学；
 
-\[
+$$
 \Delta\hat{x}^{MDD}_t
-\]
+$$
 
 表示病理状态对下一步状态变化的修正。
 
@@ -876,15 +927,15 @@ router_condition = HAMD + current latent brain state
 
 未来：
 
-\[
+$$
 Router(HAMD,z_t)
-\]
+$$
 
 比仅：
 
-\[
+$$
 Router(HAMD)
-\]
+$$
 
 更符合个体化动力学。
 
@@ -893,26 +944,27 @@ Router(HAMD)
 ---
 
 # 18. GraphODE 的重新定位
+> **实现状态（2026-09-28）：【部分实现】** 审计结论已确认（`GraphODE.forward(t,…)` 直接丢弃 `t`，自治向量场）；真实 Δt 未实现，按本节要求在协议文档 §9.2 如实说明，未伪装连续时间语义。
 
 新任务下，GraphODE 更容易被解释为：
 
-\[
+$$
 z_t\rightarrow z_{t+1}
-\]
+$$
 
 如果 TR 已知：
 
-\[
+$$
 \Delta t=TR
-\]
+$$
 
 则未来可进一步实现：
 
-\[
+$$
 z(t+\Delta t)
 =
 ODESolve(f_\theta,z(t),\Delta t)
-\]
+$$
 
 因此后续 GraphODE 应显式接收真实：
 
@@ -970,9 +1022,9 @@ next-step PCC
 
 最重要基线：
 
-\[
+$$
 \hat{x}_{t+1}=x_t
-\]
+$$
 
 因为 BOLD 高度自相关。
 
@@ -984,11 +1036,11 @@ NeuroTwin 必须证明其性能优于简单 persistence。
 
 定义：
 
-\[
+$$
 \hat{x}_{t+1}
 =
 x_t+(x_t-x_{t-1})
-\]
+$$
 
 用于判断模型是否只是学习简单局部趋势。
 
@@ -998,11 +1050,11 @@ x_t+(x_t-x_{t-1})
 
 如果实现成本合理，增加每 ROI 的 AR(1)：
 
-\[
+$$
 x_{t+1}^{(i)}
 =
 a_i x_t^{(i)}+b_i
-\]
+$$
 
 参数只能使用训练集 subject 拟合。
 
@@ -1023,29 +1075,29 @@ Persistence
 
 给定真实历史：
 
-\[
+$$
 x_{t-K+1:t}
-\]
+$$
 
 预测：
 
-\[
+$$
 \hat{x}_{t+1}
-\]
+$$
 
 随后：
 
-\[
+$$
 [x_{t-K+2:t},\hat{x}_{t+1}]
 \rightarrow
 \hat{x}_{t+2}
-\]
+$$
 
 继续：
 
-\[
+$$
 \hat{x}_{t+3},\ldots,\hat{x}_{t+H}
-\]
+$$
 
 从第一步预测开始，中间不得读取未来 ground truth。
 
@@ -1081,11 +1133,11 @@ MAE_H16
 
 重点观察：
 
-\[
+$$
 H\uparrow
 \Rightarrow
 Error\uparrow
-\]
+$$
 
 以及模型是否发生：
 
@@ -1104,13 +1156,13 @@ Error\uparrow
 
 例如：
 
-\[
+$$
 Y_{pred}\in\mathbb{R}^{H\times F}
-\]
+$$
 
-\[
+$$
 Y_{true}\in\mathbb{R}^{H\times F}
-\]
+$$
 
 当：
 
@@ -1120,17 +1172,17 @@ H >= fc_min_length
 
 例如 32 或 64 TR 时：
 
-\[
+$$
 FC_{pred}
 =
 Corr(Y_{pred})
-\]
+$$
 
-\[
+$$
 FC_{true}
 =
 Corr(Y_{true})
-\]
+$$
 
 比较：
 
@@ -1210,13 +1262,13 @@ Across-Subject Statistics
 
 未来 offsets：
 
-\[
+$$
 \mathcal{H}=\{1,2,4,8\}
-\]
+$$
 
 即：
 
-\[
+$$
 x_{\leq t}
 \rightarrow
 \{
@@ -1225,7 +1277,7 @@ x_{t+2},
 x_{t+4},
 x_{t+8}
 \}
-\]
+$$
 
 建议名称：
 
@@ -1238,6 +1290,7 @@ x_{t+8}
 ---
 
 # 31. MTP 第一版结构
+> **实现状态（2026-09-28）：【部分实现】** Parallel MTP 已实现：`--enable_mtp` + `--mtp_weights`，同一 hidden state 并行输出多偏移，预测头无需改结构；Sequential MTP 未实现（P3）。
 
 优先采用 Parallel MTP：
 
@@ -1252,21 +1305,21 @@ x_{t+8}
 
 主 next-state 仍然为：
 
-\[
+$$
 t+1
-\]
+$$
 
 其他 horizon 作为辅助预测。
 
 损失：
 
-\[
+$$
 L_{MTP}
 =
 \sum_k
 w_k
 L(\hat{x}_{t+\delta_k},x_{t+\delta_k})
-\]
+$$
 
 推荐初始：
 
@@ -1280,6 +1333,7 @@ weights = [1.0, 0.7, 0.5, 0.3]
 ---
 
 # 32. Short Rollout Training
+> **实现状态（2026-09-28）：【已实现】** `--enable_rollout_loss`（默认关闭），`--rollout_train_steps` 默认 2、`--lambda_rollout` 默认 0.2，成本约为单步的 (1+steps) 倍；第一版与设计一致保持关闭。
 
 Next-state training 使用真实历史，会产生 teacher-forcing / free-rollout mismatch。
 
@@ -1287,32 +1341,32 @@ Next-state training 使用真实历史，会产生 teacher-forcing / free-rollou
 
 例如训练：
 
-\[
+$$
 x_{\leq t}
 \rightarrow
 \hat{x}_{t+1}
-\]
+$$
 
 然后使用预测：
 
-\[
+$$
 \hat{x}_{t+1}
-\]
+$$
 
 继续：
 
-\[
+$$
 \hat{x}_{t+2}
-\]
+$$
 
 定义：
 
-\[
+$$
 L_{roll}
 =
 \sum_{k=1}^{K_r}
 D(\hat{x}_{t+k},x_{t+k})
-\]
+$$
 
 第一版建议：
 
@@ -1329,6 +1383,8 @@ rollout_train_steps = 2 or 4
 建议新增：
 
 ```yaml
+task_mode: next_timepoint
+
 context_min: 16
 context_max: 64
 context_lengths: [16, 32, 64]
@@ -1370,27 +1426,70 @@ mtp_weights: [1.0, 0.7, 0.5, 0.3]
 
 ---
 
-# 34. 单一任务入口
+# 34. 兼容旧任务
+> **实现状态（2026-09-28）：【已删除】** 本节设计已被后续决策推翻：2026-09-27 任务口径统一时，旧任务（滑窗 6→1）连同兼容别名与旧 CLI 参数完全删除，`--task_mode` 仅支持 `next_timepoint`；Experiment A（window forecast）不再可复现，消融基线由 Experiment B（无 delta）承担。
 
-本轮只保留 Next-Timepoint Prediction。训练入口直接读取连续 BOLD，
-不再提供旧滑窗预测入口或跨任务检查点加载。历史窗口任务仅作为背景问题说明。
+必须尽量保留旧模式：
+
+```text
+task_mode = window_forecast
+```
+
+新增：
+
+```text
+task_mode = next_timepoint
+```
+
+这样可以进行公平 ablation：
+
+### Experiment A
+
+旧任务：
+
+```text
+6 windows → 1 window
+```
+
+### Experiment B
+
+Next-Timepoint：
+
+```text
+history → t+1
+```
+
+### Experiment C
+
+Next-Timepoint + Delta Prediction
+
+### Experiment D
+
+Next-Timepoint + Short Rollout Loss
+
+### Experiment E
+
+Next-Timepoint + MTP
 
 ---
 
 # 35. 推荐消融实验
+> **实现状态（2026-09-28）：【部分实现】** `experiments/variants.py` 已注册 `G20_NEXTPOINT`（Experiment B–F：next_timepoint / delta / rollout loss / MTP 全组合）；Experiment A 因旧任务删除不可运行。
 
 至少设计：
 
 | Experiment | Task | Delta | Rollout Loss | MTP |
 |---|---|---:|---:|---:|
-| A | Next-Timepoint | No | No | No |
-| B | Next-Timepoint | Yes | No | No |
-| C | Next-Timepoint | Yes | Yes | No |
-| D | Next-Timepoint | Yes | No | Yes |
-| E | Next-Timepoint | Yes | Yes | Yes |
+| A | Window Forecast | No | No | No |
+| B | Next-Timepoint | No | No | No |
+| C | Next-Timepoint | Yes | No | No |
+| D | Next-Timepoint | Yes | Yes | No |
+| E | Next-Timepoint | Yes | No | Yes |
+| F | Next-Timepoint | Yes | Yes | Yes |
 
 目的不是只比较最终最复杂模型，而是明确：
 
+- 任务改变是否有效；
 - delta prediction 是否有效；
 - rollout supervision 是否有效；
 - MTP 是否有效。
@@ -1398,6 +1497,7 @@ mtp_weights: [1.0, 0.7, 0.5, 0.3]
 ---
 
 # 36. 工程重构优先级
+> **实现状态（2026-09-28）：【部分实现】** P0、P1 全部完成；P2 中 AR(1) baseline、FC rollout 评估、频谱评估、短 rollout training loss 已完成，latent transition supervision 未实现；P3（Sequential MTP、state-aware MoE router、真实 Δt GraphODE、概率预测、干预模拟）均未实现。
 
 ## P0：必须完成
 
@@ -1444,7 +1544,7 @@ mtp_weights: [1.0, 0.7, 0.5, 0.3]
 - Parallel MTP；
 - Sequential MTP；
 - state-aware MoE router；
-- real-\(\Delta t\) GraphODE；
+- real-$\Delta t$ GraphODE；
 - probabilistic next-state prediction；
 - intervention/counterfactual simulation。
 
@@ -1474,7 +1574,7 @@ mtp_weights: [1.0, 0.7, 0.5, 0.3]
 18. MDD 正确读取 HAMD；
 19. checkpoint 正常保存和恢复；
 20. persistence baseline 输出正确；
-21. 训练入口只接受下一时间点任务，其他任务检查点被拒绝。
+21. old task mode 仍可启动。
 
 ---
 
@@ -1595,10 +1695,10 @@ BOLD + SC + HAMD
 
 ---
 
-# 39. Checkpoint Protocol
+# 39. Checkpoint Compatibility
+> **实现状态（2026-09-28）：【已实现】** `--load_backbone_only True` 只加载主干键，预测头/MoE/条件模块重新初始化，显式打印 loaded / missing / incompatible / reinitialized 四类清单；同口径（next_timepoint → next_timepoint）预训练→微调可完整加载，跨口径由 `check_pretrain_config_compat` 报错。
 
-检查点必须声明下一时间点任务，并记录架构配置与被试划分。
-其他任务的检查点直接拒绝加载。
+ForecastHead 改变后，旧 checkpoint 很可能不能完整加载。
 
 禁止简单：
 
@@ -1608,14 +1708,20 @@ strict=False
 
 然后静默忽略大量权重。
 
-HC 预训练权重加载到 MDD 模型时，打印：
+应明确支持：
+
+```text
+load_backbone_only
+```
+
+并打印：
 
 - successfully loaded parameters；
 - missing parameters；
 - reinitialized modules；
 - incompatible parameters。
 
-同阶段检查点必须完整匹配；新增病理模块在 HC→MDD 阶段显式初始化。
+旧 ForecastHead 不兼容时，应显式重新初始化。
 
 ---
 
@@ -1663,6 +1769,7 @@ train/loss_t+8
 ---
 
 # 41. Checkpoint Selection
+> **实现状态（2026-09-28）：【已实现】** checkpoint 判据 = val next-state MAE（日志同时打印与 persistence 的 ΔMAE），未使用单纯 PCC。
 
 第一阶段建议使用：
 
@@ -1759,21 +1866,21 @@ long free rollout
 
 数学上：
 
-\[
+$$
 p(x_{t+1}\mid x_{\leq t},SC)
-\]
+$$
 
 进一步：
 
-\[
+$$
 p(x_{t+1}\mid x_{\leq t},SC,HAMD)
-\]
+$$
 
 最终希望扩展：
 
-\[
+$$
 p(x_{t+1:t+H}\mid x_{\leq t},SC,HAMD)
-\]
+$$
 
 ---
 
@@ -1812,6 +1919,7 @@ Counterfactual Brain Trajectory
 ---
 
 # 45. 本轮重构的最终边界
+> **实现状态（2026-09-28）：【已实现】** 「本轮必须完成」清单已全部落地；「暂缓」清单（Sequential MTP、复杂概率预测、连续时间 GraphODE 重写、干预模拟、临床反事实）仍按计划暂缓。
 
 本轮必须完成：
 
@@ -1859,36 +1967,36 @@ next whole-brain state
 
 即：
 
-\[
+$$
 \boxed{
 x_{t-K+1:t},SC
 \rightarrow
 x_{t+1}
 }
-\]
+$$
 
 MDD：
 
-\[
+$$
 \boxed{
 x_{t-K+1:t},SC,HAMD
 \rightarrow
 x_{t+1}
 }
-\]
+$$
 
 推荐默认采用：
 
-\[
+$$
 \boxed{
 \hat{x}_{t+1}
 =
 x_t+\Delta\hat{x}_t
 }
-\]
+$$
 
 训练阶段首先学习稳定的 next-state transition；
 
 评估阶段使用 free autoregressive rollout 检查长期动力学；
 
-后续通过 MTP、rollout loss、真实 \(\Delta t\) GraphODE 和 intervention simulation 逐步扩展为更加完整的个体化数字孪生脑模型。
+后续通过 MTP、rollout loss、真实 $\Delta t$ GraphODE 和 intervention simulation 逐步扩展为更加完整的个体化数字孪生脑模型。

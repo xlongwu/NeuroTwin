@@ -61,7 +61,6 @@ backbone_lr_scale=0.2
 ARGS=(
   # ---- 基础与路径 ----
   --mode finetune
-  --model_arch tfm
   --seed "$seed"
   --data_root "$data_root"
   --checkpoint_dir "$checkpoint_dir"

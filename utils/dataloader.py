@@ -88,7 +88,7 @@ def read_mat_array(path, preferred_keys=None) -> np.ndarray:
 #      训练：随机 (K, t) → history = series[:, t-K+1 : t+1]   [F, 1, K]
 #                          target  = series[:, t + offsets]     [F, H]
 #      其中整段 context 作为**单个窗口**（W=1）、K 个 TR 作为该窗口的时间轴（S=K），
-#      因此主干（BrainMDM 时间卷积 / GraphODE / 预测头）无需改写，只依赖 S 轴的
+#      因此主干无需改写，只依赖 S 轴的
 #      变长前缀切片；同一 batch 内 K 一致（按 K 分桶），不引入 padding。
 #      offsets = forecast_offsets（默认 [1] = 预测下一个 TR；MTP 时如 [1,2,4,8]）。
 # ══════════════════════════════════════════════════════════════════════════

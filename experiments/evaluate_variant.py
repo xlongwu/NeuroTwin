@@ -6,7 +6,7 @@ analysis/next_point_eval.py：next-state 主指标 + persistence/trend/AR(1) bas
 free rollout + FC/频谱。
 
 关键点（模型重建口径）：
-  构造 NeuroTwin 若只传部分参数，结构性变体（head_shape_mode/moe_experts_mode/
+  构造 NeuroTwinTFM 若只传部分参数，结构性变体（tfm_patch_len/cpm_horizon/
   sc_prior_mode 等）会按默认结构建模导致权重错配。训练结束时
   save_backbone_weights 已把完整 vars(args) 存进 ckpt['config']['args']
   （train/optim.py），因此这里从该快照 + inspect.signature 自省重建与训练
@@ -26,43 +26,28 @@ import numpy as np
 import torch
 
 from analysis.metrics import NETWORK_GROUPS
-from models.neurotwin import NeuroTwin
 from models.tfm import NeuroTwinTFM
-from utils.common import parse_pred_quantiles, set_seed
+from utils.common import set_seed
 from utils.dataloader import NeuroTwinDataLoader
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
-# next_timepoint 任务（task_mode=next_timepoint）的模型维度来自 context/offset 配置，
-# 见 utils.common.resolve_task_dims 与 main.py 的同名解析逻辑
-_KWARG_ALIAS_NEXT_POINT = {
-    'features': 'num_rois',
-    'adapter_alpha': 'alpha',
-    # 评估期路由温度：训练结束时已退火到 temp_end（与 analysis/checkpoint.py 一致）
-    'moe_gate_temperature': 'moe_gate_temp_end',
-}
-# 由本函数显式控制的参数（不从 args 取）；pretrain_mode 由 args.mode 推导，
-# 保证 HC 预训练检查点也能按结构重建（旧的 pretrain 权重此前无法被评估）
-_KWARG_FIXED = {'pred_quantiles', 'refiner_return_rounds', 'pred_logvar_init'}
-
 
 def _next_point_model_dims(args) -> dict:
     """next_timepoint 的模型维度（与 main.py 的生效值一致）。
 
-    in_window=1（整段 context 作为单窗口）、pred_window=len(forecast_offsets)、
-    in_seq_len=context_max（S 轴建模宽度）、pred_seq_len=1（每个偏移 1 个时间点）。
-    TFM（model_arch=tfm）额外附 patch_len / cpm_horizon（结构签名分量）。
+    in_window=1（整段 context 作为单窗口）、pred_window=1（one-step 头只建模
+    +1 偏移）、in_seq_len=context_max（S 轴建模宽度）、pred_seq_len=1（每个偏移
+    1 个时间点）；另附 patch_len / cpm_horizon（结构签名分量）。
     """
-    from utils.common import resolve_forecast_offsets
     dims = {'in_window': 1,
-            'pred_window': len(resolve_forecast_offsets(args)),
+            'pred_window': 1,
             'in_seq_len': int(getattr(args, 'context_max')),
-            'pred_seq_len': 1}
-    if str(getattr(args, 'model_arch', 'legacy')) == 'tfm':
-        dims['model_arch'] = 'tfm'
-        dims['patch_len'] = int(args.tfm_patch_len)
-        dims['cpm_horizon'] = int(args.cpm_horizon)
+            'pred_seq_len': 1,
+            'model_arch': 'tfm',
+            'patch_len': int(args.tfm_patch_len),
+            'cpm_horizon': int(args.cpm_horizon)}
     return dims
 
 
@@ -78,37 +63,6 @@ def load_train_args(ckpt_path):
     return Namespace(**saved)
 
 
-def build_model_from_args(args, device):
-    """按 inspect.signature 自省从参数快照重建与训练一致的模型（legacy / tfm）。"""
-    model_arch = str(getattr(args, 'model_arch', 'legacy'))
-    if model_arch == 'tfm':
-        return _build_tfm_from_args(args, device)
-    sig = inspect.signature(NeuroTwin.__init__).parameters
-    alias, dims_override = _KWARG_ALIAS_NEXT_POINT, _next_point_model_dims(args)
-    kwargs = {}
-    for name, param in sig.items():
-        if name == 'self':
-            continue
-        if name in _KWARG_FIXED:
-            continue
-        if name in dims_override:
-            # 任务维度由 context/offset 配置推导，优先于快照中的同名键
-            kwargs[name] = dims_override[name]
-        elif name in alias and hasattr(args, alias[name]):
-            kwargs[name] = getattr(args, alias[name])
-        elif hasattr(args, name):
-            kwargs[name] = getattr(args, name)
-        else:
-            # 快照中缺失的参数（旧 checkpoint）回落模型默认值
-            if param.default is inspect.Parameter.empty:
-                raise ValueError(f'参数快照缺少必填构造参数：{name}')
-    # 训练阶段的 mode 决定模型是否带病理条件模块（MoE / AdaLN / 归一化器）：
-    # finetune 权重 → pretrain_mode=False（与旧行为一致），HC 预训练权重 → True
-    kwargs['pretrain_mode'] = (str(getattr(args, 'mode', 'finetune')) == 'pretrain')
-    kwargs['pred_quantiles'] = parse_pred_quantiles(args.pred_quantiles)
-    return NeuroTwin(**kwargs).to(device)
-
-
 # NeuroTwinTFM 构造参数 → 训练快照键的别名（其余同名参数直接取自快照）
 _KWARG_ALIAS_TFM = {
     'features': 'num_rois',
@@ -118,13 +72,17 @@ _KWARG_ALIAS_TFM = {
     'num_heads': 'tfm_heads',
     'ff_ratio': 'tfm_ff_ratio',
     'one_step_hidden_dim': 'tfm_one_step_hidden_dim',
-    'use_patho_cond': 'tfm_use_patho_cond',
     'use_revin': 'norm',
 }
 
 
-def _build_tfm_from_args(args, device):
-    """按 NeuroTwinTFM 的构造签名从参数快照重建 TFM 模型。"""
+def build_model_from_args(args, device):
+    """按 inspect.signature 自省从参数快照重建与训练一致的 NeuroTwinTFM。"""
+    model_arch = str(getattr(args, 'model_arch', 'tfm'))
+    if model_arch != 'tfm':
+        raise ValueError(
+            f"checkpoint 的 model_arch='{model_arch}'：legacy NeuroTwin 架构已移除，"
+            "无法重建该模型。请改用 NeuroTwinTFM（model_arch=tfm）的 checkpoint。")
     sig = inspect.signature(NeuroTwinTFM.__init__).parameters
     kwargs = {}
     for name, param in sig.items():
@@ -133,7 +91,7 @@ def _build_tfm_from_args(args, device):
         if name == 'features':
             kwargs[name] = int(args.num_rois)
         elif name == 'context_max':
-            # 任务维度由配置推导，优先于快照中的同名键（与 legacy 路径一致）
+            # 任务维度由配置推导，优先于快照中的同名键
             kwargs[name] = int(getattr(args, 'context_max'))
         else:
             alias = _KWARG_ALIAS_TFM.get(name, name)
@@ -141,6 +99,8 @@ def _build_tfm_from_args(args, device):
                 kwargs[name] = getattr(args, alias)
             elif param.default is inspect.Parameter.empty:
                 raise ValueError(f'参数快照缺少必填构造参数：{name}')
+    # 训练阶段的 mode 决定模型是否带病理条件模块（FiLM / 归一化器）：
+    # finetune 权重 → pretrain_mode=False，HC 预训练权重 → True
     kwargs['pretrain_mode'] = (str(getattr(args, 'mode', 'finetune')) == 'pretrain')
     return NeuroTwinTFM(**kwargs).to(device)
 
@@ -185,9 +145,7 @@ def build_eval_loader(args, eval_split, refresh_split_manifest=False):
             getattr(args, 'eval_rollout_tasks_per_subject', 2)),
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
-        eval_all_future_steps=(int(getattr(args, 'cpm_horizon', 0) or 0)
-                               if str(getattr(args, 'model_arch', 'legacy')) == 'tfm'
-                               else 0),
+        eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
     )
     if eval_split == 'test':
         return loader.get_test(), loader.get_test_subjects()
@@ -257,7 +215,7 @@ def compute_fc_metrics(pred, target, eps=1e-6):
 
 
 def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=2024,
-                        device=None, run_shuffled=True, save_arrays=False,
+                        device=None, save_arrays=False,
                         eval_rollout=None, eval_fc=None, eval_spectral=None,
                         spectral_tr=None, refresh_split_manifest=False,
                         compute_importance=False, importance_max_tasks=256,
@@ -312,9 +270,7 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
             extra_report=extra, ar1=ar1, compute_importance=compute_importance,
             importance_max_tasks=importance_max_tasks,
             importance_permutations=importance_permutations,
-            importance_fdr_alpha=importance_fdr_alpha,
-            run_shuffled=bool(run_shuffled), base_loader=loader,
-            shuffle_seed=int(seed))
+            importance_fdr_alpha=importance_fdr_alpha)
         summary.update(npe.summarize(report))
         if split == 'test':
             first = f"t+{report['protocol']['forecast_offsets'][0]}"
@@ -327,7 +283,7 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
 
 
 def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
-             run_shuffled=True, device=None, visualize=False,
+             device=None, visualize=False,
              compute_feature_importance=False, save_arrays=False,
              refresh_split_manifest=False, eval_rollout=None, eval_fc=None,
              eval_spectral=None, spectral_tr=None,
@@ -337,8 +293,8 @@ def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
 
     从 checkpoint 的 config.args 快照自省重建模型，转发到 evaluate_next_point。
     ``compute_feature_importance=True`` 时额外产 ``feature_importance_<split>.json``
-    （ROI 置换重要性 + BH-FDR 显著脑区）；``visualize`` 依赖旧单窗口 [B,F,W,S] 口径
-    的 visualizer，暂不支持，传入 True 时显式报错。
+    （ROI 置换重要性 + BH-FDR 显著脑区）；``visualize`` 已随旧版可视化组件移除，
+    传入 True 时显式报错。
     """
     _args = load_train_args(ckpt_path)
     task_mode = str(getattr(_args, 'task_mode', 'next_timepoint'))
@@ -347,11 +303,11 @@ def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
             f"仅支持 task_mode=next_timepoint 的 checkpoint，收到 '{task_mode}'")
     if visualize:
         raise ValueError(
-            'next_timepoint 任务暂不支持 --visualize（旧可视化基于 [B,F,W,S] 单窗口径）；'
+            '--visualize 已随旧可视化组件移除；'
             '请用 analysis/visualize_roi_importance.py 与 analysis/visualize_sig_region.py。')
     return evaluate_next_point(
         ckpt_path, out_dir, _args, eval_splits=eval_splits, seed=seed, device=device,
-        run_shuffled=run_shuffled, save_arrays=save_arrays,
+        save_arrays=save_arrays,
         eval_rollout=eval_rollout, eval_fc=eval_fc, eval_spectral=eval_spectral,
         spectral_tr=spectral_tr, refresh_split_manifest=refresh_split_manifest,
         compute_importance=compute_feature_importance,
@@ -367,7 +323,6 @@ def main():
     ap.add_argument('--splits', default='test',
                     help='评估划分（逗号分隔）；默认只评 test，需要 val 时显式传入')
     ap.add_argument('--seed', type=int, default=2024)
-    ap.add_argument('--no_shuffled', action='store_true')
     ap.add_argument('--save_arrays', action='store_true',
                     help='保存预测数组 predictions_<split>.npz')
     ap.add_argument('--refresh_split_manifest', action='store_true',
@@ -397,7 +352,7 @@ def main():
                     help='BH-FDR 显著脑区阈值（默认 0.05）')
     ns = ap.parse_args()
     summary = evaluate(ns.ckpt, ns.out_dir, tuple(ns.splits.split(',')),
-                       seed=ns.seed, run_shuffled=not ns.no_shuffled,
+                       seed=ns.seed,
                        save_arrays=ns.save_arrays,
                        refresh_split_manifest=ns.refresh_split_manifest,
                        eval_rollout=ns.rollout, eval_fc=ns.fc,

@@ -54,7 +54,6 @@ lr_final=5e-5
 ARGS=(
   # ---- 基础与路径 ----
   --mode pretrain
-  --model_arch tfm
   --seed "$seed"
   --data_root "$data_root"
   --checkpoint_dir "$checkpoint_dir"
