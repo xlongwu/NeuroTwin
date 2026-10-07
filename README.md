@@ -305,7 +305,6 @@ python analysis/analyze_low_pcc_samples.py \
 | --- | --- |
 | [docs/NeuroTwinTFM_模型结构流程图.png](docs/NeuroTwinTFM_模型结构流程图.png) | TFM 主干结构流程图 |
 | [docs/Version3_docs_1003/NeuroTwin_TimesFM3_改进方案.md](docs/Version3_docs_1003/NeuroTwin_TimesFM3_改进方案.md) | TFM 设计方案（§30 V1 四项改动 + 双头 + 条件化协议） |
-| [docs/Version3_docs_1003/G30_TFM消融实验总结_20261005.md](docs/Version3_docs_1003/G30_TFM消融实验总结_20261005.md) | G30_TFM 9 变体消融结论（patch_len 最优、HAMD 条件等） |
 | docs/Version0-2 版本文档目录 | 历史（legacy 主干时代）架构与机理档案，仅供追溯；所述模块已随 legacy 移除 |
 
 ## 任务口径：Next-Timepoint Prediction（连续 BOLD → 下一 TR 全脑状态）

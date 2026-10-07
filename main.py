@@ -729,8 +729,7 @@ def parse_args():
     p.add_argument('--tfm_heads', type=int, default=4,
                    help='TFM temporal/ROI attention 的头数。')
     p.add_argument('--tfm_patch_len', type=int, default=8,
-                   help='TFM temporal patch 长度 p（G30_TFM 消融：p=8 最优，'
-                        '详见 docs/Version3_docs_1003/G30_TFM消融实验总结_20261005.md）。'
+                   help='TFM temporal patch 长度 p，须与 checkpoint 保存的结构一致。'
                         'K 不是 p 的整数倍时开头补零对齐。')
     p.add_argument('--tfm_ff_ratio', type=int, default=4,
                    help='TFM FFN 隐层扩张倍数（ff_dim = ff_ratio × dim）。')
