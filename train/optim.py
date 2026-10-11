@@ -2,6 +2,7 @@
 """优化器、调度器、EMA 与预训练权重加载等训练基础设施。"""
 import os
 from copy import deepcopy
+from typing import List
 
 import torch
 from torch.optim import AdamW
@@ -304,6 +305,254 @@ def _iter_tfm_pathology_moe_modules(model):
             yield module
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  条件参数登记、冻结校验与显式迁移（v1 revised §8 / §11）
+# ══════════════════════════════════════════════════════════════════════════
+
+def conditioning_param_names(model) -> List[str]:
+    """列出所有条件适配器参数名（顶层模块携带 ``is_conditioning_adapter``）。
+
+    逐名校验（验收 L）依赖这份清单：冻结期可训练集合、optimizer 参数组、去重和
+    numel 都必须与之对应；新增顶层条件模块若忘记打标，会在此处暴露为「未登记」。
+    """
+    prefixes = conditioning_module_prefixes(model)
+    names = []
+    for pname, _ in model.named_parameters():
+        parts = pname.split('.')
+        for i in range(len(parts) - 1, 0, -1):
+            if '.'.join(parts[:i]) + '.' in prefixes:
+                names.append(pname)
+                break
+    return sorted(names)
+
+
+def conditioning_module_prefixes(model) -> set:
+    """条件适配器模块的键前缀集合（用**模块路径**，不是参数首段）。
+
+    必须按完整模块路径取前缀：``one_step_head.film`` 才是适配器，而同级的
+    ``one_step_head.transition`` / ``.decode`` 是无条件主干部件。若退化成
+    ``one_step_head.`` 会把主干键也当成「预期新增」，让迁移器失去拦截结构漂移
+    的能力。
+    """
+    out = set()
+    for mod_name, module in model.named_modules():
+        if getattr(module, 'is_conditioning_adapter', False) and mod_name:
+            out.add(mod_name + '.')
+    return out
+
+
+def param_report(model, optimizer=None) -> dict:
+    """登记实际参数量（方案 §11：不硬套旧方案的 35040/36388 等数字）。"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    cond_names = set(conditioning_param_names(model))
+    cond_total = sum(p.numel() for n, p in model.named_parameters() if n in cond_names)
+    cond_trainable = sum(p.numel() for n, p in model.named_parameters()
+                         if n in cond_names and p.requires_grad)
+    opt_total = (sum(p.numel() for g in optimizer.param_groups for p in g['params'])
+                 if optimizer is not None else None)
+    opt_distinct = (len({id(p) for g in optimizer.param_groups for p in g['params']})
+                    if optimizer is not None else None)
+    return {
+        'total': int(total),
+        'trainable': int(trainable),
+        'conditioning': int(cond_total),
+        'conditioning_trainable': int(cond_trainable),
+        'rho_conditioning': float(cond_total / total) if total else 0.0,
+        'optimizer_numel': opt_total,
+        'optimizer_distinct_tensors': opt_distinct,
+    }
+
+
+def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=False):
+    """校验条件参数：全部进入优化器、无重复、numel 一致（验收 L）。
+
+    同时检查「解冻后不会永久静默冻结」：条件模块的参数在冻结与解冻两态都必须
+    出现在优化器参数组里，否则说明分阶段解冻漏掉了新增顶层模块。
+    """
+    cond = conditioning_param_names(model)
+    named = dict(model.named_parameters())
+    in_opt = {}
+    for gi, g in enumerate(optimizer.param_groups):
+        for p in g['params']:
+            in_opt.setdefault(id(p), []).append(gi)
+    dup = {k: v for k, v in in_opt.items() if len(v) > 1}
+    problems = []
+    missing, untrainable = [], []
+    for n in cond:
+        p = named[n]
+        if not p.requires_grad:
+            untrainable.append(n)
+        elif id(p) not in in_opt:
+            missing.append(n)
+    cond_numel = sum(named[n].numel() for n in cond if named[n].requires_grad)
+    opt_cond_numel = sum(named[n].numel() for n in cond
+                         if named[n].requires_grad and id(named[n]) in in_opt)
+    if missing:
+        problems.append(f'条件参数未进入优化器（{len(missing)} 个，例如 {missing[:5]}）')
+    if untrainable:
+        problems.append(f'条件参数 requires_grad=False（{len(untrainable)} 个，例如 '
+                        f'{untrainable[:5]}）；冻结期条件模块必须可训练')
+    if dup:
+        problems.append(f'优化器存在重复参数（{len(dup)} 个张量出现在多个参数组）')
+    if cond_numel != opt_cond_numel:
+        problems.append(f'条件参数 numel 不一致：应训练 {cond_numel}，实入优化器 '
+                        f'{opt_cond_numel}')
+    if expect_frozen_backbone:
+        backbone_trainable = sum(1 for n, p in named.items()
+                                 if p.requires_grad and n not in set(cond))
+        if backbone_trainable:
+            problems.append(f'冻结期主干仍可训练（{backbone_trainable} 个参数）')
+    if problems:
+        raise RuntimeError('[条件参数校验] 失败：\n  - ' + '\n  - '.join(problems))
+    return {'conditioning_params': len(cond), 'conditioning_numel': int(cond_numel),
+            'optimizer_groups': [g.get('name', f'g{i}')
+                                 for i, g in enumerate(optimizer.param_groups)]}
+
+
+def classify_checkpoint_keys(model_state, ckpt_state, conditioning_prefixes):
+    """把模型键分为 loaded / new_initialized / zero_expanded / skipped / missing。
+
+    ``conditioning_prefixes`` 为条件模块的键前缀集合：它们**预期**不出现在旧
+    checkpoint 中（新增结构），其余键缺失即视为语义问题（结构漂移），必须报错
+    而不是静默随机初始化。
+    """
+    loaded, new_initialized, missing, skipped = [], [], [], []
+    for k, v in model_state.items():
+        src = ckpt_state.get(k, None)
+        if src is None:
+            if any(k.startswith(p) for p in conditioning_prefixes):
+                new_initialized.append(k)
+            else:
+                missing.append(k)
+        elif tuple(src.shape) != tuple(v.shape):
+            # 同宽度但语义变化也会被 layout_hash 拦下；这里按形状冲突归类
+            missing.append(f'{k} (shape {tuple(src.shape)}→{tuple(v.shape)})')
+        else:
+            loaded.append(k)
+    skipped = sorted(k for k in ckpt_state if k not in model_state)
+    return {'loaded': loaded, 'new_initialized': new_initialized,
+            'missing': missing, 'skipped': skipped}
+
+
+def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
+                                  arch_policy='require_match',
+                                  zero_expanded_keys=(), layout_expect=None,
+                                  layout_saved=None):
+    r"""显式迁移器：旧 checkpoint → 新结构，逐键归类并汇报（方案 §8）。
+
+    与「``strict=False`` + shape 过滤」不同，本函数把每个键归入
+    ``loaded / copied / new_initialized / zero_expanded / skipped / missing``
+    六类之一，任何**未分类**的键或语义冲突都直接报错：
+
+    - ``loaded/copied``：同名同形状，逐位复制；
+    - ``new_initialized``：新增条件模块的参数（旧文件里没有，属预期）；
+    - ``zero_expanded``：调用方显式声明「按零初始化扩展」的键（例如给已有 FiLM
+      追加调制维度），必须列在白名单里，否则报错；
+    - ``skipped``：checkpoint 有、模型没有的键（旧模块被移除）；
+    - ``missing``：模型有、checkpoint 没有、且**不属于**条件模块的键 → 结构漂移，
+      报错。
+
+    ``layout_expect`` / ``layout_saved``：条件向量的 ``layout_hash``。**字段顺序
+    参与哈希**，因此「同宽度但字段顺序变化」也会被拒绝（验收 K）。
+    """
+    if arch_policy not in ARCH_POLICIES:
+        raise ValueError(f"Unsupported arch_policy '{arch_policy}'")
+    if layout_expect and layout_saved and str(layout_expect) != str(layout_saved):
+        raise RuntimeError(
+            f'条件布局冲突：checkpoint layout_hash={layout_saved} 与当前运行 '
+            f'{layout_expect} 不一致。字段名称/顺序/来源列/类别词表任一变化都会改变'
+            f'哈希；即使宽度相同也**拒绝加载**（否则同 shape 的列会被静默错位复用）。')
+
+    ckpt = torch.load(pretrained_path, map_location=device)
+    state, arch_version, config = unwrap_state_dict(ckpt)
+    fname = os.path.basename(str(pretrained_path))
+    if arch_version is None:
+        print(f'提示: {fname} 无 arch_version，按 {LEGACY_ARCH_VERSION} 处理。')
+        arch_version = LEGACY_ARCH_VERSION
+    if arch_version != ARCH_VERSION:
+        msg = (f'架构版本不匹配: checkpoint arch_version={arch_version}, '
+               f'当前 ARCH_VERSION={ARCH_VERSION}')
+        if arch_policy == 'require_match':
+            raise RuntimeError(
+                msg + '。请使用显式迁移入口或重新预训练；'
+                      '如需按 shape 强制加载（不推荐），传 --pretrained_arch_policy warn。')
+        if arch_policy == 'ignore':
+            print(msg + '：arch_policy=ignore，跳过加载。')
+            return {'loaded': 0, 'copied': 0, 'new_initialized': [],
+                    'zero_expanded': [], 'skipped': sorted(state), 'missing': [],
+                    'arch_version': arch_version}
+        print('警告: ' + msg + '（arch_policy=warn：继续迁移）')
+
+    cond_prefixes = tuple(sorted(conditioning_module_prefixes(model)))
+    model_state = model.state_dict()
+    cls = classify_checkpoint_keys(model_state, state, cond_prefixes)
+    zero_expanded = [k for k in cls['new_initialized'] if k in set(zero_expanded_keys)]
+    plain_new = [k for k in cls['new_initialized'] if k not in set(zero_expanded_keys)]
+    # zero_expanded 键允许在 checkpoint 中存在但形状不同（按零填充扩展）
+    shape_conflicts = [k for k in cls['missing'] if ' (shape ' in k]
+    hard_missing = [k for k in cls['missing'] if ' (shape ' not in k]
+    unknown_keys = sorted(set(zero_expanded_keys) - set(cls['new_initialized']))
+    if hard_missing:
+        raise RuntimeError(
+            f'迁移失败：{len(hard_missing)} 个非条件键在 checkpoint 中缺失'
+            f'（例如 {hard_missing[:5]}）。这表示主干结构发生了变化，不应静默随机初始化。')
+    if shape_conflicts:
+        raise RuntimeError(
+            f'迁移失败：{len(shape_conflicts)} 个键形状冲突（例如 {shape_conflicts[:3]}）；'
+            f'同宽度不同语义的权重不可复用，需要显式 --zero_expanded_keys 声明的'
+            f'零扩展迁移。')
+    if unknown_keys:
+        raise RuntimeError(
+            f'--zero_expanded_keys 含未在预期新增集合中的键（{unknown_keys[:5]}）；'
+            f'未分类键必须报错，不能静默处理。')
+
+    filtered = {k: state[k] for k in cls['loaded']}
+    model_state.update(filtered)
+    model.load_state_dict(model_state)
+    report = {
+        'loaded': len(cls['loaded']), 'copied': len(cls['loaded']),
+        'new_initialized': plain_new, 'zero_expanded': zero_expanded,
+        'skipped': cls['skipped'], 'missing': cls['missing'],
+        'arch_version': arch_version, 'file': fname,
+    }
+    print(f"[migrate] {fname}（arch_version={arch_version}）| loaded/copied="
+          f"{report['loaded']} | new_initialized={len(plain_new)} | "
+          f"zero_expanded={len(zero_expanded)} | skipped={len(cls['skipped'])} | "
+          f"missing={len(cls['missing'])}")
+    if plain_new:
+        print(f"[migrate] 新增条件键示例: {plain_new[:5]}")
+    return report
+
+
+def unfreeze_while_preserving_state(model, optimizer, args):
+    """训练中途解冻主干，但**保留已训练条件参数的 Adam 状态与 LR 进度**。
+
+    旧写法是解冻后重建 optimizer + scheduler：AdamW 重建会让条件参数已积累的
+    ``exp_avg`` / ``exp_avg_sq`` 全部丢失，且 scheduler 从 warmup 重新开始，等于
+    把解冻前的条件训练进度抹掉（默认 freeze_backbone_epochs=10 < warmup_epochs=15
+    时每次运行都会发生）。这里改为只把新可训练的参数**追加**进现有 param group。
+
+    返回 ``(added_numel, group_names)``，供调用方打印可核对的证据。
+    """
+    existing = {id(p) for g in optimizer.param_groups for p in g['params']}
+    added_groups, added_numel = [], 0
+    for group in get_param_groups(model, args):
+        fresh = [p for p in group['params'] if id(p) not in existing]
+        if fresh:
+            # 沿用组名与 LR：已存在的组不重建，避免任何 Adam 状态被丢弃
+            target = next((g for g in optimizer.param_groups
+                           if g.get('name') == group.get('name')), None)
+            if target is not None:
+                target['params'].extend(fresh)
+            else:
+                added_groups.append(group)
+            added_numel += sum(p.numel() for p in fresh)
+    for group in added_groups:
+        optimizer.add_param_group(group)
+    return added_numel, [g.get('name') for g in optimizer.param_groups]
+
+
 def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
     """微调分阶段训练：默认训练条件模块（病理 FiLM / 病理 MoE），backbone_unfrozen 后解冻主干。"""
     for p in model.parameters():
@@ -327,9 +576,11 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
 def get_param_groups(model: NeuroTwinTFM, args):
     """按模式划分参数组。
 
-    - pretrain: 单组 'all'
-    - finetune: 'backbone' / 'adapter'（条件模块）/ 'tfm_moe'（TFM 病理残差
-      专家，RECC 方案 §45：lr = lr_peak × tfm_moe_lr_scale），各自独立学习率
+    - pretrain: 单组 'all'（HC 预训练允许条件模块，此时条件参数随主干一起训练）
+    - finetune: 'backbone' / 'condition'（条件模块：独立编码器、融合、FiLM、
+      条件 norm、门控残差/低秩）/ 'tfm_moe'，各自独立学习率。
+      条件组 LR 倍率取 ``condition_lr_scale``（方案 §11.2 的搜索维度），
+      未提供时回退历史 ``adapter_lr_scale`` 以保持旧配置可复现。
     """
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if args.mode == 'pretrain':
@@ -351,14 +602,16 @@ def get_param_groups(model: NeuroTwinTFM, args):
     backbone_p = [p for _, p in named
                   if id(p) not in adapter_ids and id(p) not in moe_ids]
 
+    cond_scale = getattr(args, 'condition_lr_scale', None)
+    if cond_scale is None:
+        cond_scale = getattr(args, 'adapter_lr_scale', 1.0)
     groups = []
     if backbone_p:
         groups.append({'params': backbone_p,
                        'lr': args.lr_peak * args.backbone_lr_scale, 'name': 'backbone'})
     if adapter_p:
         groups.append({'params': adapter_p,
-                       'lr': args.lr_peak * getattr(args, 'adapter_lr_scale', 1.0),
-                       'name': 'adapter'})
+                       'lr': args.lr_peak * float(cond_scale), 'name': 'condition'})
     if moe_p:
         groups.append({'params': moe_p,
                        'lr': args.lr_peak * getattr(args, 'tfm_moe_lr_scale', 1.0),

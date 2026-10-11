@@ -627,15 +627,21 @@ def write_feature_importance(out_dir, split, result, offsets):
 #  §4 评估主流程
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_next_point_loader(args, split, refresh_split_manifest=False):
-    """按 checkpoint 的训练配置重建 next_timepoint DataLoader（被试级切分 manifest 复用）。"""
-    from main import parse_pathology_fields
+def build_next_point_loader(args, split, refresh_split_manifest=False,
+                            condition_bundle=None):
+    """按 checkpoint 的训练配置重建 next_timepoint DataLoader（被试级切分 manifest 复用）。
+
+    ``condition_bundle`` 为 checkpoint 的 ``config.condition``；提供时条件统计量走
+    **inherit**（逐位复用训练期 train-only 快照），不在评估侧重拟合。
+    """
+    from main import condition_loader_kwargs, parse_pathology_fields
     dims = resolve_task_dims(args)
     if dims['task_mode'] != 'next_timepoint':
         raise ValueError("build_next_point_loader 仅支持 task_mode=next_timepoint 的配置快照")
     horizons = eval_horizons(args)
     loader = NeuroTwinDataLoader(
         data_root=args.data_root, mode=args.mode, batch_size=args.batch_size,
+        **condition_loader_kwargs(args, condition_bundle),
         pathology_input_dim=args.pathology_input_dim,
         pathology_fields=parse_pathology_fields(args.pathology_fields),
         pathology_missing=args.pathology_missing,
@@ -668,9 +674,7 @@ def build_next_point_loader(args, split, refresh_split_manifest=False):
             getattr(args, 'eval_rollout_tasks_per_subject', 2)),
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
-        eval_all_future_steps=(int(getattr(args, 'cpm_horizon', 0) or 0)
-                               if str(getattr(args, 'model_arch', 'legacy')) == 'tfm'
-                               else 0),
+        eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
     )
     if split == 'test':
         return loader.get_test(), loader.get_test_subjects(), loader
@@ -679,26 +683,9 @@ def build_next_point_loader(args, split, refresh_split_manifest=False):
     raise ValueError(f"split 仅支持 val/test，收到 '{split}'")
 
 
-def remap_pathology(pathology: torch.Tensor, subj_ids, override: dict) -> torch.Tensor:
-    """按 subj_id 重映射 batch 内每个样本的病理评分（shuffled-HAMD 负对照）。
-
-    pathology: [B, D]（batch 原始评分）；subj_ids: 长度 B 的被试 ID；
-    override: {subj_id: 评分向量}。任一被试缺失即报错（不做静默兜底）。
-    """
-    rows = []
-    for sid in subj_ids:
-        vec = override.get(str(sid))
-        if vec is None:
-            raise KeyError(f'评分重映射缺少被试 {sid}（override 覆盖 {len(override)} 人）')
-        rows.append(torch.as_tensor(np.asarray(vec, dtype=np.float32),
-                                    device=pathology.device))
-    return torch.stack(rows, dim=0).to(pathology.dtype)
-
-
 @torch.no_grad()
 def run_inference(model, data_loader, device, offsets, rollout_steps,
-                  ar1=None, eval_rollout=True, collect_cpm=False,
-                  pathology_override=None):
+                  ar1=None, eval_rollout=True, collect_cpm=False):
     """跑一遍 next_state 评估集，收集模型/基线预测与 rollout 子集。
 
     返回 dict（numpy）：
@@ -712,11 +699,9 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         cpm_pred [N, F, Hc] / cpm_target [N, F, R] / cpm_mask [N, R]
                                        （仅 collect_cpm=True：TFM 的 CPM 头输出，
                                          要求评估视图为所有 anchor 提供 future）
-
-    ``pathology_override``：{subj_id: 评分向量}，非空时按被试替换 batch 内评分
-    （shuffled-HAMD 负对照；rollout 段同样使用替换后的评分）。
     """
     model.eval()
+    from main import _index_condition
     chunk = defaultdict(list)
     for batch in tqdm(data_loader, desc='[NextPoint eval]', leave=False):
         x = batch['x'].to(device, non_blocking=True)              # [B,F,1,K]
@@ -730,11 +715,18 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         pathology = batch.get('pathology_score', None)
         if pathology is not None:
             pathology = pathology.to(device, non_blocking=True)
-            if pathology_override is not None:
-                pathology = remap_pathology(pathology, batch['subj_id'],
-                                            pathology_override)
+        # 字段级条件注入（与 legacy 数值通路互斥；由 Dataset 是否产出 cond_z 决定）
+        cond = None
+        if 'cond_z' in batch:
+            cond = {
+                'cond_z': batch['cond_z'].to(device, non_blocking=True),
+                'cond_code': batch['cond_code'].to(device, non_blocking=True),
+                'cond_mask': batch['cond_mask'].to(device, non_blocking=True),
+            }
+            if 'subject_index' in batch:
+                cond['subject_index'] = batch['subject_index'].to(device, non_blocking=True)
 
-        pred, aux_info = model(x, sc, pathology)                  # [B,F,H,1]
+        pred, aux_info = model(x, sc, pathology, condition=cond)     # [B,F,H,1]
         pred = pred[:, :, :, 0]                                   # [B,F,H]
         bases = baseline_next_state(x_last, x_prev, offsets, ar1=ar1)
 
@@ -749,7 +741,18 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         chunk['cutoff'].append(batch['cutoff'].numpy())
         chunk['ctx_len'].append(batch['context_len'].numpy())
         if pathology is not None:
-            chunk['hamd'].append(pathology.detach().cpu().numpy().reshape(-1))
+            p_np = pathology.detach().cpu().numpy()
+            chunk['hamd'].append(np.asarray(p_np).reshape(p_np.shape[0], -1)[:, 0])
+        if cond is not None:
+            # 逐 anchor 的**矩阵**：绝不 reshape(-1)，否则行数会变成 anchor 数的 K 倍
+            # （把 [N, K] 当成 [N] 读是经典口径错误，方案 §14 明确要求避免）
+            for key in ('cond_z', 'cond_code', 'cond_mask'):
+                chunk[key].append(cond[key].detach().cpu().numpy())
+            if 'cond_raw' in batch:
+                chunk['cond_raw'].append(batch['cond_raw'].numpy())
+            if 'subject_index' in cond:
+                chunk['subject_index'].append(
+                    cond['subject_index'].detach().cpu().numpy())
 
         # ---- CPM 全 horizon 预测（TFM；评估视图须为所有 anchor 提供 future）----
         if collect_cpm:
@@ -774,7 +777,9 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                 hist = x[rf_gpu][:, :, 0, :].transpose(1, 2).contiguous()   # [n,K,F]
                 roll = model.rollout_next_states(
                     hist, sc[rf_gpu], (pathology[rf_gpu] if pathology is not None else None),
-                    steps=rollout_steps)                                # [n,R,F]
+                    steps=rollout_steps,
+                    condition=(_index_condition(cond, rf_gpu) if cond else None),
+                )                                                   # [n,R,F]
                 base_roll = baseline_rollout(x_last[rf_gpu], (x_last - x_prev)[rf_gpu],
                                              rollout_steps, ar1=ar1)
                 chunk['roll_pred'].append(roll.float().detach().cpu().numpy())
@@ -815,6 +820,24 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         'roll_cutoff': (np.concatenate(chunk['roll_cutoff'], axis=0)
                         if chunk['roll_cutoff'] else None),
     }
+    # ---- 字段级条件矩阵（按**字段名**读取，绝不假设第 0 列是 HAMD）----
+    conditioner = getattr(model, 'conditioner', None)
+    fields = list(conditioner.names) if conditioner is not None else []
+    data['condition_fields'] = fields
+    if chunk['cond_z']:
+        n_anchor = len(chunk['subj'])
+        for key in ('cond_z', 'cond_code', 'cond_mask', 'cond_raw', 'subject_index'):
+            if not chunk[key]:
+                continue
+            arr = np.concatenate(chunk[key], axis=0)
+            if arr.shape[0] != n_anchor:
+                raise AssertionError(
+                    f'条件数组 {key} 行数 {arr.shape[0]} != anchor 数 {n_anchor}；'
+                    '多字段评估必须保持 [N, K]，把 [N, K] 展平成 N*K 会让每个被试'
+                    '被计成 K 次（方案 §14 明确禁止 reshape(-1)）')
+            data[key] = arr
+        if chunk['cond_raw'] and 'HAMD' in fields:
+            data['hamd'] = data['cond_raw'][:, fields.index('HAMD')].astype(np.float64)
     if collect_cpm:
         data['cpm_pred'] = (np.concatenate(chunk['cpm_pred'], axis=0)
                             if chunk['cpm_pred'] else None)
@@ -858,8 +881,7 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
                    spectral_tr=2.0, save_arrays=False, n_params=None,
                    extra_report=None, ar1=None, compute_importance=False,
                    importance_max_tasks=256, importance_permutations=0,
-                   importance_fdr_alpha=0.05, run_shuffled=False,
-                   base_loader=None, shuffle_seed=2024):
+                   importance_fdr_alpha=0.05):
     """单个 split 的完整 next_timepoint 评估，落盘 metrics_<split>.json 与两个 csv。
 
     ``compute_importance=True`` 时额外做 ROI 置换重要性并落盘
@@ -870,11 +892,10 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
     horizons = eval_horizons(args)
     rollout_steps = eval_rollout_steps(args, horizons)
     fc_min_len = int(getattr(args, 'fc_min_length', 32))
-    is_tfm = (str(getattr(args, 'model_arch', 'legacy')) == 'tfm')
     cpm_horizon = int(getattr(args, 'cpm_horizon', 0) or 0)
     data = run_inference(model, data_loader, device, offsets, rollout_steps,
                          ar1=ar1, eval_rollout=eval_rollout,
-                         collect_cpm=is_tfm)
+                         collect_cpm=cpm_horizon > 0)
 
     pred, target, mask = data['pred'], data['target'], data['mask']
     subj_idx = np.array([str(s) for s in data['subj_ids']], dtype=object)
@@ -895,7 +916,7 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         'eval_context_length': (int(getattr(args, 'eval_context_length', 0) or 0)
                                 or int(args.context_max)),
         'forecast_offsets': list(offsets),
-        'prediction_target': str(getattr(args, 'prediction_target', 'delta')),
+        'prediction_target': 'delta_residual',
         'eval_anchors_per_subject': int(getattr(args, 'eval_anchors_per_subject', 16)),
         'rollout_steps': int(rollout_steps), 'rollout_horizons': list(horizons),
         'fc_min_length': fc_min_len,
@@ -995,8 +1016,8 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         report['rollout'] = {'enabled': False,
                              'reason': '--eval_rollout_tasks_per_subject <= 0 或 eval_rollout=False'}
 
-    # ---- CPM 全 horizon（TFM；非自回归一次输出 t+1..t+H，方案 §8）----
-    if is_tfm and data.get('cpm_pred') is not None:
+    # ---- CPM 全 horizon（非自回归一次输出 t+1..t+H，方案 §8）----
+    if data.get('cpm_pred') is not None:
         cpm_labels = [f'H{h}' for h in range(1, cpm_horizon + 1)]
         cpm_pred = data['cpm_pred'][:, :, :cpm_horizon]
         cpm_target = data['cpm_target'][:, :, :cpm_horizon]
@@ -1032,83 +1053,7 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         ])
     else:
         report['cpm_horizon'] = {'enabled': False,
-                                 'reason': ('仅 model_arch=tfm 且评估视图提供 '
-                                            'all_future_steps 时计算')}
-
-    # ---- shuffled-HAMD 负对照（方案 §24 Stage 4 / §25.4：条件通路是否真的被使用）----
-    # 做法：把评估集内各被试的病理评分随机置换后重跑推理（被试的 BOLD/SC 不变）。
-    # 若模型真在用条件，打乱评分应使指标变差（delta_MAE_shuffled_minus_true > 0）；
-    # delta ≈ 0 说明条件通路未被使用（或已饱和），需结合 no-HAMD 训练消融解释。
-    has_cond = getattr(model, 'pathology_normalizer', None) is not None
-    if run_shuffled and not has_cond:
-        report['shuffled_hamd'] = {'available': False,
-                                   'reason': '模型无条件通路（pretrain 或条件关闭）'}
-    elif run_shuffled and base_loader is None:
-        report['shuffled_hamd'] = {'available': False,
-                                   'reason': '未提供 base_loader（无法读取被试评分）'}
-    elif run_shuffled:
-        split_subjects = (base_loader.get_test_subjects() if split == 'test'
-                          else base_loader.get_val_subjects())
-        subj_score = [(s, base_loader.base_dataset.get_pathology_vector_by_subject(s))
-                      for s in split_subjects]
-        subj_score = [(s, np.asarray(v, dtype=np.float32))
-                      for s, v in subj_score if v is not None]
-        if len(subj_score) >= 2:
-            sids = [s for s, _ in subj_score]
-            vecs = [v for _, v in subj_score]
-            perm = np.random.RandomState(int(shuffle_seed)).permutation(len(sids))
-            override = {sids[i]: vecs[int(perm[i])] for i in range(len(sids))}
-            log.info('[shuffled-HAMD] 置换 %d 个被试的评分（seed=%d）重跑推理',
-                     len(sids), int(shuffle_seed))
-            data_shuf = run_inference(
-                model, data_loader, device, offsets, rollout_steps=0, ar1=ar1,
-                eval_rollout=False, collect_cpm=is_tfm,
-                pathology_override=override)
-            shuf_arrays = per_task_next_state(
-                data_shuf['pred'], data_shuf['target'], data_shuf['mask'],
-                anchor=data_shuf['x_last'])
-            shuf_agg = aggregate_columns(shuf_arrays, subj_idx, labels)
-            shuf_block = OrderedDict(
-                (label, blk) for label in labels
-                if (blk := _block_summary(shuf_agg, label)))
-            # 置换后的 next-state 指标与「真评分」结果的逐项差（>0 = 打伤）
-            shuf_report = OrderedDict([
-                ('available', True),
-                ('n_subjects', len(sids)), ('seed', int(shuffle_seed)),
-                ('model', shuf_block),
-                ('delta_shuffled_minus_true', {
-                    label: {
-                        'delta_MAE': float(
-                            shuf_block.get(label, {}).get('MAE', float('nan'))
-                            - _block_summary(agg, label).get('MAE', float('nan'))),
-                        'delta_PCC_spatial': float(
-                            shuf_block.get(label, {}).get('PCC_spatial', float('nan'))
-                            - _block_summary(agg, label).get('PCC_spatial', float('nan'))),
-                    } for label in labels}),
-                ('note', '把被试间病理评分随机置换后重评：条件通路真正被使用时'
-                         '指标应变差（delta_MAE > 0）；≈0 需结合 --tfm_use_patho_cond '
-                         'False 的训练消融判断条件是否生效'),
-            ])
-            # TFM 额外给 CPM 逐 horizon 的置换对照
-            if is_tfm and data_shuf.get('cpm_pred') is not None and cpm_horizon > 0:
-                shuf_cpm_arrays = per_task_next_state(
-                    data_shuf['cpm_pred'][:, :, :cpm_horizon],
-                    data_shuf['cpm_target'][:, :, :cpm_horizon],
-                    data_shuf['cpm_mask'][:, :cpm_horizon],
-                    anchor=data_shuf['x_last'])
-                shuf_cpm_agg = aggregate_columns(shuf_cpm_arrays, subj_idx, cpm_labels)
-                shuf_report['cpm'] = OrderedDict(
-                    (label, blk) for label in cpm_labels
-                    if (blk := _block_summary(shuf_cpm_agg, label)))
-                shuf_report['cpm_delta_shuffled_minus_true'] = {
-                    label: {'delta_MAE': float(
-                        shuf_report['cpm'].get(label, {}).get('MAE', float('nan'))
-                        - cpm_block.get(label, {}).get('MAE', float('nan')))}
-                    for label in cpm_labels if label in shuf_report['cpm']}
-            report['shuffled_hamd'] = shuf_report
-        else:
-            report['shuffled_hamd'] = {'available': False,
-                                       'reason': '有评分的被试不足 2 个'}
+                                 'reason': '评估视图提供 all_future_steps 时计算'}
 
     # ---- FC（rollout 轨迹；长度不足则不计算） ----
     if eval_fc and data['roll_pred'] is not None:
@@ -1196,6 +1141,14 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
                        base_arrays, subj_idx, labels)
     _write_task_csv(out_dir / f'per_task_metrics_{split}.csv', data, arrays, labels)
     if save_arrays:
+        extra = {}
+        # 条件矩阵按 [N, K] 原样落盘（**不展平**），字段名一并保存，供置换诊断、
+        # 缺失分层与逐被试复核复用（HAMD/HAMA 按字段名读取，不假设列序）
+        for key in ('cond_z', 'cond_code', 'cond_mask', 'cond_raw', 'subject_index'):
+            if data.get(key) is not None:
+                extra[key] = data[key]
+        extra['condition_fields'] = np.array(data.get('condition_fields', []),
+                                             dtype=object)
         np.savez_compressed(
             out_dir / f'predictions_{split}.npz',
             pred=pred, target=target, mask=mask, x_last=data['x_last'],
@@ -1207,7 +1160,8 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
             pred_ar1=data['baselines'].get('ar1'),
             rollout=(data['roll_pred'] if data['roll_pred'] is not None else []),
             rollout_target=(data['roll_target'] if data['roll_target'] is not None else []),
-            rollout_preds_ar1=data['roll_baselines'].get('ar1', []))
+            rollout_preds_ar1=data['roll_baselines'].get('ar1', []),
+            **extra)
     log.info('[next_timepoint] %s 评估完成 | next MAE=%.4f | spatial PCC=%.4f',
              split, model_block.get(labels[0], {}).get('MAE', float('nan')),
              model_block.get(labels[0], {}).get('PCC_spatial', float('nan')))
@@ -1230,7 +1184,11 @@ def _overall_block(agg, labels):
 
 
 def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
-    """被试级 CSV（论文统计的主口径：先被试内平均，再跨被试统计）。"""
+    """被试级 CSV（论文统计的主口径：先被试内平均，再跨被试统计）。
+
+    条件注入时逐字段值与有效性按**字段名**成列写出（不假设第 0 列是 HAMD），
+    并附真实缺失模式，供缺失分层与来源分层报告直接使用。
+    """
     subjects = sorted(set(str(s) for s in subj_idx))
     hamd_map, n_tasks = {}, {}
     for i, s in enumerate(subj_idx):
@@ -1238,11 +1196,25 @@ def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
         n_tasks[s] = n_tasks.get(s, 0) + 1
         if np.isfinite(data['hamd'][i]):
             hamd_map[s] = float(data['hamd'][i])
+    fields = list(data.get('condition_fields') or [])
+    raw = data.get('cond_raw')
+    msk = data.get('cond_mask')
+    cond_map, obs_map = {}, {}
+    if raw is not None and fields:
+        for i, s in enumerate(subj_idx):
+            s = str(s)
+            cond_map[s] = {name: (float(raw[i, j]) if np.isfinite(raw[i, j]) else float('nan'))
+                           for j, name in enumerate(fields)}
+            obs_map[s] = {name: int(msk[i, j] > 0) for j, name in enumerate(fields)} \
+                if msk is not None else {}
     rows = []
     for s in subjects:
         sel = subj_idx == s
         row = {'subject_id': s, 'hamd': hamd_map.get(s, float('nan')),
                'n_tasks': n_tasks[s]}
+        for j, name in enumerate(fields):
+            row[f'cond_{name}'] = cond_map.get(s, {}).get(name, float('nan'))
+            row[f'obs_{name}'] = obs_map.get(s, {}).get(name, -1)
         for i, label in enumerate(labels):
             for metric, arr in (('MAE', arrays['mae']), ('RMSE', arrays['rmse']),
                                 ('PCC_spatial', arrays['spatial_pcc']),
@@ -1257,6 +1229,7 @@ def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
                 row[f'{name}_{label}_MAE'] = float(col.mean()) if len(col) else float('nan')
         rows.append(row)
     cols = (['subject_id', 'hamd', 'n_tasks']
+            + sum(([f'cond_{name}', f'obs_{name}'] for name in fields), [])
             + [f'{label}_{m}' for label in labels
                for m in ('MAE', 'RMSE', 'PCC_spatial', 'R2')]
             + [f'{name}_{label}_MAE' for name in base_arrays for label in labels])
@@ -1321,13 +1294,6 @@ def summarize(report):
         for label, blk in cpm.get('model', {}).items():
             summary[f'{split}_cpm_mae_{label}'] = blk.get('MAE')
             summary[f'{split}_cpm_pcc_{label}'] = blk.get('PCC_spatial')
-    shuf = report.get('shuffled_hamd', {})
-    if shuf.get('available'):
-        shuf_blk = shuf.get('model', {}).get(first, {})
-        summary[f'{split}_shuffled_hamd_mae'] = shuf_blk.get('MAE')
-        summary[f'{split}_shuffled_hamd_pcc'] = shuf_blk.get('PCC_spatial')
-        summary[f'{split}_shuffled_delta_mae'] = (
-            shuf.get('delta_shuffled_minus_true', {}).get(first, {}).get('delta_MAE'))
     fc = report.get('fc', {}).get('model', {}) if isinstance(report.get('fc'), dict) else {}
     if isinstance(fc, dict) and fc.get('available'):
         summary[f'{split}_fc_upper_mae'] = fc.get('fc_mae')

@@ -2,28 +2,57 @@
 # ============================================================================
 # NeuroTwin-TFM 预训练（HC 队列，TimesFM-3 风格主干，方案 §30 V1）
 #
-# 用法：bash scripts/Pretrain_HC_tfm.sh
-#
 # 任务口径（方案 §16/§30）：连续 BOLD context [B,F,K]
 #   → temporal patching（p=4）→ SC-guided Temporal–Variate Block × N
 #   → One-Step 头（x̂_(t+1)，z_t→z_(t+1) 状态转移）
 #   + CPM 头（非自回归一次输出 x̂_(t+1:t+H)，H=8）
 # 损失（方案 §20）：L = λ_one·(Huber + λ_pcc·(1−PCC_sp)) + λ_cpm·(γ 加权逐 horizon Huber)
 #
-# ⚠️ 与 legacy（scripts/Pretrain_HC_next_point.sh）的权重互不兼容：
-#   检查点按 model_arch + patch_len + cpm_horizon 做任务口径签名校验。
+# 用法
+#   PYTHON="$HOME/anaconda3/envs/mamba/bin/python" bash scripts/Pretrain_HC_tfm.sh
+#   # 可选环境变量：
+#   #   CHECKPOINT_DIR=<输出目录>  默认 $ROOT/checkpoints（想隔离本轮产物就指到本轮目录）
+#   #   DEVICE=cuda:1              不给则沿用 main.py 的设备默认
+#   #   DATA_ROOT=<数据根目录>      默认 $ROOT/data
+#   #   PRINT_CMD=1                打印完整命令行（默认只打印关键参数摘要）
+#
+# 条件注入（2026-10-10 选定方案，见 TASK_HANDOFF §0.26）：HC 侧固定
+#   ``--condition_group hc3 --condition_arm demo``。hc3 只有共享三字段
+#   （Sex/Age/education），结构上不可能用融合臂（``build_condition_encoder`` 会直接拒），
+#   所以「cat」落在下游的 MDD 微调脚本里；两者共用同一个锚点宽度 C=32。
+#
+# ⚠️ 2026-10-10 起本轮不再有 study/fresh 身份闸门（`experiments/condition_study.py` 已删除，
+#   §0.27）：主干是否从随机初始化开始，完全由「本脚本不传 --pretrained_weight」这一事实保证，
+#   而不是由代码校验。产物是否落在本轮目录由 CHECKPOINT_DIR 决定，脚本不再强制。
+#
+# ⚠️ 与其它架构/任务口径的权重互不兼容：检查点按 model_arch + patch_len + cpm_horizon
+#   做任务口径签名校验，不匹配的组合会被加载端拦截。
 # ============================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-data_root="$ROOT/data"
-checkpoint_dir="$ROOT/checkpoints"
-name="neurotwin_tfm_pretrain"
+PYTHON_BIN="${PYTHON:-python}"
+data_root="${DATA_ROOT:-$ROOT/data}"
+checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
+DEVICE="${DEVICE:-}"
+# 本轮 HC 试次的固定目录名：下游 MDD 脚本按同一个名字找起点
+name="hc_demo"
 
 # ---- 实验规模（方案 §17 首选起点：D=256, N=4, patch=4, heads=4）----
-seed=2024
+# 随机来源（模型 seed / 采样 seed / Condition Dropout seed）只在
+# utils/condition_schema.py 登记一次，这里读出来用；脚本里抄字面量必然漂移。
+# 历史缺陷：本脚本曾把 --sampling_seed 直接写成 --seed 的同一个值（都是 2024），
+# 于是模型初始化流与采样流并成一条，方案 §四 的「分离」名存实亡。
+read -r seed sampling_seed cond_dropout_seed < <(
+  PYTHONPATH=. "$PYTHON_BIN" -c 'from utils.condition_schema import (DROPOUT_SEED, MODEL_SEED, SAMPLING_SEED); print(MODEL_SEED, SAMPLING_SEED, DROPOUT_SEED)') \
+  || { echo "[错误] $PYTHON_BIN 读取 utils.condition_schema 的随机来源常量失败（需 PYTHON=<≥3.10 且带 torch 的解释器>）" >&2; exit 1; }
+if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
+      || "$sampling_seed" == "$cond_dropout_seed" ]]; then
+  echo "[错误] 登记处自身的随机来源就不同值（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed），违反方案 §四" >&2
+  exit 1
+fi
 num_rois=116
 context_min=16
 context_max=64
@@ -54,7 +83,6 @@ lr_final=5e-5
 ARGS=(
   # ---- 基础与路径 ----
   --mode pretrain
-  --model_arch tfm
   --seed "$seed"
   --data_root "$data_root"
   --checkpoint_dir "$checkpoint_dir"
@@ -111,9 +139,37 @@ ARGS=(
   --amp True
   --num_workers 4
   --train_samples_per_subject 0    # 0=auto（每被试每 epoch min(合法组合数, 12)）
-  --sampling_seed "$seed"
+  --sampling_seed "$sampling_seed"
   # --refresh_split_manifest 是 store_true 开关（不接受取值），默认 False 不刷新
 )
 
-echo "[CMD] python -u main.py ${ARGS[*]}"
-python -u main.py "${ARGS[@]}"
+# ---- 本轮条件注入（选定方案：hc3 + demo）----
+ARGS+=(
+  --condition_group hc3 --condition_arm demo     # hc3 无新增字段，结构上只能用 demo
+  --cond_dropout_seed "$cond_dropout_seed"
+)
+# 宽度不在这里重复字面量：main.py 的 argparse 默认就是锚点
+# (d_demo=16, d_new=16, C=32, H_delta=64, delta_style=mlp, dropout_p=0, inject=heads)。
+# HC 侧**不带** --pretrained_weight：主干从随机初始化训练（方案 §一.1）。
+if [[ -n "$DEVICE" ]]; then
+  ARGS+=(--device "$DEVICE")
+fi
+
+# 生效参数已随 checkpoint 的 config.args 快照保存，完整命令行只在 PRINT_CMD=1 时打印。
+arg_value() {   # 从 ARGS 取开关取值，避免把同一个字面量抄进第二处
+  local key="--$1" i
+  for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    [[ ${ARGS[i]} == "$key" ]] && { echo "${ARGS[i + 1]}"; return 0; }
+  done
+}
+
+if [[ "${PRINT_CMD:-0}" == "1" ]]; then
+  echo "[CMD] $PYTHON_BIN -u main.py ${ARGS[*]}"
+else
+  echo "[CMD] main.py --mode $(arg_value mode) --name $(arg_value name)" \
+       "| condition=$(arg_value condition_group)/$(arg_value condition_arm)" \
+       "| epochs=$(arg_value train_epochs) bs=$(arg_value batch_size)" \
+       "| ckpt=$(arg_value checkpoint_dir)" \
+       "| ${#ARGS[@]} 个参数（PRINT_CMD=1 看完整命令行）"
+fi
+PYTHONPATH=. "$PYTHON_BIN" -u main.py "${ARGS[@]}"

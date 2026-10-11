@@ -7,6 +7,7 @@
 """
 import argparse
 import os
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -24,10 +25,13 @@ except Exception:
         def add_scalar(self, *args, **kwargs): return None
         def close(self): return None
 
-from utils.dataloader import NeuroTwinDataLoader
+from utils.dataloader import (CONDITION_FILE_BY_MODE, CONDITION_GROUP_BY_MODE,
+                              NeuroTwinDataLoader)
 from utils.common import (parse_int_list, resolve_forecast_offsets,
                           resolve_task_dims, set_seed, str2bool)
+from models.conditioning import ConditioningConfig
 from models.tfm import NeuroTwinTFM, TFM_CANDIDATE_SCHEMA
+from utils.condition_schema import DROPOUT_SEED, parse_extra_codes
 from train.losses import TFMDualLoss, compute_graph_regularization, spatial_pcc
 from train.tfm_coupling import (
     compute_tfm_coupling_diagnostics,
@@ -40,7 +44,9 @@ from train.tfm_coupling import (
 from train.optim import (ModelEMA, build_optimizer, build_scheduler,
                          check_pretrain_config_compat, count_trainable_params,
                          load_backbone_only, load_backbone_weights,
-                         save_backbone_weights, set_finetune_stage)
+                         migrate_pretrained_checkpoint, param_report,
+                         save_backbone_weights, set_finetune_stage,
+                         unfreeze_while_preserving_state)
 
 
 FILE = Path(__file__).resolve()
@@ -48,6 +54,61 @@ ROOT = FILE.parents[0]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  单行自适应进度条
+# ──────────────────────────────────────────────────────────────────────────
+
+#: {bar} 至少保留的列数；预算不足时裁剪指标而不是让整行折行。
+PBAR_MIN_BAR = 12
+#: 固定字段（百分比、计数分隔、耗时）的保守留白，按 'h:mm:ss' 形态的耗时取值。
+PBAR_OVERHEAD = 30
+
+
+def pbar_ncols() -> int:
+    """进度条整行的目标列宽。
+
+    重定向到文件/管道时 `shutil.get_terminal_size()` 走 `COLUMNS` → 80 的回退，
+    因此日志行宽与终端里一致，不会因为宽度未知而每次刷新另起一行。
+    """
+    return max(PBAR_MIN_BAR + PBAR_OVERHEAD,
+               min(int(shutil.get_terminal_size().columns), 120))
+
+
+def make_pbar(iterable, total: int, desc: str) -> tqdm:
+    """宽度自适应的单行进度条。
+
+    `tqdm` 的 `dynamic_ncols` 只收缩 `{bar}`：desc 与 postfix 一旦超过终端宽度，
+    整行仍然折行，表现为每个 iteration 打印一行。这里固定 `bar_format`（去掉变长的
+    remaining/rate 字段）、把 desc 截进宽度预算，并配合 :func:`pbar_metrics` 裁剪
+    指标，使整行始终占一行。
+    """
+    cols = pbar_ncols()
+    return tqdm(iterable, total=total, leave=False, ncols=cols,
+                dynamic_ncols=sys.stderr.isatty(), mininterval=0.5,
+                desc=desc[:max(8, cols - PBAR_OVERHEAD)],
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]{postfix}')
+
+
+def pbar_metrics(pbar: tqdm, **metrics) -> None:
+    """把指标拼成 `k=v` 串，并按剩余列宽从右往左丢弃放不下的项。
+
+    `tqdm` 会在字符串 postfix 前自动加 `', '`，因此预算里扣掉这 2 列。
+    """
+    cols = pbar.ncols if isinstance(pbar.ncols, int) else pbar_ncols()
+    count_w = max(len(str(pbar.total)), len(str(pbar.n)))
+    budget = (cols - PBAR_MIN_BAR - PBAR_OVERHEAD - count_w - 2
+              - len(str(pbar.desc or '')))
+    shown, used = [], 0
+    for name, value in metrics.items():
+        part = f'{name}={value}'
+        need = len(part) + (1 if shown else 0)
+        if used + need > budget:
+            break
+        shown.append(part)
+        used += need
+    pbar.set_postfix_str(' '.join(shown), refresh=False)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -59,6 +120,9 @@ def next_point_batch(batch, device):
 
     y 由 [B,F,H] 升维为 [B,F,H,1]（与模型输出 [B,F,H,1] 对齐）；x_last 为
     context 末位 x_t，target_mask [B,H] 标记各预测偏移是否有真值。
+
+    返回的 ``bp`` 是 **legacy 数值条件**（pathology_score）；字段级条件注入使用
+    :func:`condition_batch`，两者由模型显式互斥校验。
     """
     bx = batch['x'].to(device, non_blocking=True)                # [B,F,1,K]
     by = batch['y'].to(device, non_blocking=True).unsqueeze(-1)  # [B,F,H,1]
@@ -71,6 +135,124 @@ def next_point_batch(batch, device):
     if bp is not None:
         bp = bp.to(device, non_blocking=True)
     return bx, by, bl, bm, bs, bp
+
+
+#: 字段级条件批次的键（Dataset 在 condition_group 开启时产出）
+CONDITION_BATCH_KEYS = ('cond_z', 'cond_code', 'cond_mask', 'subject_index')
+
+
+def condition_batch(batch, device):
+    """把字段级条件张量搬到 device，返回模型 ``condition=`` 所需的 dict 或 None。
+
+    ``cond_raw`` 只服务诊断/置换对照，不进模型，因此这里刻意不透传。
+    三个必需键缺一即报错：静默降级成「无条件」会让对照臂悄悄变成不同的模型。
+    """
+    if 'cond_z' not in batch:
+        return None
+    missing = [k for k in ('cond_z', 'cond_code', 'cond_mask') if k not in batch]
+    if missing:
+        raise KeyError(f'条件批次缺少必需键 {missing}')
+    out = {
+        'cond_z': batch['cond_z'].to(device, non_blocking=True),
+        'cond_code': batch['cond_code'].to(device, non_blocking=True),
+        'cond_mask': batch['cond_mask'].to(device, non_blocking=True),
+    }
+    if 'subject_index' in batch:
+        out['subject_index'] = batch['subject_index'].to(device, non_blocking=True)
+    return out
+
+
+def _index_condition(cond, index):
+    """按布尔/整数索引切片条件批次（rollout 只取被选中的样本）。"""
+    if cond is None:
+        return None
+    return {k: (v[index] if torch.is_tensor(v) else v) for k, v in cond.items()}
+
+
+def condition_loader_kwargs(args, bundle=None):
+    """从 checkpoint 快照推导评估/推理 DataLoader 的条件参数（与训练同口径）。
+
+    ``bundle`` 提供训练期的 train-only 统计量 → 使用 ``inherit`` 模式**逐位复用**，
+    不在评估侧重拟合；缺少 bundle 时退回 ``fit``（用同一份划分与 seed 重新拟合，
+    结果应与训练一致，但会在日志中显式区分）。
+    """
+    arm = str(getattr(args, 'condition_arm', 'none') or 'none')
+    if arm == 'none':
+        return {}
+    group = (str(getattr(args, 'condition_group', '') or '')
+             or CONDITION_GROUP_BY_MODE.get(str(args.mode)))
+    if not group:
+        raise ValueError(f'mode={args.mode} 无法推导 condition_group，请显式指定')
+    base = None
+    if bundle is not None:
+        from experiments.evaluate_variant import condition_stats_from_bundle
+        base = condition_stats_from_bundle(bundle, group)
+    return {
+        'condition_group': group,
+        'condition_file': (getattr(args, 'condition_file', '') or None),
+        'split_file': (getattr(args, 'split_file', '') or None),
+        'stratify_key': (getattr(args, 'stratify_key', '') or None),
+        'condition_base_stats': base,
+        'condition_stats_mode': 'inherit' if base is not None else 'fit',
+        'condition_control': str(getattr(args, 'cond_control', 'none') or 'none'),
+    }
+
+
+def split_hash(dl, args) -> str:
+    """被试划分的规范哈希：所有对照臂必须共享同一 cohort/split（验收 F）。
+
+    只依赖 train/val/test 的被试名单（排序后），因此不同 seed 的重复运行、以及
+    同一划分下的不同条件臂得到相同哈希；名单变化立即暴露。
+    """
+    import hashlib
+    import json
+    payload = {'mode': str(args.mode),
+               'train': sorted(dl.train_subjects),
+               'val': sorted(dl.val_subjects),
+               'test': sorted(dl.test_subjects)}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
+def _report_conditioning(model, optimizer, args, dl):
+    """登记实际参数量并校验条件参数全部进入优化器（方案 §11 / 验收 L）。"""
+    from train.optim import param_report, verify_conditioning_param_groups
+    rep = param_report(model, optimizer)
+    print(f"[params] total={rep['total']} | conditioning={rep['conditioning']} "
+          f"| trainable={rep['trainable']} | rho_cond="
+          f"{rep['rho_conditioning']:.4f} | optimizer_numel={rep['optimizer_numel']} "
+          f"| distinct_tensors={rep['optimizer_distinct_tensors']}")
+    if getattr(model, 'conditioner', None) is not None:
+        print(f"[params] 条件编码器内部: {model.conditioner.param_report()} "
+              f"| layout={model.conditioner.layout()['layout_hash']}")
+        verify_conditioning_param_groups(model, optimizer)
+        print('[params] 条件参数组校验通过（全部入优化器、无重复、numel 一致）')
+    return rep
+
+
+def load_condition_stats_payload(path):
+    """从 checkpoint 读取 train-only 条件统计量快照（HC→MDD 继承用）。"""
+    import json
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f'--condition_inherit_stats 指定的文件不存在: {path}')
+    if p.suffix.lower() == '.json':
+        payload = json.loads(p.read_text(encoding='utf-8'))
+        # 允许传整个 checkpoint config 的导出件：既支持裸 stats，也支持含
+        # config.condition.stats 的结构
+        if isinstance(payload, dict) and 'fields' not in payload:
+            payload = ((payload.get('config') or {}).get('condition') or {}).get('stats')
+    else:
+        raw = torch.load(p, map_location='cpu', weights_only=False)
+        cfg = raw.get('config') if isinstance(raw, dict) else None
+        payload = (cfg or {}).get('condition', {}).get('stats') if isinstance(cfg, dict) else None
+    if not isinstance(payload, dict) or 'fields' not in payload:
+        raise KeyError(
+            f'{path} 中没有可用的条件统计量快照（需要 config.condition.stats 或裸 '
+            f'stats JSON）：无法继承 HC 的 Age/education 统计量与类别协议。')
+    return payload
 
 
 def _masked_l1_weighted(pred, target, weight, eps=1e-8):
@@ -121,17 +303,19 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
     horizon = int(getattr(model, 'cpm_horizon', 0) or args.cpm_horizon)
     huber_delta = float(getattr(args, 'cpm_huber_delta', 1.0))
     comp_tau = float(getattr(args, 'tfm_competence_temperature', 1.0))
-    pbar = tqdm(data_loader, total=len(data_loader), dynamic_ncols=True, leave=False)
-    pbar.set_description('[Val-TFM]')
+    pbar = make_pbar(data_loader, len(data_loader), '[Val-TFM]')
 
     for batch in pbar:
         bx, by, bl, bm, bs, bp = next_point_batch(batch, device)
+        cond = condition_batch(batch, device)
         fut = batch['future'].to(device, non_blocking=True)          # [B,F,R]
         fmask = batch['future_mask'].to(device, non_blocking=True)   # [B,R]
         outputs, aux_info = model(bx, bs, bp,
                                   pathology_epoch=pathology_epoch,
                                   return_expert_pred=need_expert_pred,
-                                  return_pair_pred=need_pair_pred)  # [B,F,1,1]
+                                  return_pair_pred=need_pair_pred,
+                                  condition=cond,
+                                  condition_epoch=None)              # 验证：关闭随机 Dropout
         cpm_pred = aux_info['cpm_pred']                              # [B,F,H]
         cpm_target = fut[:, :, :horizon]                             # [B,F,H]
         cpm_mask = fmask[:, :horizon]                                # [B,H]
@@ -206,9 +390,9 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                      'metric_trend_mae': trend_mae.detach(),
                      'metric_cpm_mae': torch.tensor(metric_cpm_mae)}.items():
             meters[k].append(v.detach())
-        pbar.set_postfix({'MAE': f"{float(mae):.4f}",
-                          'PCC_sp': f"{float(pcc_spatial):.4f}",
-                          'CPM': f"{metric_cpm_mae:.4f}"})
+        pbar_metrics(pbar, MAE=f"{float(mae):.4f}",
+                     PCC=f"{float(pcc_spatial):.4f}",
+                     CPM=f"{metric_cpm_mae:.4f}")
 
         # ---- Router–Expert 耦合诊断（moe + RECC/diagnose 模式，RECC 方案 §63–§69）----
         if need_expert_pred and 'tfm_expert_pred' in aux_info:
@@ -227,7 +411,8 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                 roll = model.rollout_next_states(
                     hist, bs[rf_gpu], (bp[rf_gpu] if bp is not None else None),
                     steps=int(rollout_steps),
-                    pathology_epoch=pathology_epoch)             # [n,R,F]
+                    pathology_epoch=pathology_epoch,
+                    condition=_index_condition(cond, rf_gpu))
                 fut_r = batch['future'][rf].transpose(1, 2).contiguous().to(
                     device).float()                                  # [n,R,F]
                 fmask_r = batch['future_mask'][rf].to(device).float()  # [n,R]
@@ -281,15 +466,41 @@ def fit_pathology_normalizer(model, dl, args):
           f'out_dim={norm.out_dim}')
 
 
+def check_seed_separation(args):
+    """方案 §四：模型 seed / 采样 seed / Condition Dropout seed 必须是三条独立随机流。
+
+    任意两者同值等于把两条流并为一条，「分离」名存实亡（``--seed`` 与 ``--sampling_seed``
+    的历史默认值都是 2024，正好撞车）。这里拒绝，而不是静默改默认值；登记值见
+    ``utils/condition_schema.py`` 的 MODEL_SEED / SAMPLING_SEED / DROPOUT_SEED。
+    """
+    flags = ('seed', 'sampling_seed', 'cond_dropout_seed')
+    absent = [f for f in flags if not hasattr(args, f)]
+    if absent:
+        raise ValueError(
+            f'缺少随机来源参数 {absent}：请经 main.py 的 argparse 入口调用，'
+            '不要构造缺参的 Namespace（方案 §四 的分离要求无法在没有取值的条件下核验）。')
+    seen = {}
+    for flag in flags:
+        value = int(getattr(args, flag))
+        if value in seen:
+            raise ValueError(
+                f'随机来源必须两两分离（方案 §四）：--{flag}={value} 与 '
+                f'--{seen[value]} 同值。')
+        seen[value] = flag
+
+
 def main(args):
     # checkpoint config.args 快照保留 model_arch 键：evaluate_variant 重建与
     # pretrain 签名校验依赖它（TFM 已是唯一主干，CLI 不再暴露该开关）
     args.model_arch = 'tfm'
+    check_seed_separation(args)
     # ---- TFM 病理专家 / RECC 配置约束（RECC 方案 §51，fail-fast）----
     if args.mode == 'pretrain':
-        # HC 预训练不构建任何病理模块（方案 §52：避免 Expert 学成健康亚型）
+        # HC 预训练不构建**病理专家 MoE**（RECC 方案 §52：避免 Expert 学成健康
+        # 亚型）；但条件注入模块允许在 HC 上建立/拟合/前反向（v1 revised §1.3），
+        # 由 condition_arm 决定，One-Step 的 film 模式在模型内部随条件开关设置。
         if getattr(args, 'tfm_patho_mode', 'none') != 'none':
-            print(f"[TFM-MoE] HC 预训练不构建病理模块：tfm_patho_mode="
+            print(f"[TFM-MoE] HC 预训练不构建病理专家模块：tfm_patho_mode="
                   f"'{args.tfm_patho_mode}' 自动置为 none（方案 §51）。")
         args.tfm_patho_mode = 'none'
         args.tfm_recc_mode = 'off'
@@ -371,8 +582,36 @@ def main(args):
           f"rollout: R={eval_rollout_steps}, horizons={eval_rollout_horizons}, "
           f"锚点/被试={args.eval_rollout_tasks_per_subject}")
 
+    cond_enabled = bool(getattr(args, 'condition_arm', None) not in (None, '', 'none'))
+    condition_group = (str(args.condition_group) if getattr(args, 'condition_group', None)
+                       else CONDITION_GROUP_BY_MODE.get(args.mode)) if cond_enabled else None
+    if cond_enabled:
+        print(f'[condition] 阶段={args.mode} 分组={condition_group} 臂={args.condition_arm} '
+              f'| merged 文件={args.condition_file or CONDITION_FILE_BY_MODE.get(args.mode)} '
+              f'（条件数据**只**来自该 merged 表）')
+    cond_base_stats = None
+    if cond_enabled and getattr(args, 'condition_inherit_stats', ''):
+        from utils.condition_schema import (DEMO_GROUP, load_inherited_stats,
+                                            schema_for)
+        payload = load_condition_stats_payload(args.condition_inherit_stats)
+        target_specs = schema_for(condition_group or 'mdd8')
+        src_names = [f['name'] for f in payload.get('fields', [])]
+        share = [n for n in DEMO_GROUP if n in src_names]
+        cond_base_stats = load_inherited_stats(payload, target_specs, share)
+        print(f'[condition] 已载入继承统计量快照：{args.condition_inherit_stats} | '
+              f'来源字段={src_names} → 继承共享字段={share}；'
+              f'其余字段将在 MDD-train 上拟合（不会覆盖继承值）')
+
     dl = NeuroTwinDataLoader(
         data_root=args.data_root, mode=args.mode, batch_size=args.batch_size,
+        condition_group=condition_group,
+        condition_file=args.condition_file or None,
+        split_file=args.split_file or None,
+        stratify_key=(args.stratify_key or None),
+        condition_base_stats=cond_base_stats,
+        condition_extra_codes=parse_extra_codes(args.condition_extra_codes)
+        if args.condition_extra_codes else None,
+        condition_control=args.cond_control,
         pathology_input_dim=args.pathology_input_dim,
         pathology_fields=parse_pathology_fields(args.pathology_fields),
         pathology_missing=args.pathology_missing,
@@ -405,6 +644,19 @@ def main(args):
     )
     train_data, val_data = dl.get_train(), dl.get_val()
 
+    condition_cfg_dict = None
+    condition_stats_payload = None
+    if cond_enabled:
+        condition_cfg_dict = ConditioningConfig(
+            group=condition_group, arm=args.condition_arm,
+            d_demo=args.cond_d_demo, d_new=args.cond_d_new,
+            cond_dim=args.cond_dim, h_delta=args.cond_h_delta,
+            delta_style=args.cond_delta_style,
+            dropout_p=args.cond_dropout_p,
+            dropout_seed=args.cond_dropout_seed).to_dict()
+        condition_stats_payload = dl.get_condition_stats().to_dict()
+        print(f'[condition] 编码器配置 {condition_cfg_dict}')
+
     model = NeuroTwinTFM(
         features=args.num_rois, context_max=dims['seq_len'],
         patch_len=args.tfm_patch_len, dim=args.tfm_dim,
@@ -427,6 +679,17 @@ def main(args):
         cpm_horizon=args.cpm_horizon, cpm_layers=args.cpm_layers,
         cpm_intervention=args.cpm_intervention,
         pretrain_mode=(args.mode == 'pretrain'),
+        condition_arm=args.condition_arm,
+        condition_config=condition_cfg_dict,
+        condition_stats_payload=condition_stats_payload,
+        cond_inject=args.cond_inject,
+        cond_backbone_scope=args.cond_backbone_scope,
+        cond_norm_generator=args.cond_norm_generator,
+        cond_norm_ident_dim=args.cond_norm_ident_dim,
+        cond_lambda_os=args.cond_lambda_os,
+        cond_lambda_cpm=args.cond_lambda_cpm,
+        cond_gate_residual=args.cond_gate_residual,
+        cond_gate_hidden=args.cond_gate_hidden,
         pathology_input_dim=args.pathology_input_dim,
         pathology_norm_mode=args.pathology_norm_mode,
         pathology_norm_quantiles=args.pathology_norm_quantiles,
@@ -437,12 +700,49 @@ def main(args):
     if args.mode == 'finetune':
         if not os.path.exists(args.pretrained_weight):
             raise FileNotFoundError(f"未找到预训练权重: {args.pretrained_weight}")
+        # 跨阶段迁移守卫：HC（hc3）与 MDD（mdd8）的完整 layout_hash 天然不同
+        # （K=3 vs K=8），但**共享前三字段必须逐位一致**，否则 E_demo / 特征编码器 /
+        # FiLM 会挂到语义不同的列上（方案 §8：同宽度但字段顺序变化也必须拒绝）。
+        saved_layout = None
+        same_group_arm = False
+        if cond_enabled:
+            from experiments.evaluate_variant import load_condition_bundle
+            bundle = load_condition_bundle(args.pretrained_weight)
+            if bundle is not None:
+                saved_layout = (bundle.get('meta') or {}).get('layout_hash')
+            if saved_layout and getattr(model, 'conditioner', None) is not None:
+                now = model.conditioner.layout()
+                same_group_arm = (bundle['config'].get('group') == condition_group
+                                  and bundle['config'].get('arm') == now['arm'])
+                if same_group_arm and saved_layout != now['layout_hash']:
+                    raise RuntimeError(
+                        f'条件布局不一致：权重={saved_layout}，当前={now["layout_hash"]}。'
+                        '字段顺序/来源列/类别词表任一变化都禁止复用该权重。')
+                if not same_group_arm and saved_layout != now.get('demo_layout_hash'):
+                    raise RuntimeError(
+                        f'HC→MDD 共享三字段布局不一致：HC 权重 layout_hash={saved_layout}，'
+                        f'当前 mdd8 的 demo 子集哈希={now.get("demo_layout_hash")}。'
+                        'Sex/Age/education 的顺序、类型或词表必须逐位一致才能继承。')
         if args.load_backbone_only:
             # 显式模式：只加载主干、头部/条件模块重新初始化（prompt §三十六）。
             # 任务口径闸门降级为 warn：口径差异只提示，主干按 shape 逐键加载并汇报。
             check_pretrain_config_compat(args.pretrained_weight, dims,
                                          arch_policy='warn')
             load_backbone_only(model, args.pretrained_weight, device)
+        elif cond_enabled:
+            # 条件注入路径必须走**显式迁移器**：逐键归类并汇报，未分类键报错，
+            # 不允许 strict=False + shape 过滤的静默忽略（方案 §8）
+            check_pretrain_config_compat(args.pretrained_weight, dims,
+                                         arch_policy=args.pretrained_arch_policy)
+            migrate_pretrained_checkpoint(
+                model, args.pretrained_weight, device,
+                arch_policy=args.pretrained_arch_policy,
+                # 同组同臂才比较完整 layout_hash；跨组（hc3→mdd8）的完整哈希本就
+                # 不同，上面已用 demo 子集哈希做过共享前缀校验
+                layout_expect=(model.conditioner.layout()['layout_hash']
+                               if (getattr(model, 'conditioner', None) and same_group_arm)
+                               else None),
+                layout_saved=saved_layout if same_group_arm else None)
         else:
             # 任务口径闸门：不同任务的目标/输入 shape 语义不同，
             # 不允许静默按 shape 过滤加载（形状对不上时会静默跳过大量键）
@@ -511,9 +811,11 @@ def main(args):
     # 训练/复评口径分别落盘（执行计划 §4.1/§6.3）：checkpoint 元数据记录本
     # 次训练实际使用的 candidate 口径，旧权重复评结果由分析脚本另行标注
     model_aux_schema = TFM_CANDIDATE_SCHEMA if moe_active else 'not_applicable'
-    print(f"[TFM] One-Step 病理条件: tfm_patho_mode={args.tfm_patho_mode}"
-          + (f" | CPM FiLM: {'on' if getattr(model.cpm_head, 'film', None) is not None else 'off'}"
-             if args.mode == 'finetune' else ""))
+    print(f"[TFM] One-Step 条件模式: 模型生效 tfm_patho_mode={model.tfm_patho_mode}"
+          f"（args 值 {args.tfm_patho_mode}）"
+          f" | OS FiLM: {'on' if getattr(model.one_step_head, 'film', None) is not None else 'off'}"
+          f" | CPM FiLM: {'on' if getattr(model.cpm_head, 'film', None) is not None else 'off'}"
+          f" | 主干条件 RMSNorm: {'on' if getattr(model, 'cond_norm', None) is not None else 'off'}")
     if moe_active:
         print(f"[TFM-MoE] E={args.tfm_num_experts} top_k={args.tfm_top_k} | "
               f"expert_hidden={args.tfm_expert_hidden_dim} "
@@ -533,6 +835,7 @@ def main(args):
 
     optimizer = build_optimizer(model, criterion, args)
     scheduler = build_scheduler(optimizer, args)
+    _report_conditioning(model, optimizer, args, dl)
     scaler    = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     ema       = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     if args.compile and hasattr(torch, 'compile'):
@@ -560,16 +863,38 @@ def main(args):
         save_dir = f"{p}{max(idx)+1 if idx else 2}"
     os.makedirs(save_dir, exist_ok=True)
 
+    # 条件模块激活记录（方案 §五：记录 OS/CPM/encoder 的首次非零梯度与首次参数更新）。
+    # 只在显式给预算时启用，且**只读**梯度与参数值，不参与 loss/step，因此不改变训练。
+    activation_probe = None
+    act_budget = int(getattr(args, 'cond_activation_steps', 0) or 0)
+    act_step = 0
+    if act_budget > 0:
+        from train.condition_activation import (ACTIVATION_STEP_CAP, ActivationProbe,
+                                                format_summary)
+        from train.optim import conditioning_module_prefixes
+        if not 1 <= act_budget <= ACTIVATION_STEP_CAP:
+            raise ValueError(
+                f'--cond_activation_steps={act_budget} 超出允许范围 1..{ACTIVATION_STEP_CAP}'
+                '（合成激活检查的步数上限是预注册的，不能放宽）。')
+        if not conditioning_module_prefixes(model):
+            print('[activation] 本配置未建立任何条件模块（arm=none / 条件关闭）：'
+                  '不生成激活记录，避免把「不存在」写成「未激活」。')
+        else:
+            activation_probe = ActivationProbe(model, optimizer=optimizer)
+            print(f'[activation] 激活记录已启用，预算 {act_budget} 个 train step；'
+                  '首次非零梯度与首次参数更新分开记录（零初始化首步梯度为零属正常）。')
+
     for epoch in range(args.train_epochs):
         if (args.mode == 'finetune'
                 and not backbone_unfrozen
                 and epoch >= args.freeze_backbone_epochs):
             set_finetune_stage(model, backbone_unfrozen=True)
             backbone_unfrozen = True
-            optimizer = build_optimizer(model, criterion, args)
-            scheduler = build_scheduler(optimizer, args)
-            print(f"Epoch {epoch+1}: 已解冻主干，"
-                  f"可训练参数量 = {count_trainable_params(model)}")
+            # 解冻只追加新可训练参数：已训练条件参数的 Adam 状态与 LR 进度必须保留
+            added, names = unfreeze_while_preserving_state(model, optimizer, args)
+            print(f"Epoch {epoch+1}: 已解冻主干，新增可训练参数 numel={added} "
+                  f"groups={names}，可训练参数量 = {count_trainable_params(model)}"
+                  f"（沿用现有 optimizer 状态与 scheduler 进度）")
 
         # 本 epoch 的 RECC / 路由模式（RECC 方案 §14/§24：dense warmup 与
         # λ_recc ramp 都按 0 基 epoch 调度）
@@ -595,13 +920,19 @@ def main(args):
             batch_sampler.set_epoch(epoch)
         train_meters = defaultdict(list)    # tensor 累积，epoch 末一次性同步
         live = defaultdict(float)           # 进度条所需的少数关键指标
-        pbar = tqdm(train_data, total=len(train_data), dynamic_ncols=True, leave=False)
-        pbar.set_description(f"Epoch {epoch+1:03d}/{args.train_epochs:03d} [Train]")
+        pbar = make_pbar(
+            train_data, len(train_data),
+            f"Epoch {epoch + 1:03d}/{args.train_epochs:03d} [Train]")
 
         for step, batch in enumerate(pbar, start=1):
             optimizer.zero_grad(set_to_none=True)
+            if activation_probe is not None and act_step < act_budget:
+                # 步前快照：只有与「本步更新前的值」比较，才能区分「优化器真的改写了
+                # 条件参数」与「梯度非零但被裁剪/跳过 step」
+                activation_probe.note_step_boundary(model)
             # next_timepoint：x [B,F,1,K] / y [B,F,H,1] / x_last [B,F] / mask [B,H]
             bx, by, bl, bm, bs, bp = next_point_batch(batch, device)
+            cond = condition_batch(batch, device)
             by_roll = batch.get('future', None)
             bm_roll = batch.get('future_mask', None)
             if by_roll is not None: by_roll = by_roll.to(device, non_blocking=True)
@@ -610,7 +941,9 @@ def main(args):
             with torch.amp.autocast('cuda', enabled=amp_enabled):
                 outputs, aux_info = model(bx, bs, bp,
                                           pathology_epoch=epoch,
-                                          return_expert_pred=need_expert_pred)
+                                          return_expert_pred=need_expert_pred,
+                                          condition=cond,
+                                          condition_epoch=epoch)
                 # CPM 目标：训练视图 future_steps=cpm_horizon → by_roll [B,F,H]
                 total_loss, loss_stats = criterion(
                     outputs, by, aux_info['cpm_pred'], by_roll, bm_roll)
@@ -667,6 +1000,9 @@ def main(args):
 
             scaler.step(optimizer)
             scaler.update()
+            if activation_probe is not None and act_step < act_budget:
+                activation_probe.record_step(act_step + 1)
+            act_step += 1
             if ema is not None: ema.update(model)
 
             for k, v in {**loss_stats, **graph_stats, **coupled_stats,
@@ -686,7 +1022,7 @@ def main(args):
             if 'router_balance' in coupled_stats:
                 live['_rbal'] = live.get('_rbal', 0.0) + float(coupled_stats['router_balance'])
                 postfix['Bal'] = f"{live['_rbal']/step:.3f}"
-            pbar.set_postfix(postfix)
+            pbar_metrics(pbar, **postfix)
 
         eval_model  = ema.ema if ema is not None else model
         val_metrics = evaluate_tfm(eval_model, val_data, criterion, device,
@@ -696,6 +1032,24 @@ def main(args):
                                    need_expert_pred=need_expert_pred,
                                    need_pair_pred=need_pair_pred)
         scheduler.step()
+
+        if activation_probe is not None:
+            # 每个 epoch 末落盘一次：即使训练中断，也已留下「观测到哪一步」的激活证据。
+            # 只记录事实（首次非零梯度步 / 首次参数更新步），不据此判定模块有效性。
+            import json
+            act_payload = {
+                'name': args.name, 'mode': args.mode,
+                'condition_arm': args.condition_arm,
+                'cond_inject': args.cond_inject,
+                'epoch': epoch + 1,
+                'budget_steps': act_budget,
+                'observed_steps': activation_probe.steps_observed,
+                'summary': activation_probe.summary(),
+            }
+            with open(os.path.join(save_dir, 'condition_activation.json'),
+                      'w', encoding='utf-8') as f:
+                json.dump(act_payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            print('[activation] ' + format_summary(act_payload['summary']).replace('\n', ' | '))
 
         train_metrics = {k: torch.stack(vs).mean().item() for k, vs in train_meters.items()}
         group_lrs    = {g.get('name', f'g{i}'): g['lr']
@@ -755,8 +1109,10 @@ def main(args):
 
         def _ckpt_meta():
             # 权重本身不携带 epoch 曾导致 best/last 无法追溯（S0 缺口清单）；
-            # 自本版本起 checkpoint 记录训练进度与阶段状态
-            return {'args': vars(args), 'epoch': int(epoch),
+            # 自本版本起 checkpoint 记录训练进度与阶段状态；条件注入进一步记录
+            # schema/统计量/mask 语义/布局哈希/merged 文件哈希/split 哈希，
+            # 使 strict 重建与跨实验对齐可验证（方案 §4/§8）。
+            meta = {'args': vars(args), 'epoch': int(epoch),
                     'epoch_1based': int(epoch + 1),
                     'val_metric': float(cur_metric),
                     'ckpt_metric_key': ckpt_metric_key,
@@ -764,6 +1120,15 @@ def main(args):
                     'dense_routing': bool(epoch < args.tfm_moe_dense_warmup_epochs),
                     'recc_mode': recc_mode,
                     'candidate_schema': model_aux_schema}
+            meta['condition'] = {
+                'config': condition_cfg_dict,
+                'stats': (dl.get_condition_stats().to_dict()
+                          if dl.base_dataset.condition_enabled else None),
+                'meta': dl.get_condition_meta(),
+                'split_hash': split_hash(dl, args),
+            }
+            meta['params'] = param_report(model, optimizer)
+            return meta
         if is_best:
             best_ckpt_value = cur_metric
             best_name = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
@@ -853,6 +1218,12 @@ def main(args):
                   f"可手动复评: python -m experiments.evaluate_variant --ckpt {best_path} --out_dir {eval_dir}")
 
 
+#: 历史入口的默认预训练权重：**只在 finetune 省略 --pretrained_weight 时回填**
+#: （保持旧脚本行为不变）。正式 runbook（两个 *_tfm.sh 脚本）始终显式传入起点权重，
+#: 不依赖这个默认值。
+LEGACY_PRETRAINED_WEIGHT = './checkpoints/neurotwin_pretrain/base_best.pt'
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description='NeuroTwin-TFM: Pathology-Conditioned TimesFM-style Foundation '
@@ -861,10 +1232,20 @@ def parse_args():
     p.add_argument('--device', default='',
                    help='训练设备（如 cuda:0）。空 = 历史默认（有 GPU 时用 cuda:1）。'
                         '用于多卡并行跑消融：不同执行器指定不同 --device。')
-    p.add_argument('--pretrained_weight', default='./checkpoints/neurotwin_pretrain/base_best.pt')
+    p.add_argument('--pretrained_weight', default='',
+                   help='起点权重路径。finetune 必填；pretrain 一律留空。'
+                        '省略时按历史入口回填 '
+                        f'{LEGACY_PRETRAINED_WEIGHT}。')
+    p.add_argument('--save_training_state', action='store_true',
+                   help='工程恢复接口：额外落盘 optimizer/scheduler/scaler/EMA/随机状态。'
+                        '本轮正式从头实验不使用。')
     p.add_argument('--pathology_input_dim', type=int, default=1)
     p.add_argument('--seed', type=int, default=2024)
     p.add_argument('--data_root', default='./data')
+    p.add_argument('--cond_activation_steps', type=int, default=0, metavar='N',
+                   help='记录条件模块激活证据的 train step 预算（1..200）。0=不记录。'
+                        '只读梯度与参数值，不改变训练；产物写在 <save_dir>/'
+                        'condition_activation.json。')
     p.add_argument('--checkpoint_dir', default='./checkpoints')
     p.add_argument('--name', default='neurotwin')
     p.add_argument('--clinical_file', default='Rest-meta-MDD-V1V2-Merged-MDD.xlsx')
@@ -915,7 +1296,82 @@ def parse_args():
     p.add_argument('--reuse_pretrained_norm_stats', type=str2bool, default=True,
                    help='加载的检查点已带归一化统计量时是否复用（否则用 train subjects 重新拟合）。')
     p.add_argument('--adapter_lr_scale', type=float, default=1.0,
-                   help='条件适配器（adapter）参数组的学习率缩放。')
+                   help='条件适配器（adapter）参数组的学习率缩放（历史键；'
+                        '未设 --condition_lr_scale 时作为其回退值）。')
+
+    # ---------- 条件注入（docs/NeuroTwin_condition_injection_v1_revised_20261008）----------
+    # default=None 是「未声明」哨兵，与显式 ``--condition_arm none`` 语义不同：
+    # 未声明保持 legacy 行为（tfm_patho_mode 决定要不要建 HAMD FiLM），显式 none
+    # 是「结构性地不建条件通路」，必须连 legacy FiLM 一起关掉（§三）。
+    # 两者都要写进快照，独立评估才能重建出与训练同一个模型（§六.7）。
+    # 臂空间已按 2026-10-10 的决定收敛为 none|demo|cat：HC 侧只能用 demo（hc3 分组没有
+    # 新增字段），MDD 侧选定 cat；direct/sum/mean 随对比工具链一起移除。
+    p.add_argument('--condition_arm', default=None,
+                   choices=['none', 'demo', 'cat'],
+                   help='条件注入臂。不给该参数=未声明（保留 legacy 数值通路或'
+                        '无条件）；none=显式不建条件通路，legacy HAMD FiLM 也不构建；'
+                        'demo=仅共享三字段（HC 预训练侧唯一可行值）；'
+                        'cat=逐字段独立编码 + 拼接后过零初始化 DeltaE（MDD 微调选定值）。')
+    p.add_argument('--condition_group', default='',
+                   choices=['', 'hc3', 'mdd8'],
+                   help='条件字段分组；留空按 --mode 推导（pretrain→hc3，finetune→mdd8）。')
+    p.add_argument('--condition_file', default='',
+                   help='条件 merged 文件名（默认按 mode 取 '
+                        'Rest-meta-MDD-V1V2-Merged-{HC,MDD}.xlsx）。条件数据只允许'
+                        '来自该文件，禁止回读单独 V1/V2 源表。')
+    p.add_argument('--split_file', default='',
+                   help='外部被试级划分 JSON（train/val/test 名单）；提供并校验通过后'
+                        '优先于 data/subject_split_<mode>.json，所有对照臂共用同一份。')
+    p.add_argument('--stratify_key', default='',
+                   help='划分分层键（MDD 默认 HAMD）。不随条件字段顺序 fields[0] 变化；'
+                        '键缺失者进入预注册的缺失桶确定性分配，不删人。')
+    p.add_argument('--condition_inherit_stats', default='',
+                   help='HC checkpoint / JSON 路径：MDD 实验从中继承 Age/education 的 '
+                        'mu/scale 与类别协议，只在新增五字段上重新拟合。')
+    p.add_argument('--condition_extra_codes', default='',
+                   help='显式预注册的有效类别码（Sex:0,3;medication:2 形式），用于'
+                        'merged 中确实存在但未落在 train 的词表；运行时禁止静默扩表。')
+    p.add_argument('--cond_d_demo', type=int, default=16,
+                   help='共享三字段（HC）独立编码宽度 d_demo（搜索起点，非已知最优）。')
+    p.add_argument('--cond_d_new', type=int, default=16,
+                   help='MDD 新增五字段独立编码宽度 d_new。')
+    p.add_argument('--cond_dim', type=int, default=32,
+                   help='融合后条件向量宽度 C。')
+    p.add_argument('--cond_h_delta', type=int, default=64,
+                   help='增量 DeltaE 的隐藏宽度 H_delta。')
+    p.add_argument('--cond_delta_style', default='mlp', choices=['linear', 'mlp'],
+                   help='DeltaE 结构；mlp 末层零初始化使 c_MDD 起点等于 c_demo。')
+    p.add_argument('--cond_dropout_p', type=float, default=0.0,
+                   help='Condition Dropout 的遮蔽概率 p（受试者级、每 epoch 固定）。')
+    p.add_argument('--cond_dropout_seed', type=int, default=DROPOUT_SEED,
+                   help='Condition Dropout 种子（与 --seed 模型种子、划分 seed 分离）。')
+    p.add_argument('--cond_inject', default='heads',
+                   choices=['heads', 'backbone', 'heads+backbone'],
+                   help='注入位置：双头 FiLM / 主干条件 RMSNorm / 两者。')
+    p.add_argument('--cond_backbone_scope', default='last1',
+                   choices=['last1', 'last2', 'all'],
+                   help='主干调制范围（先只调制最后一个 block 的三个 norm 位置）。')
+    p.add_argument('--cond_norm_generator', default='per_layer',
+                   choices=['per_layer', 'shared'],
+                   help='条件 norm 生成器：逐层独立 或 共享生成器＋层身份嵌入。')
+    p.add_argument('--cond_norm_ident_dim', type=int, default=8,
+                   help='shared 生成器的层身份嵌入宽度。')
+    p.add_argument('--cond_lambda_os', type=float, default=1.0,
+                   help='OS 头注入强度 λ（固定值，可被可学习 W 吸收，不是特征贡献比）。')
+    p.add_argument('--cond_lambda_cpm', type=float, default=1.0,
+                   help='CPM 头注入强度 λ（同上）。')
+    p.add_argument('--cond_gate_residual', type=str2bool, default=False,
+                   help='扩展候选：条件门控残差 h + g(h,c)⊙R(h,c)（R 末层零初始化）。')
+    p.add_argument('--cond_gate_hidden', type=int, default=64,
+                   help='条件门控残差分支 R 的隐藏宽度。')
+    p.add_argument('--cond_control', default='none',
+                   choices=['none', 'static_new', 'mask_only'],
+                   help='信息/容量对照：static_new=新增五字段取训练常量且新增 mask '
+                        '固定为全 1（同时取消值与缺失模式的个体差异）；mask_only=值固定'
+                        '但保留真实 mask（检验缺失模式是否解释收益）。共享三字段不变。')
+    p.add_argument('--condition_lr_scale', type=float, default=None,
+                   help='条件参数组学习率相对 baseline 的倍率（未设则回退 '
+                        '--adapter_lr_scale）。')
 
     # ---------- SC 软先验（soft anatomical prior / 图正则） ----------
     p.add_argument('--sc_prior_mode', default='soft_prior',
@@ -1125,7 +1581,12 @@ def parse_args():
                    help='finetune 时只加载主干权重（预测头 / 条件模块保持随机初始化），'
                         '并显式打印 loaded/missing/reinitialized 清单。')
 
-    return p.parse_args()
+    args = p.parse_args()
+    # 历史入口行为：finetune 省略 --pretrained_weight 时回填默认主权重路径。
+    # 本轮脚本始终显式传入起点，不依赖这个默认值。
+    if args.mode == 'finetune' and not args.pretrained_weight:
+        args.pretrained_weight = LEGACY_PRETRAINED_WEIGHT
+    return args
 
 
 if __name__ == '__main__':

@@ -1,0 +1,103 @@
+{
+  "artifact": "initial_condition_config",
+  "status": "search_not_run",
+  "is_best": false,
+  "is_optimal": false,
+  "generated_at": "2026-10-09T10:18:34+0800",
+  "n_completed_trials_in_registry": 0,
+  "anchor_config": {
+    "arm": "cat",
+    "group": "mdd8",
+    "mode": "finetune",
+    "d_demo": 16,
+    "d_new": 16,
+    "cond_dim": 32,
+    "h_delta": 64,
+    "inject": "heads",
+    "backbone_scope": "last1",
+    "dropout_p": 0.0,
+    "control": "none"
+  },
+  "anchor_config_semantics": "这是预注册的**搜索起点**（方案 §13 的 anchor 宽度与注入位置），不是实验最优；任何引用都必须带 is_optimal=false。",
+  "measured_budget": {
+    "status": "measured",
+    "profile_version": 3,
+    "measured_at": "2026-10-09T02:14:28+0800",
+    "device": "cuda:1",
+    "cohorts": {
+      "HC": {
+        "mode": "pretrain",
+        "tasks_per_epoch_by_sample_level": {
+          "4": 7112,
+          "12": 21336
+        },
+        "fixed_overhead_seconds": 5.414,
+        "validation_seconds_per_epoch": 43.231,
+        "seconds_per_task": 0.004836,
+        "seconds_per_task_frozen": 0.004836,
+        "unfreeze_once_seconds": 0.0,
+        "epoch_drift_seconds": 1.567,
+        "eval_seconds": 21.22,
+        "eval_full_seconds": 71.74,
+        "diagnostic_seconds": null,
+        "peak_gpu_mib": 13498,
+        "n_params_total": 6064880,
+        "arch_fingerprint": {
+          "num_rois": 116,
+          "tfm_dim": 256,
+          "tfm_layers": 4,
+          "tfm_heads": 4,
+          "tfm_ff_ratio": 4,
+          "tfm_one_step_hidden_dim": 256,
+          "tfm_patch_len": 4,
+          "cpm_horizon": 8,
+          "cpm_layers": 2,
+          "context_max": 64,
+          "eval_context_length": 64
+        },
+        "one_trial_at_full_budget_gpu_hours": 6.108,
+        "one_trial_basis": "train_epochs=150、train_samples_per_subject=auto(21336 任务/epoch，实测档位)"
+      },
+      "MDD": {
+        "mode": "finetune",
+        "tasks_per_epoch_by_sample_level": {
+          "4": 7212,
+          "12": 21636
+        },
+        "fixed_overhead_seconds": 13.558,
+        "validation_seconds_per_epoch": 41.831,
+        "seconds_per_task": 0.004811,
+        "seconds_per_task_frozen": 0.0025,
+        "unfreeze_once_seconds": 2.919,
+        "epoch_drift_seconds": 2.919,
+        "eval_seconds": 24.23,
+        "eval_full_seconds": 76.04,
+        "diagnostic_seconds": 105.8,
+        "peak_gpu_mib": 7800,
+        "n_params_total": 6075600,
+        "arch_fingerprint": {
+          "num_rois": 116,
+          "tfm_dim": 256,
+          "tfm_layers": 4,
+          "tfm_heads": 4,
+          "tfm_ff_ratio": 4,
+          "tfm_one_step_hidden_dim": 256,
+          "tfm_patch_len": 4,
+          "cpm_horizon": 8,
+          "cpm_layers": 2,
+          "context_max": 64,
+          "eval_context_length": 64
+        },
+        "one_trial_at_full_budget_gpu_hours": 5.952,
+        "one_trial_basis": "train_epochs=150、train_samples_per_subject=auto(21636 任务/epoch，实测档位)、freeze_backbone_epochs=10"
+      }
+    }
+  },
+  "plan_sizes_reference": {
+    "stage1_2_trials": 8,
+    "stage1_3_trials_per_promoted_arm": 11,
+    "note": "阶段 3+ 的试次数取决于真实晋级臂（必须由阶段 2 验证排名决定），因此这里不预填 GPU·h；核算命令见 TASK_HANDOFF §6。"
+  },
+  "statement": "条件注入搜索尚未运行（登记表里没有完成的学习试次）。本文件里的 config 是预注册的搜索起点（anchor），不是实验最优，也不得被引用为最优。",
+  "naming": "initial_* = 起点；best_condition_config.json 只允许由 experiments/condition_runner.py --frozen_trial 在真实 completed 且跑满预算的配置上生成，且已存在时不覆盖。"
+}

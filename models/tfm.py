@@ -28,6 +28,7 @@ HC 预训练结构与 checkpoint 完全不变（§52）。backbone / SC prior / 
 对外提供 next_timepoint 标准协议（``forward`` / ``predict_next_state`` /
 ``rollout_next_states``），训练入口与评估链路按同一接口消费。
 """
+from contextlib import contextmanager, nullcontext
 from typing import List, Optional
 
 import torch
@@ -35,6 +36,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.common import BrainRevIN
+from models.conditioning import (ARMS, ConditionalGatedResidual,
+                                 ConditionNormGenerator, ConditioningConfig,
+                                 build_condition_encoder)
 from models.graph_prior import SoftAnatomicalPrior
 from models.pathology import PathologyNormalizer
 from models.tfm_backbone import (
@@ -44,6 +48,38 @@ from models.tfm_backbone import (
     build_context_grid,
 )
 from models.tfm_experts import TFMPathologyMoE, build_pair_indices
+
+
+@contextmanager
+def isolated_global_rng():
+    """块内构建的模块**不消耗**外部全局 RNG（H0/H1 非条件参数逐位可比）。
+
+    条件模块的默认初始化（``nn.Linear`` / ``nn.Embedding`` / ``trunc_normal_``）会
+    推进全局 RNG 流；不隔离时，同一 seed 下 ``arm=none`` 与 ``arm=cat`` 的
+    backbone / 双头非条件参数会逐位不同，验收「相同 seed 下 HC H0 无条件与 H1
+    条件的非条件参数逐位相同」就不成立（臂间差异被初始噪声污染）。
+
+    只包裹条件构件的构造调用点，不改动任何非条件模块的初始化语义（宽度/层数等
+    按项目策略已冻结）；条件模块自身仍按进入块时的 RNG 状态正常随机初始化。
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _rng_scope(isolate: bool):
+    """条件构件的 RNG 作用域开关。
+
+    ``isolate=False`` 用于 legacy RECC 线（``condition_config`` 缺席），保持其历史
+    初始化顺序逐位不变；条件注入实验一律 ``True``，使条件模块的构造对后续非条件
+    模块「不可见」。
+    """
+    return isolated_global_rng() if isolate else nullcontext()
 
 
 # candidate 预测契约版本（RECC 执行计划 §5.1 / §6.3：复评产物必须能声明口径）。
@@ -62,28 +98,37 @@ class ConditionFiLM(nn.Module):
     权重零初始化 → 初始为恒等调制，保证「无条件 → 有条件」切换不破坏
     预训练主干的数值行为（与 LoRA / 零初始化 ΔA 的稳定起步策略一致）。
 
+    ``lam`` 是**固定的**注入强度 :math:`\\lambda_\\ell`（默认 1）：
+    :math:`h'=(1+\\lambda\\gamma(c))\\odot h+\\lambda\\beta(c)`。因为
+    :math:`\\lambda` 可被可学习的 :math:`W_\\ell` 吸收，它**不是**「临床特征贡献
+    比例」，也不能解释为稳定的物理配比（方案 §11 末）；位置比较使用开关而非
+    连续强度，非零强度默认 1。
+
     ``is_conditioning_adapter`` 标记供 train/optim.py 的微调冻结逻辑识别：
     冻结主干阶段 FiLM 仍参与训练（它们是“让病理条件真正生效”的唯一路径）。
     """
 
     is_conditioning_adapter = True
 
-    def __init__(self, cond_dim: int, dim: int):
+    def __init__(self, cond_dim: int, dim: int, lam: float = 1.0):
         super().__init__()
         if cond_dim <= 0:
             raise ValueError(f"cond_dim 必须 > 0，收到 {cond_dim}")
         self.cond_dim = int(cond_dim)
         self.dim = int(dim)
+        self.lam = float(lam)
         self.proj = nn.Linear(self.cond_dim, 2 * self.dim)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, cond: torch.Tensor):
-        """cond [B, C] → (scale [B, D], shift [B, D])。"""
+        """cond [B, C] → (scale [B, D], shift [B, D])，已按 ``lam`` 缩放。"""
         if cond.ndim != 2 or cond.shape[1] != self.cond_dim:
             raise ValueError(
                 f"条件向量期望 [B, {self.cond_dim}]，收到 {tuple(cond.shape)}")
         scale, shift = self.proj(cond).chunk(2, dim=-1)
+        if self.lam != 1.0:
+            scale, shift = self.lam * scale, self.lam * shift
         return scale, shift
 
 
@@ -112,7 +157,11 @@ class OneStepDynamicsHead(nn.Module):
                  num_experts: int = 4, top_k: int = 2,
                  expert_hidden_dim: int = 256, router_hidden_dim: int = 128,
                  router_temperature: float = 1.0,
-                 dense_warmup_epochs: int = 5):
+                 dense_warmup_epochs: int = 5,
+                 cond_lambda: float = 1.0,
+                 cond_gate_residual: bool = False,
+                 cond_gate_hidden: int = 64,
+                 cond_rng_isolated: bool = False):
         super().__init__()
         self.dim = int(dim)
         self.pathology_mode = str(pathology_mode)
@@ -132,20 +181,34 @@ class OneStepDynamicsHead(nn.Module):
         nn.init.zeros_(self.decode.bias)
         self.film = None
         self.pathology_moe = None
+        self.gate_res = None
+        # ``cond_rng_isolated`` 由顶层按「是否处于条件注入实验」决定：条件臂下
+        # 条件子模块不得推进全局 RNG（否则后建的头/主干随臂变化，H0 与 H1 不可比）；
+        # legacy RECC 线保持历史构造顺序，逐位不变。
         if self.pathology_mode == 'film':
-            self.film = ConditionFiLM(cond_dim, self.dim) if cond_dim else None
+            with _rng_scope(cond_rng_isolated):
+                self.film = (ConditionFiLM(cond_dim, self.dim, lam=cond_lambda)
+                             if cond_dim else None)
+            # 扩展候选：条件门控残差（末层零初始化 → 起点行为不变）
+            if cond_gate_residual:
+                if not cond_dim:
+                    raise ValueError('cond_gate_residual 需要条件通路（cond_dim>0）')
+                with _rng_scope(cond_rng_isolated):
+                    self.gate_res = ConditionalGatedResidual(
+                        self.dim, cond_dim, hidden=cond_gate_hidden)
         elif self.pathology_mode == 'moe':
             if not cond_dim:
                 raise ValueError(
                     "pathology_mode='moe' 需要病理条件通路（finetune 模式 + "
                     "pathology_normalizer），HC 预训练请使用 'none'。")
             # 方案 §5：moe 模式关闭 One-Step 原 FiLM，病理条件只进入 MoE
-            self.pathology_moe = TFMPathologyMoE(
-                dim=self.dim, cond_dim=cond_dim, num_experts=num_experts,
-                top_k=top_k, expert_hidden_dim=expert_hidden_dim,
-                router_hidden_dim=router_hidden_dim,
-                router_temperature=router_temperature, dropout=dropout,
-                dense_warmup_epochs=dense_warmup_epochs)
+            with _rng_scope(cond_rng_isolated):
+                self.pathology_moe = TFMPathologyMoE(
+                    dim=self.dim, cond_dim=cond_dim, num_experts=num_experts,
+                    top_k=top_k, expert_hidden_dim=expert_hidden_dim,
+                    router_hidden_dim=router_hidden_dim,
+                    router_temperature=router_temperature, dropout=dropout,
+                    dense_warmup_epochs=dense_warmup_epochs)
 
     def forward(self, z_t: torch.Tensor, adj: torch.Tensor,
                 cond: Optional[torch.Tensor] = None,
@@ -181,6 +244,9 @@ class OneStepDynamicsHead(nn.Module):
             if self.film is not None and cond is not None:
                 scale, shift = self.film(cond)
                 h = h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            if self.gate_res is not None and cond is not None:
+                # 扩展候选：h' = h + g(h,c) ⊙ R(h,c)，R 末层零初始化
+                h = self.gate_res(h, cond)
             z_next = z_t + h
         else:
             z_shared = z_t + h                                 # 共享 HC 动力学
@@ -236,12 +302,17 @@ class CPMHorizonHead(nn.Module):
     ROI 嵌入与 backbone patch embedding 共享（同一套 e^ROI），horizon 嵌入
     为本头私有参数。``cpm_intervention=True`` 时构建 future-known covariate
     嵌入 E_u（§12.4/§13 接口预留，V1 默认关闭、不参与训练）。
+
+    ``cond_rng_isolated=True``（条件注入实验）时，本头 FiLM 的构造不消耗全局
+    RNG，保证同 seed 下 ``arm=none`` 与本臂的非条件参数逐位相同。
     """
 
     def __init__(self, dim: int, horizon: int, num_heads: int = 4,
                  num_layers: int = 2, dropout: float = 0.1,
                  cond_dim: Optional[int] = None,
-                 build_intervention: bool = False):
+                 build_intervention: bool = False,
+                 cond_lambda: float = 1.0,
+                 cond_rng_isolated: bool = False):
         super().__init__()
         if horizon < 1:
             raise ValueError(f"cpm_horizon 必须 >= 1，收到 {horizon}")
@@ -263,7 +334,10 @@ class CPMHorizonHead(nn.Module):
                 'drop': nn.Dropout(dropout),
             }))
         self.out_proj = nn.Linear(self.dim, 1)
-        self.film = ConditionFiLM(cond_dim, self.dim) if cond_dim else None
+        # 条件 FiLM 的构造不推进全局 RNG（条件注入实验下 H0/H1 非条件参数逐位一致）
+        with _rng_scope(cond_rng_isolated):
+            self.film = (ConditionFiLM(cond_dim, self.dim, lam=cond_lambda)
+                         if cond_dim else None)
         # future-known covariate（intervention lookahead）接口：V1 仅预留，
         # 默认不构建；U 逐 (ROI, horizon) 标量 → 向量嵌入加到查询上
         self.intervention_embed = nn.Linear(1, self.dim) if build_intervention else None
@@ -355,6 +429,17 @@ class NeuroTwinTFM(nn.Module):
     任务口径约束：one-step 头只建模 +1 偏移（§10），因此要求
     ``forecast_offsets == (1,)``；稀疏偏移 {1,2,4,8} 的监督/评估由 CPM 头的
     horizon 覆盖（§18 Task C 降级为 CPM 的子集）。
+
+    条件通路的两条声明入口（互斥语义由模型自身保证，不依赖调用方的额外开关）：
+
+    - ``condition_config``（含 ``arm``）+ ``condition_stats_payload``：字段级条件
+      注入；``arm='none'`` 时新编码器与 legacy 数值调制**都不构建**。
+    - ``condition_arm``：只声明臂名（``None`` = 未声明）。调用方给出 ``'none'`` 时，
+      即使 ``tfm_patho_mode='film'``（CLI 默认）也不会构建 legacy 单标量 HAMD FiLM，
+      H0 参照因此是真的无条件；未声明时 legacy RECC/MoE 线保持历史行为逐位不变。
+
+    ``cond_inject`` 决定条件真正进入哪里：``heads`` 只建双头 FiLM，``backbone`` 只建
+    条件 RMSNorm，``heads+backbone`` 两者都建（三档的构造与参数量互不相同）。
     """
 
     def __init__(
@@ -395,6 +480,18 @@ class NeuroTwinTFM(nn.Module):
         pathology_norm_mode: str = 'robust_z',
         pathology_norm_quantiles: int = 64,
         pathology_norm_rbf_knots: int = 8,
+        # ---- 条件注入（v1 revised 20261008；None/arm='none' = 不使用）----
+        condition_config: Optional[dict] = None,
+        condition_stats_payload: Optional[dict] = None,
+        condition_arm: Optional[str] = None,
+        cond_inject: str = 'heads',
+        cond_backbone_scope: str = 'last1',
+        cond_norm_generator: str = 'per_layer',
+        cond_norm_ident_dim: int = 8,
+        cond_lambda_os: float = 1.0,
+        cond_lambda_cpm: float = 1.0,
+        cond_gate_residual: bool = False,
+        cond_gate_hidden: int = 64,
         # ---- 归一化（§15）----
         use_revin: bool = True,
     ):
@@ -412,15 +509,48 @@ class NeuroTwinTFM(nn.Module):
         self.pretrain_mode = bool(pretrain_mode)
         self.use_revin = bool(use_revin)
         self.sc_prior_mode = str(sc_prior_mode)
-        # One-Step 病理条件模式（RECC 方案 §51）：HC 预训练强制 none（不构建
-        # 任何病理模块，方案 §52）；fail-fast 校验放在 moe 分支内
+        # 条件臂声明（与 CLI ``--condition_arm`` 同义）：``None`` = 调用方未声明，
+        # 保持 legacy 语义；``'none'`` = 显式声明「无条件」，此时 **legacy 单标量
+        # HAMD FiLM 也不构建**，否则 D_none 参照其实是旧模型（阶段 1 的 H0 定义）。
+        self.condition_arm = (str(condition_arm)
+                              if condition_arm is not None and str(condition_arm) != ''
+                              else None)
+        if self.condition_arm is not None and self.condition_arm not in ARMS:
+            raise ValueError(f"condition_arm 必须是 {ARMS}，收到 '{self.condition_arm}'")
+        # One-Step 病理条件模式（RECC 方案 §51）：HC 预训练不构建 **MoE** 专家
+        # （方案 §52：避免 Expert 学成健康亚型）；但条件注入（film）在 HC 预训练
+        # 是允许的——v1 revised §1.3 明确「不能继续一律禁用 HC 条件」。
+        cfg_arm = (str(dict(condition_config).get('arm', 'none'))
+                   if condition_config is not None else None)
+        if self.condition_arm is not None and cfg_arm is not None \
+                and self.condition_arm != cfg_arm:
+            raise ValueError(
+                f'condition_arm 声明（{self.condition_arm}）与 condition_config.arm'
+                f'（{cfg_arm}）不一致；两处必须同源，否则模型的「无条件」语义与'
+                '编码器配置互相矛盾。')
+        if self.condition_arm not in (None, 'none') and condition_config is None:
+            raise ValueError(
+                f"condition_arm='{self.condition_arm}' 需要同时提供 condition_config "
+                '与 condition_stats_payload；臂不能只靠声明而没有编码器配置。')
+        # 生效臂：声明值与 condition_config 一致（已由上面的检查约束），取其一即可。
+        active_arm = self.condition_arm if self.condition_arm is not None else cfg_arm
+        self.condition_disabled = active_arm == 'none'
         if self.pretrain_mode:
-            self.tfm_patho_mode = 'none'
+            if str(tfm_patho_mode) == 'moe':
+                print("[TFM-MoE] HC 预训练不构建病理专家模块：tfm_patho_mode='moe' "
+                      "自动置为 none（RECC 方案 §51）。")
+            self.tfm_patho_mode = 'film' if (
+                active_arm is not None and active_arm != 'none') else 'none'
         else:
             self.tfm_patho_mode = str(tfm_patho_mode)
             if self.tfm_patho_mode not in ('none', 'film', 'moe'):
                 raise ValueError(
                     f"tfm_patho_mode 必须是 none/film/moe，收到 {tfm_patho_mode}")
+            if self.condition_disabled and self.tfm_patho_mode != 'none':
+                print(f"[condition] arm=none：不构建 legacy 数值条件调制（"
+                      f"tfm_patho_mode='{self.tfm_patho_mode}' 置为 none）；"
+                      "如需 legacy HAMD FiLM，请保持 condition_arm 未声明。")
+                self.tfm_patho_mode = 'none'
 
         # ---- Context-only RevIN（§15：μ/σ 只由历史 context 估计）----
         self.rev_norm = BrainRevIN(num_features=features) if self.use_revin else None
@@ -435,10 +565,54 @@ class NeuroTwinTFM(nn.Module):
             return_sequence=False,
         )
 
-        # ---- 病理条件（仅 finetune；HC 预训练无条件模块）----
+        # ---- 条件通路 ----
+        # 1) 新条件注入（独立编码 + 融合）：**HC 预训练也可以建立/拟合/前反向**
+        #    （方案 §1.3 修正此前「预训练一律禁用条件」的限制）。
+        # 2) legacy 数值条件（PathologyNormalizer → FiLM）：仅在未启用新通路时构建，
+        #    两通路不共存，避免同一份临床信息进入模型两次。
+        from utils.condition_schema import ConditionStats, schema_for
+
+        self.conditioner = None
+        self.cond_norm = None
+        self.condition_cfg_dict = dict(condition_config) if condition_config else None
+        self.cond_inject = str(cond_inject)
+        if self.cond_inject not in ('heads', 'backbone', 'heads+backbone'):
+            raise ValueError(
+                f"cond_inject 必须是 heads/backbone/heads+backbone，收到 '{cond_inject}'")
+        self.cond_backbone_scope = str(cond_backbone_scope)
+        self.cond_norm_generator_mode = str(cond_norm_generator)
+        self.cond_gate_residual = bool(cond_gate_residual)
+
+        condition_cfg = None
+        if condition_config is not None:
+            condition_cfg = ConditioningConfig.from_dict(condition_config)
+        self.conditioning_on = bool(condition_cfg is not None
+                                     and condition_cfg.arm != 'none')
+        if self.condition_disabled:
+            print('[condition] arm=none：绕过条件通路（不构建编码器，也不构建 '
+                  'FiLM / legacy HAMD 数值调制）。')
+
         self.pathology_normalizer = None
         cond_dim = 0
-        if not self.pretrain_mode:
+        if self.conditioning_on:
+            if not condition_stats_payload:
+                raise ValueError(
+                    '条件注入需要 train-only 统计量快照（condition_stats_payload）；'
+                    '不允许靠运行时默认值猜测 mask/词表语义。')
+            specs = schema_for(condition_cfg.group)
+            stats = ConditionStats.from_dict(specs, condition_stats_payload)
+            # 条件编码器在 RNG 隔离作用域内构造：其初始化不消耗后续非条件模块的
+            # 随机流（同 seed 下 H0/H1 非条件参数逐位相同）。
+            with isolated_global_rng():
+                self.conditioner = build_condition_encoder(
+                    specs, stats, condition_cfg)
+            cond_dim = int(condition_cfg.cond_dim)
+            print(f'[condition] 编码器 arm={condition_cfg.arm} group={condition_cfg.group} '
+                  f'| d_demo={condition_cfg.d_demo} d_new={condition_cfg.d_new} '
+                  f'C={condition_cfg.cond_dim} H={condition_cfg.h_delta} '
+                  f'style={condition_cfg.delta_style} dropout_p={condition_cfg.dropout_p} '
+                  f'| 条件参数={self.conditioner.param_report()["total"]}')
+        elif not self.pretrain_mode and not self.condition_disabled:
             self.pathology_normalizer = PathologyNormalizer(
                 input_dim=pathology_input_dim,
                 mode=pathology_norm_mode,
@@ -460,42 +634,111 @@ class NeuroTwinTFM(nn.Module):
         self.final_norm = RMSNorm(dim)
 
         # ---- 双预测头（§9 Dual Dynamics Objective）----
+        # 两头的条件宽度必须同源：One-Step 按 pathology_mode 决定是否建 FiLM，CPM 只看
+        # cond_dim。若不在这里统一，``--condition_arm none --tfm_patho_mode none`` 会得到
+        # 「OS 无条件 + CPM 仍被 legacy 标量 FiLM 调制」的半无条件模型，D_none 参照就不可解释。
+        # ``cond_inject`` 决定头侧是否注入：'backbone' 档必须**真的**只有主干调制，
+        # 否则阶段 4 的 heads / backbone / heads+backbone 三档无法区分。
+        head_cond_dim = 0
+        if self.conditioning_on:
+            if self.cond_inject in ('heads', 'heads+backbone'):
+                head_cond_dim = cond_dim
+        elif self.tfm_patho_mode in ('film', 'moe'):
+            head_cond_dim = cond_dim
+        cond_rng_isolated = self.conditioning_on
         self.one_step_head = OneStepDynamicsHead(
             dim=dim, hidden_dim=one_step_hidden_dim, dropout=dropout,
-            cond_dim=cond_dim or None,
+            cond_dim=head_cond_dim or None,
             pathology_mode=self.tfm_patho_mode,
             num_experts=tfm_num_experts, top_k=tfm_top_k,
             expert_hidden_dim=tfm_expert_hidden_dim,
             router_hidden_dim=tfm_router_hidden_dim,
             router_temperature=tfm_router_temperature,
-            dense_warmup_epochs=tfm_moe_dense_warmup_epochs)
+            dense_warmup_epochs=tfm_moe_dense_warmup_epochs,
+            cond_lambda=cond_lambda_os,
+            cond_gate_residual=(cond_gate_residual and self.conditioning_on
+                                and self.cond_inject != 'backbone'),
+            cond_gate_hidden=cond_gate_hidden,
+            cond_rng_isolated=cond_rng_isolated)
         self.cpm_head = CPMHorizonHead(
             dim=dim, horizon=cpm_horizon, num_heads=num_heads,
             num_layers=cpm_layers, dropout=dropout,
-            cond_dim=cond_dim or None,
-            build_intervention=cpm_intervention)
+            cond_dim=head_cond_dim or None,
+            build_intervention=cpm_intervention,
+            cond_lambda=cond_lambda_cpm,
+            cond_rng_isolated=cond_rng_isolated)
+
+        # ---- 主干条件化（AdaRMSNorm；阶段 4 的注入位置候选）----
+        if self.conditioning_on and self.cond_inject in ('backbone', 'heads+backbone'):
+            with isolated_global_rng():
+                self.cond_norm = ConditionNormGenerator(
+                    cond_dim=cond_dim, dim=dim, num_layers=int(num_layers),
+                    scope=self.cond_backbone_scope,
+                    mode=self.cond_norm_generator_mode,
+                    ident_dim=cond_norm_ident_dim)
+            print(f'[condition] 主干条件 RMSNorm | scope={self.cond_backbone_scope} '
+                  f'generator={self.cond_norm_generator_mode} '
+                  f'blocks={self.cond_norm.blocks} 额外参数={self.cond_norm.n_params()}')
 
     # ------------------------------------------------------------------
     # 内部构件
     # ------------------------------------------------------------------
-    def _prepare_condition(self, pathology_score):
-        """原始临床评分 → 模型内条件向量；预训练 / 未提供时返回 None。"""
+    def _prepare_condition(self, pathology_score, condition=None,
+                           condition_epoch=None, subject_index=None):
+        """临床信息 → 模型内条件向量 ``c``；两条通路互斥，None 表示**绕过**。
+
+        Args:
+            pathology_score: legacy 数值条件（``[B, D]``）。
+            condition: 新条件注入的批次结构，dict 含 ``cond_z``/``cond_code``/
+                ``cond_mask``（各 ``[B, K]``）与可选 ``subject_index``。
+            condition_epoch: 训练 epoch（Condition Dropout 的每 epoch 固定随机源
+                键；``None`` = 推理态，关闭随机遮蔽）。
+
+        ``condition is None``（绕过条件通路）与「条件张量存在但全字段缺失」是两件
+        不同的事：后者仍产生一个真实的缺失表示，前者不产生 ``c``、FiLM 不生效。
+        """
+        if pathology_score is not None and condition is not None:
+            raise ValueError(
+                '同时收到 pathology_score（legacy 数值条件）与 condition（字段条件）；'
+                '两通路互斥，否则同一临床信息会进入模型两次且来源不可归因。')
+        if condition is not None:
+            if self.conditioner is None:
+                raise ValueError(
+                    '收到 condition 但当前模型未构建条件编码器'
+                    '（condition_config 缺失或 arm=none）。')
+            if not isinstance(condition, dict):
+                raise TypeError(
+                    f'condition 需为 dict（cond_z/cond_code/cond_mask），收到 {type(condition)}')
+            missing = [k for k in ('cond_z', 'cond_code', 'cond_mask')
+                       if condition.get(k) is None]
+            if missing:
+                raise KeyError(f'condition 缺少必需键 {missing}')
+            return self.conditioner(
+                condition['cond_z'], condition['cond_code'], condition['cond_mask'],
+                subject_index=condition.get('subject_index', None),
+                epoch=condition_epoch)
         if self.pathology_normalizer is None or pathology_score is None:
             return None
         return self.pathology_normalizer(pathology_score)
 
-    def _encode(self, x_grid: torch.Tensor, sc_matrix: torch.Tensor):
+    def _encode(self, x_grid: torch.Tensor, sc_matrix: torch.Tensor,
+                cond_mods=None):
         """[B,F,K]（已归一化）→ (context tokens [B,F,P,D], sc_info)。
 
         A_eff 由 SoftAnatomicalPrior 从归一化 context 与 SC 导出，backbone
         全层与两个预测头共享（§7：SC → Soft Anatomical Prior → A_eff →
         所有 ROI Attention）。
+
+        Args:
+            cond_mods: ``{block 下标: ((s,sh) x3)}`` 或 ``None``；``None`` 时与
+                无条件主干逐位一致（验收 H/P 的同输入比较依赖该性质）。
         """
         x4 = x_grid.unsqueeze(2)                               # [B,F,1,K]
         sc_info = self.sc_prior(x4, sc_matrix)
         tokens = self.patch_embed(x_grid)
-        for block in self.blocks:
-            tokens = block(tokens, sc_info['A_eff'])
+        for i, block in enumerate(self.blocks):
+            tokens = block(tokens, sc_info['A_eff'],
+                           cond_mods.get(i) if cond_mods else None)
         return self.final_norm(tokens), sc_info
 
     def _denorm_3d(self, pred_norm: torch.Tensor, stats) -> torch.Tensor:
@@ -536,7 +779,9 @@ class NeuroTwinTFM(nn.Module):
                 future_control: Optional[torch.Tensor] = None,
                 pathology_epoch: Optional[int] = None,
                 return_expert_pred: bool = False,
-                return_pair_pred: bool = False):
+                return_pair_pred: bool = False,
+                condition: Optional[dict] = None,
+                condition_epoch: Optional[int] = None):
         """单次前向：one-step 主输出 + CPM 全 horizon 辅助输出。
 
         Args:
@@ -579,13 +824,15 @@ class NeuroTwinTFM(nn.Module):
         if self.rev_norm is not None:
             x_norm4, norm_stats = self.rev_norm(x, 'norm')     # context-only 统计（§15）
             x_grid = x_norm4[:, :, 0, :]
-        cond = self._prepare_condition(pathology_score)
         if pathology_score is not None and self.pathology_normalizer is None:
             raise ValueError(
-                "收到 pathology_score 但当前为预训练模式（无条件模块）；"
-                "HC 预训练不应提供病理评分。")
+                "收到 pathology_score 但没有 legacy 数值条件模块（当前为预训练模式，"
+                "或已改用字段级 condition 通路）；条件注入请改传 condition=...。")
+        cond = self._prepare_condition(pathology_score, condition, condition_epoch)
+        cond_mods = (self.cond_norm(cond)
+                     if self.cond_norm is not None and cond is not None else None)
 
-        tokens, sc_info = self._encode(x_grid, sc_matrix)
+        tokens, sc_info = self._encode(x_grid, sc_matrix, cond_mods)
         # One-Step 头（§10）：最后 causal token 为 z_t
         z_t = tokens[:, :, -1, :]                              # [B,F,D]
         x_last_norm = x_grid[:, :, -1]                         # [B,F] = x_t（归一化）
@@ -629,6 +876,7 @@ class NeuroTwinTFM(nn.Module):
         aux_info = {'sc_prior': sc_info}
         if cond is not None:
             aux_info['pathology_cond'] = cond
+            aux_info['condition_injected'] = torch.ones(1, device=cond.device)
         if one_aux:
             aux_info.update(one_aux)
         if self.rev_norm is not None:
@@ -652,7 +900,9 @@ class NeuroTwinTFM(nn.Module):
 
     def predict_next_state(self, bold_history: torch.Tensor, sc_matrix: torch.Tensor,
                            pathology_score: Optional[torch.Tensor] = None,
-                           pathology_epoch: Optional[int] = None) -> dict:
+                           pathology_epoch: Optional[int] = None,
+                           condition: Optional[dict] = None,
+                           condition_epoch: Optional[int] = None) -> dict:
         """下一步全脑状态预测（one-step 头）。
 
         Returns:
@@ -661,7 +911,9 @@ class NeuroTwinTFM(nn.Module):
         """
         x = self._to_internal_history(bold_history)
         pred, aux_info = self.forward(x, sc_matrix, pathology_score,
-                                      pathology_epoch=pathology_epoch)
+                                      pathology_epoch=pathology_epoch,
+                                      condition=condition,
+                                      condition_epoch=condition_epoch)
         pred_next = pred[:, :, :, 0]                           # [B,F,1]
         x_last = bold_history[:, -1, :].unsqueeze(-1)          # [B,F,1] = x_t
         return {'pred_next': pred_next, 'pred_delta': pred_next - x_last,
@@ -670,7 +922,9 @@ class NeuroTwinTFM(nn.Module):
     def forecast_horizon(self, bold_history: torch.Tensor, sc_matrix: torch.Tensor,
                          pathology_score: Optional[torch.Tensor] = None,
                          future_control: Optional[torch.Tensor] = None,
-                         pathology_epoch: Optional[int] = None) -> torch.Tensor:
+                         pathology_epoch: Optional[int] = None,
+                         condition: Optional[dict] = None,
+                         condition_epoch: Optional[int] = None) -> torch.Tensor:
         """CPM 非自回归全 horizon 预测（§8：一次 forward 输出 t+1..t+H）。
 
         与 :meth:`rollout_next_states` 的自回归轨迹对比可量化 error
@@ -679,13 +933,17 @@ class NeuroTwinTFM(nn.Module):
         x = self._to_internal_history(bold_history)
         _, aux_info = self.forward(x, sc_matrix, pathology_score,
                                    future_control=future_control,
-                                   pathology_epoch=pathology_epoch)
+                                   pathology_epoch=pathology_epoch,
+                                   condition=condition,
+                                   condition_epoch=condition_epoch)
         return aux_info['cpm_pred'].transpose(1, 2)            # [B,H,F]
 
     def rollout_next_states(self, bold_history: torch.Tensor, sc_matrix: torch.Tensor,
                             pathology_score: Optional[torch.Tensor] = None,
                             steps: int = 1,
-                            pathology_epoch: Optional[int] = None) -> torch.Tensor:
+                            pathology_epoch: Optional[int] = None,
+                            condition: Optional[dict] = None,
+                            condition_epoch: Optional[int] = None) -> torch.Tensor:
         """free rollout：one-step 头自回归滚动 ``steps`` 步（中间不用真值）。
 
         每步取 +1 偏移预测接到
@@ -702,7 +960,9 @@ class NeuroTwinTFM(nn.Module):
         preds: List[torch.Tensor] = []
         for k in range(n_steps):
             out = self.predict_next_state(cur, sc_matrix, pathology_score,
-                                          pathology_epoch=pathology_epoch)
+                                          pathology_epoch=pathology_epoch,
+                                          condition=condition,
+                                          condition_epoch=condition_epoch)
             nxt = out['pred_next'][:, :, 0]                    # [B,F]（+1 偏移）
             preds.append(nxt)
             if k + 1 >= n_steps:
