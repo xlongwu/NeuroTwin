@@ -47,7 +47,9 @@ from models.tfm_backbone import (
     TemporalPatchEmbed,
     build_context_grid,
 )
+from models.tfm_dynamics import GraphODEDynamicsHead
 from models.tfm_experts import TFMPathologyMoE, build_pair_indices
+from models.tfm_personal import ProfileEncoder
 
 
 @contextmanager
@@ -494,6 +496,13 @@ class NeuroTwinTFM(nn.Module):
         cond_gate_hidden: int = 64,
         # ---- 归一化（§15）----
         use_revin: bool = True,
+        # ---- 受控图 ODE 动力学（方案 §6/§10；默认保留 discrete 旧路径）----
+        dynamics_mode: str = 'discrete',
+        ode_steps: int = 2,
+        dynamics_dt: float = 1.0,
+        graph_source: str = 'legacy_mask',
+        personalized: bool = False,
+        profile_dim: int = 32,
     ):
         super().__init__()
         if patch_len < 1 or context_max < patch_len:
@@ -509,6 +518,29 @@ class NeuroTwinTFM(nn.Module):
         self.pretrain_mode = bool(pretrain_mode)
         self.use_revin = bool(use_revin)
         self.sc_prior_mode = str(sc_prior_mode)
+        # ---- 动力学头选择（方案 §6/§10：graph_ode 新路线，discrete 保留旧调用）----
+        self.dynamics_mode = str(dynamics_mode)
+        if self.dynamics_mode not in ('discrete', 'graph_ode'):
+            raise ValueError(
+                f"dynamics_mode 必须是 discrete/graph_ode，收到 '{dynamics_mode}'")
+        if self.dynamics_mode == 'graph_ode' and str(tfm_patho_mode) == 'moe':
+            raise ValueError(
+                'graph_ode 路线不组合 MoE/RECC（方案 §11）：'
+                "请使用 tfm_patho_mode='film'/'none' 或 dynamics_mode=discrete。")
+        self.ode_steps = int(ode_steps)
+        if self.ode_steps < 1:
+            raise ValueError(f'ode_steps 必须 >= 1，收到 {ode_steps}')
+        self.dynamics_dt = float(dynamics_dt)
+        if self.dynamics_dt <= 0:
+            raise ValueError(f'dynamics_dt 必须为正，收到 {dynamics_dt}')
+        self.graph_source = str(graph_source)
+        if self.graph_source not in ('legacy_mask', 'history_fc'):
+            raise ValueError(
+                f"graph_source 必须是 legacy_mask/history_fc，收到 '{graph_source}'")
+        self.personalized = bool(personalized)
+        self.profile_dim = int(profile_dim) if self.personalized else 0
+        if self.personalized and self.profile_dim < 1:
+            raise ValueError(f'profile_dim 必须 >= 1，收到 {profile_dim}')
         # 条件臂声明（与 CLI ``--condition_arm`` 同义）：``None`` = 调用方未声明，
         # 保持 legacy 语义；``'none'`` = 显式声明「无条件」，此时 **legacy 单标量
         # HAMD FiLM 也不构建**，否则 D_none 参照其实是旧模型（阶段 1 的 H0 定义）。
@@ -646,20 +678,28 @@ class NeuroTwinTFM(nn.Module):
         elif self.tfm_patho_mode in ('film', 'moe'):
             head_cond_dim = cond_dim
         cond_rng_isolated = self.conditioning_on
-        self.one_step_head = OneStepDynamicsHead(
-            dim=dim, hidden_dim=one_step_hidden_dim, dropout=dropout,
-            cond_dim=head_cond_dim or None,
-            pathology_mode=self.tfm_patho_mode,
-            num_experts=tfm_num_experts, top_k=tfm_top_k,
-            expert_hidden_dim=tfm_expert_hidden_dim,
-            router_hidden_dim=tfm_router_hidden_dim,
-            router_temperature=tfm_router_temperature,
-            dense_warmup_epochs=tfm_moe_dense_warmup_epochs,
-            cond_lambda=cond_lambda_os,
-            cond_gate_residual=(cond_gate_residual and self.conditioning_on
-                                and self.cond_inject != 'backbone'),
-            cond_gate_hidden=cond_gate_hidden,
-            cond_rng_isolated=cond_rng_isolated)
+        if self.dynamics_mode == 'graph_ode':
+            # 受控图 ODE 头（方案 §6.1）：替换 One-Step 头，不构建第二套闲置参数
+            self.one_step_head = GraphODEDynamicsHead(
+                dim=dim, hidden_dim=one_step_hidden_dim,
+                cond_dim=head_cond_dim or None,
+                profile_dim=self.profile_dim or None,
+                ode_steps=self.ode_steps)
+        else:
+            self.one_step_head = OneStepDynamicsHead(
+                dim=dim, hidden_dim=one_step_hidden_dim, dropout=dropout,
+                cond_dim=head_cond_dim or None,
+                pathology_mode=self.tfm_patho_mode,
+                num_experts=tfm_num_experts, top_k=tfm_top_k,
+                expert_hidden_dim=tfm_expert_hidden_dim,
+                router_hidden_dim=tfm_router_hidden_dim,
+                router_temperature=tfm_router_temperature,
+                dense_warmup_epochs=tfm_moe_dense_warmup_epochs,
+                cond_lambda=cond_lambda_os,
+                cond_gate_residual=(cond_gate_residual and self.conditioning_on
+                                    and self.cond_inject != 'backbone'),
+                cond_gate_hidden=cond_gate_hidden,
+                cond_rng_isolated=cond_rng_isolated)
         self.cpm_head = CPMHorizonHead(
             dim=dim, horizon=cpm_horizon, num_heads=num_heads,
             num_layers=cpm_layers, dropout=dropout,
@@ -667,6 +707,12 @@ class NeuroTwinTFM(nn.Module):
             build_intervention=cpm_intervention,
             cond_lambda=cond_lambda_cpm,
             cond_rng_isolated=cond_rng_isolated)
+
+        # ---- 个体基线 profile（方案 §5；personalized=False 不创建）----
+        self.profile_encoder = None
+        if self.personalized:
+            self.profile_encoder = ProfileEncoder(
+                dim=dim, profile_dim=self.profile_dim, hidden=64)
 
         # ---- 主干条件化（AdaRMSNorm；阶段 4 的注入位置候选）----
         if self.conditioning_on and self.cond_inject in ('backbone', 'heads+backbone'):
@@ -741,6 +787,28 @@ class NeuroTwinTFM(nn.Module):
                            cond_mods.get(i) if cond_mods else None)
         return self.final_norm(tokens), sc_info
 
+    def _history_fc_adj(self, x_grid: torch.Tensor) -> torch.Tensor:
+        """当前可见历史的 signed Pearson 功能耦合图（方案 §4.2）。
+
+        x_grid ``[B,F,K]``（归一化或数据尺度均可：Pearson 相关对逐 ROI 仿射不变）
+        → ``[B,F,F]``：取绝对值、清零对角。该图作为 SoftAnatomicalPrior 的输入，
+        复用其混合、self-loop 与 Sinkhorn；它是**功能耦合图**，不默认称独立解剖 SC。
+        """
+        r = x_grid - x_grid.mean(dim=-1, keepdim=True)
+        num = torch.bmm(r, r.transpose(1, 2))
+        denom = torch.sqrt((r * r).sum(-1, keepdim=True) + 1e-6)   # [B,F,1]
+        c_hist = num / (denom * denom.transpose(1, 2))
+        a_hist = c_hist.abs()
+        f = x_grid.shape[1]
+        eye = torch.eye(f, dtype=torch.bool, device=x_grid.device)
+        return a_hist.masked_fill(eye, 0.0)
+
+    def _graph_input(self, x_grid: torch.Tensor, sc_matrix: torch.Tensor):
+        """graph_source 路由：history_fc 用可见历史 FC；legacy_mask 用外部图。"""
+        if self.graph_source == 'history_fc':
+            return self._history_fc_adj(x_grid)
+        return sc_matrix
+
     def _denorm_3d(self, pred_norm: torch.Tensor, stats) -> torch.Tensor:
         """[B,F,H]（归一化）→ 原始空间（复用 BrainRevIN 的仿射反变换）。"""
         if self.rev_norm is None:
@@ -781,7 +849,12 @@ class NeuroTwinTFM(nn.Module):
                 return_expert_pred: bool = False,
                 return_pair_pred: bool = False,
                 condition: Optional[dict] = None,
-                condition_epoch: Optional[int] = None):
+                condition_epoch: Optional[int] = None,
+                controls: Optional[torch.Tensor] = None,
+                time_deltas: Optional[torch.Tensor] = None,
+                dynamics_horizon: Optional[int] = None,
+                calibration_bold: Optional[torch.Tensor] = None,
+                profile: Optional[torch.Tensor] = None):
         """单次前向：one-step 主输出 + CPM 全 horizon 辅助输出。
 
         Args:
@@ -832,20 +905,61 @@ class NeuroTwinTFM(nn.Module):
         cond_mods = (self.cond_norm(cond)
                      if self.cond_norm is not None and cond is not None else None)
 
-        tokens, sc_info = self._encode(x_grid, sc_matrix, cond_mods)
-        # One-Step 头（§10）：最后 causal token 为 z_t
+        graph_input = self._graph_input(x_grid, sc_matrix)
+        tokens, sc_info = self._encode(x_grid, graph_input, cond_mods)
+        # One-Step / 图 ODE 头：最后 causal token 为初始 latent 状态
         z_t = tokens[:, :, -1, :]                              # [B,F,D]
         x_last_norm = x_grid[:, :, -1]                         # [B,F] = x_t（归一化）
-        need_expert = bool(return_expert_pred) and self.tfm_patho_mode == 'moe'
-        need_pair = need_expert and bool(return_pair_pred)
-        delta_norm, one_aux = self.one_step_head(
-            z_t, sc_info['A_eff'], cond,
-            pathology_epoch=pathology_epoch,
-            return_expert_pred=need_expert,
-            return_pair_pred=need_pair)
-        one_pred_norm = (x_last_norm + delta_norm).unsqueeze(-1).unsqueeze(-1)
 
-        if need_expert and 'tfm_expert_delta_norm' in one_aux:
+        dyn_aux = None
+        if self.dynamics_mode == 'graph_ode':
+            one_aux = {}    # graph_ode 无旧 one-step 头 aux（下方统一 update 消费）
+            # ---- 受控图 ODE 分支（方案 §6.3.1）：同一次编码创建初始状态 ----
+            if self.tfm_patho_mode == 'moe' or return_expert_pred or return_pair_pred:
+                raise ValueError(
+                    'graph_ode 路线不组合 MoE/RECC/expert candidate（方案 §11）；'
+                    '请使用 dynamics_mode=discrete。')
+            if future_control is not None:
+                raise ValueError(
+                    'future_control [B,F,H] 只属于 legacy CPM；受控动态请传 '
+                    'controls [B,H,F]，两者不自动转置混用。')
+            if self.personalized:
+                if profile is None and calibration_bold is not None:
+                    # 基线另走一次共享编码器；训练时保持梯度，不缓存 detached tokens
+                    profile = self.calibrate_profile(calibration_bold)
+                elif profile is None:
+                    raise ValueError(
+                        'personalized=True 的 forward 需要 profile 或 '
+                        'calibration_bold 之一（不偷偷从包含未来的全序列计算）。')
+            else:
+                profile = None
+            # dynamics_horizon 是可选覆盖，缺省复用 CPM H（不新增 horizon CLI）
+            dyn_h = (int(dynamics_horizon)
+                     if dynamics_horizon is not None else self.cpm_horizon)
+            z_final, q_traj_norm, z_traj = self.one_step_head(
+                z_t, x_last_norm, sc_info['A_eff'], cond=cond, profile=profile,
+                controls=controls, time_deltas=time_deltas, horizon=dyn_h)
+            del z_final   # forward 只消费 q 轨迹；latent 末状态经 state API 使用
+            # 主输出 = 动态轨迹第一帧（反归一化后 [B,F,1,1]），不再额外加 x_last
+            one_pred_norm = q_traj_norm[:, :, 0:1].unsqueeze(-1)
+            logvar_hf = self.one_step_head.variance_head(z_traj.detach())
+            dyn_aux = {'dynamics_mean_norm': q_traj_norm,          # [B,F,H]
+                       'dynamics_logvar_norm': logvar_hf.permute(0, 2, 1),
+                       'norm_stats': norm_stats}
+            if profile is not None:
+                dyn_aux['personal_profile'] = profile              # [B,profile_dim]
+        else:
+            need_expert = bool(return_expert_pred) and self.tfm_patho_mode == 'moe'
+            need_pair = need_expert and bool(return_pair_pred)
+            delta_norm, one_aux = self.one_step_head(
+                z_t, sc_info['A_eff'], cond,
+                pathology_epoch=pathology_epoch,
+                return_expert_pred=need_expert,
+                return_pair_pred=need_pair)
+            one_pred_norm = (x_last_norm + delta_norm).unsqueeze(-1).unsqueeze(-1)
+
+        if self.dynamics_mode != 'graph_ode' and need_expert \
+                and 'tfm_expert_delta_norm' in one_aux:
             # 完整预测契约（candidate_schema v2，RECC 执行计划 §5.1）：candidate
             # 与正式 mixture 输出走同一 residual → 加锚 state → denorm 链路。
             # 共同偏移不会在“candidate 与 target 的损失”中自动抵消，漏锚会改变
@@ -879,6 +993,24 @@ class NeuroTwinTFM(nn.Module):
             aux_info['condition_injected'] = torch.ones(1, device=cond.device)
         if one_aux:
             aux_info.update(one_aux)
+        if dyn_aux is not None:
+            if self.rev_norm is not None:
+                dyn_aux['dynamics_pred'] = self._denorm_3d(
+                    dyn_aux['dynamics_mean_norm'], norm_stats)   # [B,F,H] 数据尺度
+                # 数据尺度 std：σ_norm · s / |a + eps|（复用实际 RevIN 分母，方案 §6.4；
+                # 是 abs(affine_weight + eps)，不是 abs(affine_weight) + eps）
+                sigma_norm = torch.exp(0.5 * dyn_aux['dynamics_logvar_norm'])
+                _, std_s = norm_stats                            # [B,F,1,1]
+                a_w = self.rev_norm.affine_weight                # [F]
+                denom = (a_w + self.rev_norm.eps).abs().view(1, -1, 1)
+                dyn_aux['dynamics_std'] = (sigma_norm
+                                           * std_s.to(sigma_norm.dtype)[:, :, 0, 0].unsqueeze(-1)
+                                           / denom)
+            else:
+                dyn_aux['dynamics_pred'] = dyn_aux['dynamics_mean_norm']
+                dyn_aux['dynamics_std'] = torch.exp(
+                    0.5 * dyn_aux['dynamics_logvar_norm'])
+            aux_info.update(dyn_aux)
         if self.rev_norm is not None:
             one_pred = self.rev_norm(one_pred_norm, 'denorm', stats=norm_stats)
             cpm_pred = self._denorm_3d(cpm_pred_norm, norm_stats)
@@ -902,14 +1034,39 @@ class NeuroTwinTFM(nn.Module):
                            pathology_score: Optional[torch.Tensor] = None,
                            pathology_epoch: Optional[int] = None,
                            condition: Optional[dict] = None,
-                           condition_epoch: Optional[int] = None) -> dict:
-        """下一步全脑状态预测（one-step 头）。
+                           condition_epoch: Optional[int] = None,
+                           control: Optional[torch.Tensor] = None,
+                           dt: Optional[torch.Tensor] = None,
+                           calibration_bold: Optional[torch.Tensor] = None,
+                           profile: Optional[torch.Tensor] = None) -> dict:
+        """下一步全脑状态预测（one-step / 图 ODE 单区间）。
 
+        graph_ode 分支显式设动态 H=1（只为首步积分，避免无用的 H=8 动态运算），
+        经 state API 初始化一次后 ``advance_state`` 推进一个区间。
+
+        Args:
+            control: [B,F] 或 [B,F,1] 区间控制（仅 graph_ode）；dt: [B] 或 None。
         Returns:
             dict：``pred_next`` [B,F,1]（原始空间）、``pred_delta`` [B,F,1]、
-            ``pred`` [B,F,1,1]、``aux_info``（含 ``cpm_pred`` [B,F,H]）。
+            ``pred`` [B,F,1,1]、``aux_info``。
         """
         x = self._to_internal_history(bold_history)
+        if self.dynamics_mode == 'graph_ode':
+            state = self.initialize_state(
+                bold_history, sc_matrix=sc_matrix,
+                pathology_score=pathology_score, condition=condition,
+                condition_epoch=condition_epoch, profile=profile,
+                calibration_bold=calibration_bold)
+            if control is not None and control.ndim == 2:
+                control = control.unsqueeze(-1)                # [B,F,1]
+            state = self.advance_state(state, control=control, dt=dt)
+            pred_next = self.readout_state(state).unsqueeze(-1)  # [B,F,1]
+            x_last = bold_history[:, -1, :].unsqueeze(-1)      # [B,F,1] = x_t
+            aux_info = {'norm_stats': state['norm_stats']}
+            if state['profile'] is not None:
+                aux_info['personal_profile'] = state['profile']
+            return {'pred_next': pred_next, 'pred_delta': pred_next - x_last,
+                    'pred': pred_next.unsqueeze(-1), 'aux_info': aux_info}
         pred, aux_info = self.forward(x, sc_matrix, pathology_score,
                                       pathology_epoch=pathology_epoch,
                                       condition=condition,
@@ -943,17 +1100,53 @@ class NeuroTwinTFM(nn.Module):
                             steps: int = 1,
                             pathology_epoch: Optional[int] = None,
                             condition: Optional[dict] = None,
-                            condition_epoch: Optional[int] = None) -> torch.Tensor:
-        """free rollout：one-step 头自回归滚动 ``steps`` 步（中间不用真值）。
+                            condition_epoch: Optional[int] = None,
+                            controls: Optional[torch.Tensor] = None,
+                            time_deltas: Optional[torch.Tensor] = None,
+                            calibration_bold: Optional[torch.Tensor] = None,
+                            profile: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """free rollout：连续 ``steps`` 步状态推进，返回 [B, steps, F]。
 
-        每步取 +1 偏移预测接到
-        context 末尾、滑出最早 1 个 TR，返回 [B, steps, F]。
+        graph_ode 分支只初始化**一次**当前历史（固定图、c/p、RevIN stats），
+        随后按 ``controls [B,steps,F]`` 与 ``time_deltas [steps]`` 或 ``[B,steps]``
+        持续推进同一 latent/BOLD 状态，不回填预测后再次编码（方案 §6.3.1）。
+        discrete 分支保留原自回归滑窗实现，且不支持新动态参数。
         """
         if bold_history.ndim != 3:
             raise ValueError(f"bold_history 期望 [B, K, F]，收到 {tuple(bold_history.shape)}")
         n_steps = int(steps)
         if n_steps < 1:
             raise ValueError(f"steps 必须 >= 1，收到 {n_steps}")
+        if self.dynamics_mode == 'graph_ode':
+            b, _, f_dim = bold_history.shape
+            if controls is not None and tuple(controls.shape) != (b, n_steps, f_dim):
+                raise ValueError(
+                    f'controls 期望 [B,{n_steps},{f_dim}]，收到 {tuple(controls.shape)}')
+            if time_deltas is not None and time_deltas.shape[-1] != n_steps:
+                raise ValueError(
+                    f'time_deltas 末维 {time_deltas.shape[-1]} 与 steps={n_steps} 不一致')
+            state = self.initialize_state(
+                bold_history, sc_matrix=sc_matrix,
+                pathology_score=pathology_score, condition=condition,
+                condition_epoch=condition_epoch, profile=profile,
+                calibration_bold=calibration_bold)
+            outs: List[torch.Tensor] = []
+            for k in range(n_steps):
+                u = controls[:, k, :] if controls is not None else None
+                dt_sel = None
+                if time_deltas is not None:
+                    dt_sel = (time_deltas[:, k] if time_deltas.ndim == 2
+                              else time_deltas[k])
+                state = self.advance_state(
+                    state, control=(u.unsqueeze(-1) if u is not None else None),
+                    dt=dt_sel)
+                outs.append(self.readout_state(state))
+            return torch.stack(outs, dim=1)                    # [B, steps, F]
+        if controls is not None or time_deltas is not None \
+                or profile is not None or calibration_bold is not None:
+            raise ValueError(
+                'controls/time_deltas/profile/calibration_bold 仅支持 '
+                'dynamics_mode=graph_ode；discrete 路线不模拟假持续状态。')
         if bold_history.shape[1] < 2:
             raise ValueError("rollout_next_states 至少需要 K >= 2 的 context 才能滑窗。")
         cur = bold_history
@@ -969,3 +1162,215 @@ class NeuroTwinTFM(nn.Module):
                 break
             cur = torch.cat([cur[:, 1:, :], nxt.unsqueeze(1)], dim=1)
         return torch.stack(preds, dim=1)                       # [B, steps, F]
+
+    # ------------------------------------------------------------------
+    # graph_ode 持续状态 API（方案 §6.3；discrete 不维护持续状态，不支持）
+    # ------------------------------------------------------------------
+    def _require_graph_ode(self, api: str) -> None:
+        if self.dynamics_mode != 'graph_ode':
+            raise ValueError(
+                f'{api} 仅支持 dynamics_mode=graph_ode；discrete 路线不维护'
+                '持续 latent/BOLD 状态，不伪造等价接口。')
+
+    def _denorm_q(self, q: torch.Tensor, norm_stats) -> torch.Tensor:
+        """RevIN 空间 q [B,F] → 数据尺度（复用 BrainRevIN 统计量与 affine）。"""
+        if self.rev_norm is None:
+            return q
+        out = self.rev_norm(q.unsqueeze(-1).unsqueeze(-1), 'denorm', stats=norm_stats)
+        return out.squeeze(-1).squeeze(-1)
+
+    def _encode_history_internal(self, history: torch.Tensor, sc_matrix,
+                                 cond: Optional[torch.Tensor] = None):
+        """数据尺度 history [B,K,F] → (tokens, x_grid_norm, norm_stats, sc_info)。
+
+        图输入按 graph_source 路由（history_fc 从当前可见历史计算 FC）；
+        cond 已编码时按需生成主干 AdaRMSNorm 调制（与 forward 口径一致）。
+        """
+        x = history.transpose(1, 2).unsqueeze(2)               # [B,F,1,K]
+        norm_stats = None
+        if self.rev_norm is not None:
+            x_norm4, norm_stats = self.rev_norm(x, 'norm')
+            x_grid = x_norm4[:, :, 0, :]
+        else:
+            x_grid = x[:, :, 0, :]
+        cond_mods = None
+        if self.cond_norm is not None and cond is not None:
+            cond_mods = self.cond_norm(cond)
+        graph_input = self._graph_input(x_grid, sc_matrix)
+        tokens, sc_info = self._encode(x_grid, graph_input, cond_mods)
+        return tokens, x_grid, norm_stats, sc_info
+
+    def _symmetrize_adj(self, a_eff: torch.Tensor) -> torch.Tensor:
+        """A_eff → 非负对称图 A（方案 §6.1.1：动态头只做对称化，不另学图）。"""
+        return 0.5 * (a_eff + a_eff.transpose(-1, -2))
+
+    def calibrate_profile(self, calibration_bold: torch.Tensor) -> torch.Tensor:
+        """基线 ``[B,F,1,L]`` → p ``[B,profile_dim]``（共享编码器一次，方案 §5/§6.3）。
+
+        基线编码不注入当前临床 FiLM/AdaRMSNorm；图输入取基线前缀自身的可见
+        历史 FC（与 history_fc 的历史图同一定义，不需要外部 SC）。训练 forward
+        内调用时保持梯度，不跨 optimizer step 缓存 detached tokens；推理每人
+        计算一次后供 rollout / observation update 复用。
+        """
+        if self.profile_encoder is None:
+            raise ValueError(
+                'personalized=False 未创建 profile 模块，无基线校准可言。')
+        if calibration_bold.ndim != 4 or calibration_bold.shape[2] != 1:
+            raise ValueError(
+                f'calibration_bold 期望 [B,F,1,L]，收到 {tuple(calibration_bold.shape)}')
+        x_grid, _ = build_context_grid(calibration_bold)       # [B,F,L]
+        if self.rev_norm is not None:
+            cal_norm4, _ = self.rev_norm(calibration_bold, 'norm')
+            x_grid = cal_norm4[:, :, 0, :]
+        graph_input = self._history_fc_adj(x_grid)
+        tokens, _ = self._encode(x_grid, graph_input, None)
+        return self.profile_encoder(tokens)
+
+    def initialize_state(self, history: torch.Tensor, sc_matrix=None,
+                         pathology_score: Optional[torch.Tensor] = None,
+                         condition: Optional[dict] = None,
+                         condition_epoch: Optional[int] = None,
+                         profile: Optional[torch.Tensor] = None,
+                         calibration_bold: Optional[torch.Tensor] = None) -> dict:
+        """当前历史 ``[B,K,F]``（数据尺度）→ 状态 dict（方案 §6.3）。
+
+        返回普通 dict：``z [B,F,D]``（最后 patch token，无额外状态投影）、
+        ``q [B,F]``（RevIN 空间）、``adj [B,F,F]``（A_eff 对称化）、
+        ``cond [B,C]``（字段编码一次）、``profile [B,P]``、``norm_stats``、
+        ``history [B,K,F]``（数据尺度 buffer）。legacy_mask 路线额外携带
+        ``sc_matrix`` 供 update_state 重编码复用；history_fc 无需外部 SC。
+
+        字段级条件（condition dict）与 legacy 数值评分不得同时传入
+        （与 forward 同一互斥约束，由 :meth:`_prepare_condition` 检查）。
+        """
+        self._require_graph_ode('initialize_state')
+        if history.ndim != 3:
+            raise ValueError(f'history 期望 [B,K,F]，收到 {tuple(history.shape)}')
+        if self.graph_source == 'legacy_mask' and sc_matrix is None:
+            raise ValueError(
+                'graph_source=legacy_mask 的 initialize_state 必须提供外部图 '
+                'sc_matrix；history_fc 从当前可见历史计算图。')
+        cond = self._prepare_condition(pathology_score, condition, condition_epoch)
+        if self.personalized:
+            if profile is None:
+                if calibration_bold is None:
+                    raise ValueError(
+                        'personalized=True 的 initialize_state 需要 profile 或 '
+                        'calibration_bold 之一；不偷偷从包含未来的全序列计算。')
+                profile = self.calibrate_profile(calibration_bold)
+        else:
+            profile = None
+        tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
+            history, sc_matrix, cond)
+        state = {'z': tokens[:, :, -1, :], 'q': x_grid[:, :, -1],
+                 'adj': self._symmetrize_adj(sc_info['A_eff']),
+                 'cond': cond, 'profile': profile,
+                 'norm_stats': norm_stats, 'history': history}
+        if self.graph_source == 'legacy_mask':
+            state['sc_matrix'] = sc_matrix
+        return state
+
+    def advance_state(self, state: dict, control: Optional[torch.Tensor] = None,
+                      dt: Optional[torch.Tensor] = None) -> dict:
+        """推进一个预测区间：更新 z/q/history；图、p、已编码 c、RevIN stats 固定。
+
+        Args:
+            control: [B,F] 或 [B,F,1] 区间控制；None 与全零严格等价。
+            dt: [B] 区间长度（TR）；None 用构造参数 ``dynamics_dt``。
+
+        返回**新** dict，不原位覆盖、不对 z/q detach（保留反向图）；
+        history 以数据尺度预测帧滑窗更新（追加末帧、丢弃最早帧，K 不变）。
+        """
+        self._require_graph_ode('advance_state')
+        if control is not None and control.ndim == 2:
+            control = control.unsqueeze(-1)                    # [B,F,1]
+        if dt is None:
+            dt = torch.full((state['z'].shape[0],), float(self.dynamics_dt),
+                            device=state['z'].device, dtype=torch.float32)
+        z_new, q_new = self.one_step_head.integrate_interval(
+            state['z'], state['q'], state['adj'], dt,
+            cond=state['cond'], profile=state['profile'], control=control)
+        x_new = self._denorm_q(q_new, state['norm_stats'])     # [B,F] 数据尺度
+        history_new = torch.cat(
+            [state['history'][:, 1:, :], x_new.unsqueeze(1)], dim=1)
+        new_state = dict(state)
+        new_state.update({'z': z_new, 'q': q_new, 'history': history_new})
+        return new_state
+
+    def readout_state(self, state: dict) -> torch.Tensor:
+        """q 反归一化 → 数据尺度 [B,F]；不再次编码。"""
+        self._require_graph_ode('readout_state')
+        return self._denorm_q(state['q'], state['norm_stats'])
+
+    def update_state(self, state: dict, observation: torch.Tensor) -> dict:
+        """真实观测（数据尺度 [B,F]，对齐当前预测时点）替换 history 末帧并重编码。
+
+        重新估计当前 RevIN / 图 / Z / q；**保留** profile 与已编码 c（不重复
+        条件编码或 profile 计算）。这是观测重编码更新，不是 Bayesian 同化；
+        首版只支持完整 ROI 观测。
+        """
+        self._require_graph_ode('update_state')
+        if observation.ndim != 2:
+            raise ValueError(
+                f'observation 期望 [B,F]，收到 {tuple(observation.shape)}')
+        history_new = state['history'].clone()
+        expected = (history_new.shape[0], history_new.shape[2])
+        if tuple(observation.shape) != expected:
+            raise ValueError(
+                f'observation 期望 [B={expected[0]},F={expected[1]}]，'
+                f'收到 {tuple(observation.shape)}')
+        history_new[:, -1, :] = observation
+        sc_matrix = state.get('sc_matrix')
+        tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
+            history_new, sc_matrix, state['cond'])
+        new_state = dict(state)
+        new_state.update({'z': tokens[:, :, -1, :], 'q': x_grid[:, :, -1],
+                          'adj': self._symmetrize_adj(sc_info['A_eff']),
+                          'norm_stats': norm_stats, 'history': history_new})
+        return new_state
+
+    def simulate_intervention(self, history: torch.Tensor, controls: torch.Tensor,
+                              sc_matrix=None,
+                              pathology_score: Optional[torch.Tensor] = None,
+                              condition: Optional[dict] = None,
+                              condition_epoch: Optional[int] = None,
+                              profile: Optional[torch.Tensor] = None,
+                              calibration_bold: Optional[torch.Tensor] = None,
+                              time_deltas: Optional[torch.Tensor] = None):
+        """同初始状态分别用 U 与零 U 推进 H 步（方案 §6.3/§6.3.1）。
+
+        Args:
+            history: [B,K,F] 数据尺度；controls: [B,H,F] 新布局逐区间控制。
+        Returns:
+            (x_ctrl [B,H,F], x_zero [B,H,F], diff [B,H,F])；差值由两条反归一化
+            轨迹相减，不对增量单独加均值。
+        """
+        self._require_graph_ode('simulate_intervention')
+        if controls is None or controls.ndim != 3:
+            raise ValueError(
+                f'controls 期望 [B,H,F]，收到 '
+                f'{tuple(controls.shape) if controls is not None else None}')
+        b, h_out, f_dim = controls.shape
+        if history.shape[0] != b or history.shape[2] != f_dim:
+            raise ValueError(
+                f'history [B,K,F]={tuple(history.shape)} 与 controls '
+                f'[B,H,F]={tuple(controls.shape)} 的 B/F 不一致')
+        state0 = self.initialize_state(
+            history, sc_matrix=sc_matrix, pathology_score=pathology_score,
+            condition=condition, condition_epoch=condition_epoch,
+            profile=profile, calibration_bold=calibration_bold)
+        xs_ctrl, xs_zero = [], []
+        ctrl_state, zero_state = state0, state0
+        for k in range(h_out):
+            u = controls[:, k, :].unsqueeze(-1)                # [B,F,1]
+            dt_sel = None
+            if time_deltas is not None:
+                dt_sel = (time_deltas[:, k] if time_deltas.ndim == 2
+                          else time_deltas[k])
+            ctrl_state = self.advance_state(ctrl_state, control=u, dt=dt_sel)
+            zero_state = self.advance_state(zero_state, control=None, dt=dt_sel)
+            xs_ctrl.append(self.readout_state(ctrl_state))
+            xs_zero.append(self.readout_state(zero_state))
+        x_ctrl = torch.stack(xs_ctrl, dim=1)                   # [B,H,F]
+        x_zero = torch.stack(xs_zero, dim=1)                   # [B,H,F]
+        return x_ctrl, x_zero, x_ctrl - x_zero

@@ -19,8 +19,7 @@ NeuroTwin-TFM 的病理条件化新路径：One-Step 头拆分为::
 - RECC 耦合分支（§21/§33）：``coupling_probs`` 在 **detach 后**的 state/cond 上
   用同一 Router 计算完整 soft 分布，使 KL 梯度只更新 Router 参数。
 
-本文件不依赖 models/tfm.py（由 tfm.py 单向导入，避免循环导入）；
-与已移除的 legacy MoE（models/neurotwin_moe.py / train/moe.py）无代码共享。
+本文件不依赖 models/tfm.py（由 tfm.py 单向导入，避免循环导入）。
 """
 from typing import Dict, Optional
 

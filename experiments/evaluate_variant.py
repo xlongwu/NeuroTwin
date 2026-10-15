@@ -147,6 +147,12 @@ def build_model_from_args(args, device, condition_bundle=None):
                      'cond_gate_residual', 'cond_gate_hidden'):
             if hasattr(args, name):
                 kwargs[name] = getattr(args, name)
+    # ARCH_VERSION 6 溯源：旧 v5 checkpoint 的快照不含动态路线字段，按
+    # discrete / personalized=False / legacy_mask 默认重建（参数集合与 v5 一致，
+    # strict 加载可过；绝不把旧 one-step 头权重迁移到 ODE 头）
+    if any(not hasattr(args, n) for n in ('dynamics_mode', 'graph_source', 'personalized')):
+        log.info('[arch] 快照缺少动态路线字段（arch_version<6 旧 checkpoint），'
+                 '按 discrete/personalized=False/legacy_mask 重建')
     return NeuroTwinTFM(**kwargs).to(device)
 
 
@@ -191,6 +197,11 @@ def build_eval_loader(args, eval_split, refresh_split_manifest=False):
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
         eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
+        # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
+        num_rois=int(getattr(args, 'num_rois', 116)),
+        graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
+        calibration_length=int(getattr(args, 'calibration_length', 0) or 0),
+        control_manifest=(getattr(args, 'control_manifest', '') or None),
     )
     if eval_split == 'test':
         return loader.get_test(), loader.get_test_subjects()

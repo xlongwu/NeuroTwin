@@ -8,7 +8,7 @@
 - 产出 JSON（train/val/test ID 清单 + 站点统计）与 CSV（id→split 映射），供 dataloader 通过 --split_file 复用。
 
 用法：
-    python scripts/site_stratified_split.py --data_root data --groups MDD HC --ratio 8:1:1 --seed 2024
+    python utils/site_stratified_split.py --data_root data --groups MDD HC --ratio 8:1:1 --seed 2024
 """
 import argparse
 import json

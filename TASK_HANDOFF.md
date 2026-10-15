@@ -1784,7 +1784,7 @@ main.py 的 fresh 来源闸门怎么处理」，用户选 **整体移除（彻�
 | 搜索编排器的**执行链路**端到端 smoke | ~~完成~~ **已随编排器删除（2026-10-10，§0.26）**：`test_O_runner_execute_end_to_end_reuses_completed_trials` 所在文件被裁掉 |
 | 阶段 1–5 正式搜索 | **已取消**（用户 2026-10-10 决定不跑对比，改为选定单一方案 `cat`，§0.26）；不是"待运行" |
 | test 留出评估 | **口径变了（不再是人工一次性闸门）**：`main.py:1149-1159` 让 finetune 结束就自动评 test 并落盘 `<save_dir>/eval/metrics_test.json`；本轮无搜索 ⇒ 无"挑赢家再看 test"的选择性偏差，但重复微调＝重复看 test。要保留人工闸门需显式 `--no_eval_after_train`，见 §7.1 第 3 条 |
-| **正式训练入口（当前唯一）：`Pretrain_HC_tfm.sh` → `Finetune_MDD_tfm.sh`** | **就绪、未实机训练**：2026-10-10 第三次变更后不再需要 `STUDY_ID`/`STUDY_ROOT`/`LEGACY`，起点串接靠 `CHECKPOINT_DIR`（默认 `$ROOT/checkpoints`）下的 `hc_demo*/base_best.pt`，0 个/多个候选都拒绝；真实拼装命令行已过 `main.parse_args()` + 随机来源分离校验，但 **完整 150 epoch 训练从未在本轮跑过**，见 §7.1 |
+| **正式训练入口（当前唯一）：`Pretrain_HC_tfm.sh` → `Finetune_MDD_tfm.sh`** | **就绪、未实机训练**：2026-10-10 第三次变更后不再需要 `STUDY_ID`/`STUDY_ROOT`/`LEGACY`，起点串接靠 `CHECKPOINT_DIR`（默认 `$ROOT/checkpoints`）下的 `neurotwin_tfm_pretrain*/base_best.pt`（目录名 2026-10-11 由 `hc_demo` 改为此名），0 个/多个候选都拒绝；真实拼装命令行已过 `main.parse_args()` + 随机来源分离校验，但 **完整 150 epoch 训练从未在本轮跑过**，见 §7.1 |
 | **来源证明（HC 随机初始化 / MDD 继承本轮 HC / SHA256 追溯）** | **已无代码保证**（§0.27）：`fresh_study_gate` 与 `condition_study.py` 一起删除，`main.py` 不校验权重来源、不拒历史权重。仅随机来源分离（§四）改由 `main.check_seed_separation()` 无条件保住 |
 | **臂间/对照增益结论** | **无法给出**：对照臂与产出它们的编排器一起删除，留下的 `demo`/`none` 只是取值，不是同预算对照实验（§0.26 代价清单） |
 
@@ -2395,10 +2395,10 @@ PYTHONPATH=. $PY -m experiments.condition_diagnostics \
    PY=$HOME/anaconda3/envs/mamba/bin/python      # 必须是装了 torch 的 ≥3.10 解释器
    export CHECKPOINT_DIR=runs/run1010        # 可选；默认 $ROOT/checkpoints
 
-   # ① HC：随机初始化 → $CHECKPOINT_DIR/hc_demo/base_best.pt
+   # ① HC：随机初始化 → $CHECKPOINT_DIR/neurotwin_tfm_pretrain/base_best.pt
    PYTHON="$PY" bash scripts/Pretrain_HC_tfm.sh
 
-   # ② MDD：起点自动取 ①的产物 → $CHECKPOINT_DIR/mdd_cat/finetuned_best.pt
+   # ② MDD：起点自动取 ①的产物 → $CHECKPOINT_DIR/neurotwin_tfm_finetune/finetuned_best.pt
    PYTHON="$PY" bash scripts/Finetune_MDD_tfm.sh
    ```
 
@@ -2408,22 +2408,24 @@ PYTHONPATH=. $PY -m experiments.condition_diagnostics \
      这个决定权现在完全在人手里，代码不再强制（§0.27）。上面示例用 `runs/…`，因为
      `.gitignore` 已忽略 `runs/` 与 `checkpoints/`（实测 `git check-ignore -v runs/run1010` 命中）；
      随手起一个新目录名（如 `.tmp_run/`）不会被忽略，别用 `git add -A`。
-   - 解释器选错的失败点比较晚：`scripts/Pretrain_HC_tfm.sh:47` 只导入
+   - 解释器选错的失败点比较晚：`scripts/Pretrain_HC_tfm.sh:50` 只导入
      `utils/condition_schema.py` 读常量，本机默认 `python3`（3.8.10，实测无 torch）
      这一步也能过，真正报错要到 `main.py` 导入 torch 时。用 `PYTHON=` 显式指定即可。
 
 2. **重跑会产生平行目录，起点会撞多个候选**：`main.py:801-808` 在
-   `checkpoint_dir/<name>` 已存在时把新目录自增成 `hc_demo2`（不覆盖旧权重）。此后微调脚本的
-   起点查找会命中多个 `hc_demo*/base_best.pt`，脚本**拒绝替你猜**并要求显式指定
-   （`scripts/Finetune_MDD_tfm.sh:45-60`）：
+   `checkpoint_dir/<name>` 已存在时把新目录自增成 `neurotwin_tfm_pretrain2`（不覆盖旧权重）。
+   此后微调脚本的起点查找会命中多个 `neurotwin_tfm_pretrain*/base_best.pt`，脚本
+   **拒绝替你猜**并要求显式指定（`scripts/Finetune_MDD_tfm.sh:47-61`）：
 
    ```bash
    PYTHON="$PY" CHECKPOINT_DIR=runs/run1010 \
-     HC_WEIGHT=runs/run1010/hc_demo2/base_best.pt \
+     HC_WEIGHT=runs/run1010/neurotwin_tfm_pretrain2/base_best.pt \
      bash scripts/Finetune_MDD_tfm.sh
    ```
 
-   旧的 `hc_demo`/`hc_demo2` 是训练产物，**不替人删**。⚠️ 现在没有任何代码能证明你选的这份
+   2026-10-11 改名前留下的 `checkpoints/hc_demo`、`checkpoints/mdd_cat` 是训练产物，
+   **不替人删**；但微调脚本的自动查找已只认 `neurotwin_tfm_pretrain*/base_best.pt`，
+   要复用旧目录必须显式 `HC_WEIGHT=<旧路径>`。⚠️ 现在没有任何代码能证明你选的这份
    就是本轮训出来的 HC —— 内嵌来源校验随 `condition_study.py` 一起删掉了（§0.27）。
 
 3. **test 评估发生在每次微调结束时**：`main.py:1149-1159` 是 finetune 的自动闭环，会把 test

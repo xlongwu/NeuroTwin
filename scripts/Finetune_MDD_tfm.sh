@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NeuroTwin-TFM 微调（MDD 队列，临床条件注入，方案 §12.2 / Task E）
+# NeuroTwin-TFM 微调（MDD 队列，graph_ode 动态路线 + 临床条件注入）
 #
-# 用法（起点必须是 Pretrain_HC_tfm.sh 刚产出的 HC 权重）
+# 用法（起点必须是 Pretrain_HC_tfm.sh 刚产出的 hc_demo_twin 权重）
 #   PYTHON="$HOME/anaconda3/envs/mamba/bin/python" bash scripts/Finetune_MDD_tfm.sh
 #   # 前置：先跑 scripts/Pretrain_HC_tfm.sh（两者用同一 CHECKPOINT_DIR）
 #   # 可选环境变量：
@@ -17,6 +17,11 @@
 #   新增五字段按 ``d_new`` 拼接成 Φ 后过**零初始化** DeltaE，因此训练起点的条件向量
 #   与 HC 侧的 c_demo 逐位相同；条件经双头独立 FiLM 注入 One-Step 与 CPM 两头。
 #
+# graph_ode 动态路线（方案 docs/Version4_docs_1012）：twin 家族 mdd_cat_twin，
+#   与预训练同口径（raw + history_fc + personalized + graph_ode），动态 H 复用
+#   cpm_horizon=8；起点权重默认只在 hc_demo_twin 家族内匹配，不混选旧
+#   neurotwin_tfm_pretrain 的 discrete 产物。
+#
 # 统计量继承（方案 §四）：``--condition_inherit_stats`` 指向**同一个起点权重文件**，
 #   共享三字段的 median/IQR 与类别词表从里面逐位读出、不重新拟合。
 #   ⚠️ 2026-10-10 起不再有 study/fresh 身份闸门（`experiments/condition_study.py` 已删除，
@@ -24,10 +29,11 @@
 #   来源、也不校验 SHA256 —— 「起点确实是本轮 HC」这件事现在靠串接顺序，不靠代码保证。
 #
 # 两阶段逻辑：冻结 TFM 主干（仅训练条件模块）→ 解冻联合优化
-#   （backbone 学习率 × backbone_lr_scale）。
+#   （backbone 学习率 × backbone_lr_scale；profile_encoder 随共享 backbone 解冻，
+#   VarianceHead 随动力学头解冻）。
 #
-# ⚠️ 必须与预训练使用同一 model_arch/patch_len/cpm_horizon 任务口径
-#   （检查点签名校验会拦截不匹配的组合）。
+# ⚠️ 必须与预训练使用同一 graph_ode/raw/history_fc/personalized 口径
+#   （ARCH_VERSION=6 结构校验会拦截不匹配的组合；旧 discrete 权重不迁移）。
 # ============================================================================
 set -euo pipefail
 
@@ -39,14 +45,16 @@ data_root="${DATA_ROOT:-$ROOT/data}"
 checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
 HC_WEIGHT="${HC_WEIGHT:-}"
-name="mdd_cat"
+name="neurotwin_tfm_finetune"
+hc_name="neurotwin_tfm_pretrain"   # 与 Pretrain_HC_tfm.sh 的 name 同步（twin 家族）
 
-# 起点权重：HC 试次目录下的 base_best.pt。找到 0 个→还没训；找到多个→必须显式指定，
-# 绝不静默挑一个（一个融合家族只能共享一个起点）。
+# 起点权重：hc_demo_twin 试次目录下的 base_best.pt。找到 0 个→还没训；
+# 找到多个→必须显式指定，绝不静默挑一个（一个融合家族只能共享一个起点）。
+# 只匹配 twin 家族：旧 neurotwin_tfm_pretrain 的 discrete 产物不会被混选。
 if [[ -z "$HC_WEIGHT" ]]; then
-  mapfile -t hc_cands < <(compgen -G "$checkpoint_dir/hc_demo*/base_best.pt" || true)
+  mapfile -t hc_cands < <(compgen -G "$checkpoint_dir/$hc_name*/base_best.pt" || true)
   [[ ${#hc_cands[@]} -gt 0 ]] || {
-    echo "[错误] 找不到 HC 起点（$checkpoint_dir/hc_demo*/base_best.pt 不存在）；" \
+    echo "[错误] 找不到 HC 起点（$checkpoint_dir/$hc_name*/base_best.pt 不存在）；" \
          "先用同一 CHECKPOINT_DIR 跑 scripts/Pretrain_HC_tfm.sh，" \
          "或用 HC_WEIGHT=<完整路径> 显式指定" >&2
     exit 1
@@ -94,10 +102,10 @@ freeze_backbone_epochs=10
 backbone_lr_scale=0.2
 
 # ---- 预检查 ----
-[ -d "$data_root/Normlize/MDD" ] || {
-  echo "[错误] 缺少 MDD 连续 BOLD 目录：$data_root/Normlize/MDD"; exit 1; }
-[ -d "$data_root/Mask/MDD" ] || {
-  echo "[错误] 缺少 MDD 结构连接目录：$data_root/Mask/MDD"; exit 1; }
+# graph_ode 路线用 raw + history_fc：只要求 Raw 目录与临床表，不要求 Mask，
+# 也不回退 Normlize/窗口缓存（方案 §4.1）。
+[ -d "$data_root/Raw/MDD" ] || {
+  echo "[错误] 缺少 MDD Raw 目录（$data_root/Raw/MDD/ROISignals_<id>.mat，[T,F] 布局）"; exit 1; }
 [ -f "$data_root/Rest-meta-MDD-V1V2-Merged-MDD.xlsx" ] || {
   echo "[错误] 缺少临床评分表：$data_root/Rest-meta-MDD-V1V2-Merged-MDD.xlsx"; exit 1; }
 [ -f "$pretrained_weight" ] || {
@@ -178,6 +186,19 @@ ARGS+=(
   # 统计量快照直接取自同一个 HC 起点权重文件：共享三字段的 median/IQR/类别词表逐位继承，
   # 不重新拟合（方案 §四）。
   --condition_inherit_stats "$pretrained_weight"
+)
+# ---- graph_ode 动态路线（与预训练严格同口径；twin 家族固定参数）----
+ARGS+=(
+  --dynamics_mode graph_ode
+  --graph_source history_fc        # 功能耦合图来自当前可见历史，不要求 Mask
+  --bold_source raw                # Raw/MDD/ROISignals_<id>.mat，前 32 TR 校准
+  --personalized True
+  --profile_dim 32
+  --calibration_length 32
+  --ode_steps 2
+  --dynamics_dt 1.0
+  --lambda_dynamics 0.5
+  --lambda_variance 0.05
 )
 if [[ -n "$DEVICE" ]]; then
   ARGS+=(--device "$DEVICE")

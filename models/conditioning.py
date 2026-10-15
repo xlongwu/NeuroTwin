@@ -5,7 +5,7 @@
 主干；注入位置（双头 FiLM / 条件 RMSNorm / 门控残差 / 条件低秩）由
 ``models/tfm.py`` 与 ``models/tfm_backbone.py`` 消费本模块的输出。
 
-协议（docs/NeuroTwin_condition_injection_v1_revised_20261008.md §4–§6、§8）：
+协议（docs/Version3_docs_1003/NeuroTwin_条件注入实验方案.md §4–§6、§8）：
 
 - 每个字段拥有**独立**编码参数，连续与类别走不同编码：
 

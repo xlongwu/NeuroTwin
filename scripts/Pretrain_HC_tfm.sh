@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NeuroTwin-TFM 预训练（HC 队列，TimesFM-3 风格主干，方案 §30 V1）
+# NeuroTwin-TFM 预训练（HC 队列，graph_ode 动态路线，方案 docs/Version4_docs_1012）
 #
-# 任务口径（方案 §16/§30）：连续 BOLD context [B,F,K]
-#   → temporal patching（p=4）→ SC-guided Temporal–Variate Block × N
-#   → One-Step 头（x̂_(t+1)，z_t→z_(t+1) 状态转移）
-#   + CPM 头（非自回归一次输出 x̂_(t+1:t+H)，H=8）
-# 损失（方案 §20）：L = λ_one·(Huber + λ_pcc·(1−PCC_sp)) + λ_cpm·(γ 加权逐 horizon Huber)
+# 任务口径（graph_ode twin 家族 hc_demo_twin）：Raw BOLD（前 32 TR 固定 mu0/s0 校准）
+#   → 可见历史 FC → SoftAnatomicalPrior → TFM 四层主干
+#   → 受控条件图 ODE（Heun RK2 同步推进 z/q，持续状态）
+#   + CPM 头（无控制辅助预测，cpm_intervention=False）
+#   + VarianceHead（逐 ROI/horizon 对角方差）
+#   + ProfileEncoder（personalized=True，基线前 32 TR → 32 维固定 profile）
+# 损失：原 one-step/CPM 项 + 0.5·动态多步(Huber+PCC) + 0.05·方差 NLL
 #
 # 用法
 #   PYTHON="$HOME/anaconda3/envs/mamba/bin/python" bash scripts/Pretrain_HC_tfm.sh
@@ -25,8 +27,8 @@
 #   §0.27）：主干是否从随机初始化开始，完全由「本脚本不传 --pretrained_weight」这一事实保证，
 #   而不是由代码校验。产物是否落在本轮目录由 CHECKPOINT_DIR 决定，脚本不再强制。
 #
-# ⚠️ 与其它架构/任务口径的权重互不兼容：检查点按 model_arch + patch_len + cpm_horizon
-#   做任务口径签名校验，不匹配的组合会被加载端拦截。
+# ⚠️ 与旧 discrete 路线（neurotwin_tfm_pretrain 等）产物互不兼容：graph_ode 结构
+#   由 ARCH_VERSION=6 的 checkpoint 快照重建，旧 discrete 权重不会迁移到 ODE 头。
 # ============================================================================
 set -euo pipefail
 
@@ -37,8 +39,11 @@ PYTHON_BIN="${PYTHON:-python}"
 data_root="${DATA_ROOT:-$ROOT/data}"
 checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
-# 本轮 HC 试次的固定目录名：下游 MDD 脚本按同一个名字找起点
-name="hc_demo"
+# 预训练产物的固定目录名：下游 scripts/Finetune_MDD_tfm.sh 按
+# ${name}*/base_best.pt 找起点，两处改名必须同步。
+# twin 家族命名（方案 §2.1）：hc_demo_twin / mdd_cat_twin，不与旧
+# neurotwin_tfm_pretrain/finetune 产物混用。
+name="neurotwin_tfm_pretrain"
 
 # ---- 实验规模（方案 §17 首选起点：D=256, N=4, patch=4, heads=4）----
 # 随机来源（模型 seed / 采样 seed / Condition Dropout seed）只在
@@ -75,10 +80,10 @@ lr_peak=1e-4
 lr_final=5e-5
 
 # ---- 预检查 ----
-[ -d "$data_root/Normlize/HC" ] || {
-  echo "[错误] 缺少 HC 连续 BOLD 目录：$data_root/Normlize/HC"; exit 1; }
-[ -d "$data_root/Mask/HC" ] || {
-  echo "[错误] 缺少 HC 结构连接目录：$data_root/Mask/HC"; exit 1; }
+# graph_ode 路线用 raw + history_fc：只要求 Raw 目录，不要求 Mask（图来自
+# 当前可见历史），也不回退 Normlize/窗口缓存（方案 §4.1）。
+[ -d "$data_root/Raw/HC" ] || {
+  echo "[错误] 缺少 HC Raw 目录（$data_root/Raw/HC/ROISignals_<id>.mat，[T,F] 布局）"; exit 1; }
 
 ARGS=(
   # ---- 基础与路径 ----
@@ -147,6 +152,19 @@ ARGS=(
 ARGS+=(
   --condition_group hc3 --condition_arm demo     # hc3 无新增字段，结构上只能用 demo
   --cond_dropout_seed "$cond_dropout_seed"
+)
+# ---- graph_ode 动态路线（方案 §2 默认参数；twin 家族固定口径）----
+ARGS+=(
+  --dynamics_mode graph_ode        # 受控条件图 ODE（Heun RK2 同步 z/q）
+  --graph_source history_fc        # 功能耦合图来自当前可见历史，不要求 Mask
+  --bold_source raw                # Raw/HC/ROISignals_<id>.mat，前 32 TR 校准
+  --personalized True              # 固定基线个体 profile
+  --profile_dim 32
+  --calibration_length 32          # Raw 标准化与 profile 用同一前缀
+  --ode_steps 2
+  --dynamics_dt 1.0
+  --lambda_dynamics 0.5
+  --lambda_variance 0.05
 )
 # 宽度不在这里重复字面量：main.py 的 argparse 默认就是锚点
 # (d_demo=16, d_new=16, C=32, H_delta=64, delta_style=mlp, dropout_p=0, inject=heads)。

@@ -215,7 +215,11 @@ class NeuroTwinNextPointDataset(Dataset):
     被试级缓存、ROI 顺序校验。
     """
 
-    BOLD_SOURCES = ('auto', 'normlize', 'windows')
+    BOLD_SOURCES = ('auto', 'normlize', 'windows', 'raw')
+
+    #: graph_source：legacy_mask = 现有 Mask_<id>.mat 外部图；history_fc = 当前可见
+    #: 历史 signed Pearson 绝对值功能耦合图（模型侧计算，loader 只给单位图占位）。
+    GRAPH_SOURCES = ('legacy_mask', 'history_fc')
 
     def __init__(
         self,
@@ -238,6 +242,11 @@ class NeuroTwinNextPointDataset(Dataset):
         bold_source: str = 'auto',
         subject_cache_size: int = 256,
         cache_in_memory: bool = False,
+        # ---- graph_ode 路线（方案 §4）：旧调用完全不传时行为与历史一致 ----
+        num_rois: int = 116,
+        graph_source: str = 'legacy_mask',
+        calibration_length: int = 0,          # 0 = 关闭（legacy）；raw 分支必须 >=1
+        control_manifest: Optional[str] = None,
     ):
         self.data_root = Path(data_root)
         self.mode = mode
@@ -260,6 +269,23 @@ class NeuroTwinNextPointDataset(Dataset):
         self.bold_source = bold_source
         self.cache_in_memory = cache_in_memory
         self.subject_cache_size = int(subject_cache_size)
+
+        # ---- graph_ode 路线参数（方案 §4.1–§4.3）----
+        if graph_source not in self.GRAPH_SOURCES:
+            raise ValueError(
+                f"graph_source 仅支持 {self.GRAPH_SOURCES}，收到 '{graph_source}'")
+        self.graph_source = str(graph_source)
+        self.num_rois = int(num_rois)
+        if self.num_rois < 1:
+            raise ValueError(f"num_rois 必须 >= 1，收到 {self.num_rois}")
+        self.calibration_length = int(calibration_length)
+        if self.bold_source == 'raw' and self.calibration_length < 1:
+            raise ValueError(
+                "bold_source='raw' 必须显式传 calibration_length >= 1"
+                "（Raw 标准化与 profile 使用同一前缀；新路线固定 32）")
+        self.control_manifest = str(control_manifest) if control_manifest else None
+        # 逐被试控制序列 {subj_id: u [T,F] float32}；manifest 未提供时保持 None
+        self.controls_by_subject: Optional[Dict[str, np.ndarray]] = None
 
         self.pathology_input_dim = pathology_input_dim
         # 病理条件字段（默认仅 HAMD 总分；条目级缺失率高，向量路径需显式开启）
@@ -316,6 +342,8 @@ class NeuroTwinNextPointDataset(Dataset):
         self.npz_dir = self.data_root / 'npz_cache' / group_folder
         self.npz_dir = self.npz_dir if self.npz_dir.is_dir() else None
         self.normlize_dir = self.data_root / 'Normlize' / group_folder
+        # raw 分支目录（方案 §4.1）：Raw/HC|MDD/ROISignals_<id>.mat
+        self.raw_dir = self.data_root / 'Raw' / group_folder
 
         self.subject_ids: List[str] = []
         self._subject_pos: Dict[str, int] = {}
@@ -425,13 +453,43 @@ class NeuroTwinNextPointDataset(Dataset):
         return [self.window_dir / f"ROISignals_{subj_id}-{i}.mat"
                 for i in range(1, self.total_windows + 1)]
 
+    def _raw_path(self, subj_id: str) -> Path:
+        return self.raw_dir / f"ROISignals_{subj_id}.mat"
+
+    def _load_raw_array(self, subj_id: str) -> np.ndarray:
+        """读取 raw 原始序列并按该来源明确的 [T, F] 布局解释（方案 §4.1）。
+
+        不使用 ``max(shape)`` 猜时间轴：Raw 的 ROISignals 约定第 0 维为 TR、
+        第 1 维为 ROI。缺失或形状非法直接报告路径，不回退 Normlize/窗口缓存。
+        """
+        path = self._raw_path(subj_id)
+        if not path.exists():
+            raise FileNotFoundError(f"raw 分支缺少原始序列文件: {path}")
+        arr = self._read_mat_array(path, preferred_keys=['ROISignals', 'Data'])
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"{subj_id} 的 Raw BOLD 期望二维 [T, F]，收到 {arr.shape}（{path}）")
+        if arr.shape[1] < self.num_rois:
+            raise ValueError(
+                f"{subj_id} 的 Raw BOLD 仅 {arr.shape[1]} 列 ROI，少于 "
+                f"num_rois={self.num_rois}，无法取前 {self.num_rois} 列（{path}）")
+        return arr
+
     def _probe_series_length(self, subj_id: str) -> Optional[int]:
         """探测单被试连续序列长度 T（不读取全部数据，仅取 shape）。
 
         优先 Normlize 连续序列（原始 ROI BOLD，[T, F] 或 [F, T]）；不可用时按
         ``ROISignals_window`` 的 50% 重叠布局推算：偶数序号窗（1,3,5,...）恰好
         覆盖 0:S, S:2S, ... 的连续片段（见 data/utils/window_stride.py）。
+        raw 分支从 Raw 的明确时间轴取长度（截取前 150 TR 后的有效长度）。
         """
+        if self.bold_source == 'raw':
+            path = self._raw_path(subj_id)
+            if not path.exists():
+                return None
+            arr = self._load_raw_array(subj_id)
+            return min(int(arr.shape[0]), 150)
         if self.bold_source in ('auto', 'normlize'):
             path = self._normlize_path(subj_id)
             if path.exists():
@@ -454,15 +512,37 @@ class NeuroTwinNextPointDataset(Dataset):
         legacy 数值通路（``condition_group=None``）同样**不因临床缺行删人**：
         所有对照臂必须共用同一完整影像队列与同一份 split（验收 F），否则
         「条件开 / 条件关」两次运行会得到不同 cohort 与不同划分。
+
+        raw 分支（方案 §4.1）从 ``Raw/<group>/ROISignals_*.mat`` 枚举被试，
+        不要求 Mask 存在（history_fc 的图来自当前可见历史）；legacy_mask 图在
+        ``_get_subject`` 按需读取，缺失时直接报路径错误。
         """
-        sc_files = sorted(self.sc_dir.glob('Mask_*.mat'), key=lambda p: p.stem)
+        if self.bold_source == 'raw':
+            if not self.raw_dir.is_dir():
+                raise FileNotFoundError(
+                    f"bold_source='raw' 需要 Raw 目录: {self.raw_dir}")
+            source_files = sorted(self.raw_dir.glob('ROISignals_*.mat'),
+                                  key=lambda p: p.stem)
+            prefix = 'ROISignals_'
+        else:
+            source_files = sorted(self.sc_dir.glob('Mask_*.mat'), key=lambda p: p.stem)
+            prefix = 'Mask_'
         skipped_missing = 0
+        missing_examples: List[str] = []
         no_clinical: List[str] = []
         too_short: List[str] = []
-        min_required = self.context_min + 1  # 至少 context_min 段历史 + 1 个目标 TR
+        # raw 路线（calibration_length>0）：锚点下界 max(K-1, calib-1)，故被试
+        # 至少需要 max(context_min, calibration_length) + max_offset 个 TR；
+        # legacy 路线保持历史口径 context_min + 1 不变。
+        if self.calibration_length > 0:
+            min_required = max(self.context_min, self.calibration_length) \
+                + self.max_offset
+        else:
+            min_required = self.context_min + 1  # 至少 context_min 段历史 + 1 个目标 TR
+        self._min_series_len = min_required
 
-        for sc_file in sc_files:
-            subj_id = str(sc_file.stem.replace('Mask_', '')).strip()
+        for src_file in source_files:
+            subj_id = str(src_file.stem.replace(prefix, '')).strip()
             has_clinical = subj_id in self.clinical_dict
             if self.mode == 'finetune' and not self.condition_enabled and not has_clinical:
                 # 只登记，不删人：评分缺失按「无临床信息」编码（见 _get_subject）
@@ -470,6 +550,8 @@ class NeuroTwinNextPointDataset(Dataset):
             series_len = self._probe_series_length(subj_id)
             if series_len is None or series_len <= 0:
                 skipped_missing += 1
+                if self.bold_source == 'raw':
+                    missing_examples.append(str(self._raw_path(subj_id)))
                 continue
             if series_len < min_required:
                 too_short.append(f"{subj_id}(T={series_len})")
@@ -500,12 +582,75 @@ class NeuroTwinNextPointDataset(Dataset):
             f"{series_lens[0]}/{int(np.median(series_lens))}/{series_lens[-1]}"
         )
         print(
-            f"[next_timepoint] 数据源={self.bold_source} | 临床表无评分被试="
+            f"[next_timepoint] 数据源={self.bold_source} | 图来源={self.graph_source}"
+            f" | 校准长度={self.calibration_length if self.calibration_length > 0 else 'off'}"
+            f" | 临床表无评分被试="
             f"{len(self.no_clinical_subjects)}（**保留**，按无临床信息编码）| 跳过: "
             f"数据缺失 {skipped_missing} | "
-            f"序列过短 {len(too_short)}"
+            f"序列过短 {len(too_short)}（需 T >= {min_required}）"
             + (f"（例如 {too_short[:3]}）" if too_short else "")
         )
+        if missing_examples:
+            print(f"[next_timepoint] raw 缺失文件示例: {missing_examples[:3]}")
+
+        # 控制 manifest（方案 §4.3）：在索引建立后加载，逐条校验文件存在性与
+        # 队列内被试的 T/F 匹配；无 manifest 时 controls 保持 None（不伪造刺激）。
+        if self.control_manifest is not None:
+            self._load_control_manifest(self.control_manifest)
+
+    def _load_control_manifest(self, manifest_path: str) -> None:
+        """读取控制 manifest CSV 并校验每个条目（方案 §4.3）。
+
+        CSV 两列 ``subject_id,controls_path``；相对路径相对 manifest 所在目录。
+        每个 NPZ 只有必需数组 ``u [T, F]``：u[t] 对应到达观测 t 的区间，因此
+        锚点 t 的未来切片是 ``u[t+1:t+H+1]``。要求：
+
+        - 条目文件缺失、NPZ 缺 ``u`` 键、维度/宽度/长度不匹配或含非有限值 →
+          **明确报错**（不用无刺激代替缺文件，不静默跳过）；
+        - T 与该被试（截取前 150 TR 后的）序列长度严格一致；
+        - 控制幅值不使用 BOLD 均值/方差标准化，按上游定义的原值进入模型。
+        """
+        path = Path(manifest_path)
+        if not path.exists():
+            raise FileNotFoundError(f"control_manifest 不存在: {path}")
+        df = pd.read_csv(path)
+        cols = [c.strip() for c in df.columns]
+        if len(cols) < 2 or cols[0] != 'subject_id' or cols[1] != 'controls_path':
+            raise ValueError(
+                f"control_manifest 需要表头 'subject_id,controls_path'，收到 {cols}（{path}）")
+        controls: Dict[str, np.ndarray] = {}
+        base_dir = path.parent
+        for _, row in df.iterrows():
+            subj_id = str(row['subject_id']).strip()
+            rel = str(row['controls_path']).strip()
+            npz_path = Path(rel) if Path(rel).is_absolute() else base_dir / rel
+            if not npz_path.exists():
+                raise FileNotFoundError(
+                    f"control_manifest 条目 {subj_id} 的控制文件缺失: {npz_path}（{path}）")
+            with np.load(npz_path) as z:
+                if 'u' not in z:
+                    raise ValueError(
+                        f"{subj_id} 的控制 NPZ 缺少 'u' 键（{npz_path}）")
+                u = np.asarray(z['u'], dtype=np.float32)
+            if u.ndim != 2:
+                raise ValueError(
+                    f"{subj_id} 的控制 u 期望二维 [T, F]，收到 {u.shape}（{npz_path}）")
+            if u.shape[1] != self.num_rois:
+                raise ValueError(
+                    f"{subj_id} 的控制 u 末维 {u.shape[1]} 与 num_rois={self.num_rois} "
+                    f"不一致（{npz_path}）")
+            if not np.isfinite(u).all():
+                raise ValueError(f"{subj_id} 的控制 u 含非有限值（{npz_path}）")
+            expected_t = self.subject_series_len.get(subj_id, None)
+            if expected_t is not None and u.shape[0] != expected_t:
+                raise ValueError(
+                    f"{subj_id} 的控制 u 长度 {u.shape[0]} 与序列 T={expected_t} "
+                    f"不一致（{npz_path}；序列长度按 raw 前 150 TR 截取口径）")
+            controls[subj_id] = u
+        queue_hits = sum(1 for s in controls if s in self._subject_pos)
+        print(f"[controls] manifest 已加载: {path} | 条目={len(controls)} "
+              f"| 命中当前队列={queue_hits} | u 布局 [T,F]，区间 u[t] 到达观测 t")
+        self.controls_by_subject = controls
 
     def _load_condition_columns(self) -> None:
         """加载 merged 条件表并与影像队列对齐（缺行被试 → 全字段缺失）。"""
@@ -585,8 +730,13 @@ class NeuroTwinNextPointDataset(Dataset):
             self._mat_cache[key] = arr
         return arr
 
-    def _load_series(self, subj_id: str, n_rois: int) -> np.ndarray:
-        """返回连续 ROI BOLD 序列 [F, T]（float32）。"""
+    def _load_series(self, subj_id: str, n_rois: int) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """返回 (连续 ROI BOLD 序列 [F, T], 校准统计量或 None)。
+
+        raw 分支序列为校准后数据尺度 X，校准统计量为 (mu0, s0)，各 [F, 1]
+        （每 ROI 只用最早 calibration_length 个 TR 估计，方案 §4.1）；
+        其余分支 cal_stats=None（无前缀校准概念）。
+        """
         def _orient(arr: np.ndarray, src: str) -> np.ndarray:
             arr = np.asarray(arr, dtype=np.float32)
             if arr.ndim != 2:
@@ -598,6 +748,29 @@ class NeuroTwinNextPointDataset(Dataset):
             raise ValueError(
                 f"{subj_id} 的 BOLD 形状 {arr.shape} 无法与 ROI 数 {n_rois} 对齐（{src}）")
 
+        if self.bold_source == 'raw':
+            # raw 分支（方案 §4.1）：明确 [T, F] 布局取前 150 TR、前 num_rois 列，
+            # 每 ROI 只用最早 calibration_length 个 TR 计算固定 mu0/s0 后标准化
+            # 整个序列；缺失直接报路径（_load_raw_array 内），不回退旧缓存。
+            arr = self._load_raw_array(subj_id)
+            n_tr = min(int(arr.shape[0]), 150)
+            if n_tr < self.calibration_length:
+                raise ValueError(
+                    f"{subj_id} 的 Raw BOLD 只有 {n_tr} 个 TR，少于 "
+                    f"calibration_length={self.calibration_length}（{self._raw_path(subj_id)}）")
+            x = np.ascontiguousarray(arr[:n_tr, :self.num_rois].T)      # [F, T]
+            cal = x[:, :self.calibration_length]
+            mu0 = cal.mean(axis=1, keepdims=True)                       # [F, 1]
+            s0 = np.sqrt(cal.var(axis=1, keepdims=True) + 1e-6)         # [F, 1]
+            cal_stats = (mu0.astype(np.float32), s0.astype(np.float32))
+            if not self._source_logged:
+                print(f"[next_timepoint] raw 数据源: {self.raw_dir}"
+                      f"（[T,F] → 前 150 TR/前 {self.num_rois} 列 → [F,T]，"
+                      f"最早 {self.calibration_length} TR 固定 mu0/s0 校准）")
+                self._source_logged = True
+            series = ((x - mu0) / s0).astype(np.float32, copy=False)
+            return series, cal_stats
+
         if self.bold_source in ('auto', 'normlize'):
             path = self._normlize_path(subj_id)
             if path.exists():
@@ -605,7 +778,8 @@ class NeuroTwinNextPointDataset(Dataset):
                     print(f"[next_timepoint] 连续 BOLD 数据源: {path.parent}（[T,F] → [F,T]）")
                     self._source_logged = True
                 return _orient(self._read_mat_array(
-                    path, preferred_keys=['ROISignals', 'Data', 'bold']), 'Normlize')
+                    path, preferred_keys=['ROISignals', 'Data', 'bold']),
+                    'Normlize'), None
 
         # fallback：从 50% 重叠滑窗重构连续序列（取偶数序号窗 = 0:S, S:2S, ...）
         if self.source_window_len % 2 != 0:
@@ -640,36 +814,56 @@ class NeuroTwinNextPointDataset(Dataset):
             print("[next_timepoint] 未找到 Normlize 连续序列，回退用 50% 重叠滑窗重构"
                   "（偶数序号窗拼接，布局见 data/utils/window_stride.py）")
             self._source_logged = True
-        return series.astype(np.float32, copy=False)
+        return series.astype(np.float32, copy=False), None
 
     def _get_subject(self, subj_id: str) -> Dict[str, np.ndarray]:
         cached = self._cache.get(subj_id, None)
         if cached is not None:
             return cached
 
-        sc_path = self.sc_dir / f"Mask_{subj_id}.mat"
-        sc_matrix = self._read_mat_array(
-            sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
-        if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
-            raise ValueError(f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
-        sc_matrix = self._normalize_sc(sc_matrix)
-        n_rois = int(sc_matrix.shape[0])
+        cal_stats = None
+        if self.bold_source == 'raw':
+            # raw 分支：ROI 数由 num_rois 参数提供（方案 §4.1），不依赖 Mask 推断。
+            n_rois = self.num_rois
+            if self.graph_source == 'legacy_mask':
+                sc_path = self.sc_dir / f"Mask_{subj_id}.mat"
+                if not sc_path.exists():
+                    raise FileNotFoundError(
+                        f"graph_source='legacy_mask' 需要 mask 文件: {sc_path}")
+                sc_matrix = self._read_mat_array(
+                    sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
+                if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
+                    raise ValueError(
+                        f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
+                sc_matrix = self._normalize_sc(sc_matrix)
+            else:
+                # history_fc：单位图占位以兼容现有 batch 拆包；模型实际图来自
+                # 当前可见历史（_history_fc_adj），不会把占位当实际图。
+                sc_matrix = np.eye(self.num_rois, dtype=np.float32)
+        else:
+            sc_path = self.sc_dir / f"Mask_{subj_id}.mat"
+            sc_matrix = self._read_mat_array(
+                sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
+            if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
+                raise ValueError(f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
+            sc_matrix = self._normalize_sc(sc_matrix)
+            n_rois = int(sc_matrix.shape[0])
 
-        series = self._load_series(subj_id, n_rois)
+        series, cal_stats = self._load_series(subj_id, n_rois)
         if series.shape[0] != n_rois:
             raise ValueError(
-                f"ROI 顺序/数量不一致：{subj_id} BOLD {series.shape[0]} vs SC {n_rois}；"
-                "next_timepoint 要求 BOLD ROI i 与 SC ROI i 严格对应。")
+                f"ROI 顺序/数量不一致：{subj_id} BOLD {series.shape[0]} vs 期望 {n_rois}；"
+                "next_timepoint 要求 BOLD ROI i 与图 ROI i 严格对应。")
         T = int(series.shape[1])
         expected = self.subject_series_len.get(subj_id, None)
         if expected is not None and T != expected:
             raise ValueError(
                 f"{subj_id} 实际序列长度 {T} 与索引阶段探测的 {expected} 不一致："
                 "请检查数据目录是否在两次运行之间发生变化。")
-        if T < self.context_min + 1:
+        if T < self._min_series_len:
             raise ValueError(
-                f"{subj_id} 只有 {T} 个 TR，不足以构成 context_min+1="
-                f"{self.context_min + 1} 的最小样本。")
+                f"{subj_id} 只有 {T} 个 TR，不足以构成最小样本（需 T >= "
+                f"{self._min_series_len}）。")
 
         entry: Dict[str, np.ndarray] = {
             'series': np.ascontiguousarray(series.astype(np.float32, copy=True)),  # [F, T]
@@ -677,6 +871,11 @@ class NeuroTwinNextPointDataset(Dataset):
             'subj_id': subj_id,
             'series_len': T,
         }
+        if cal_stats is not None:
+            # raw 前缀校准统计量（固定 mu0/s0，各 [F,1]）：供推理侧把新原始观测
+            # 转换到同一数据尺度（inference_twin 复用，不再重新估计）。
+            entry['cal_mu0'] = cal_stats[0]
+            entry['cal_s0'] = cal_stats[1]
         if self.mode == 'finetune' and not self.condition_enabled:
             vec = self.clinical_dict.get(subj_id, None)
             if vec is None:
@@ -735,24 +934,54 @@ class NeuroTwinNextPointDataset(Dataset):
         """返回被试的连续 BOLD 序列 [F, T]（只读）。
 
         供评估侧拟合 AR(1) baseline 等只读用途；数据来源与训练完全一致
-        （Normlize 连续序列，缺失时按 50% 重叠滑窗重构）。
+        （raw 分支为校准后序列，否则 Normlize 连续序列，缺失时按 50% 重叠滑窗重构）。
         """
         return self._get_subject(str(subj_id))['series']
 
+    def get_calibration_stats(self, subj_id: str):
+        """返回该被试的固定前缀校准统计量 (mu0, s0)，各 [F, 1]；非 raw 分支为 None。
+
+        供推理侧把新原始观测用**同一扫描**的 mu0/s0 转换到数据尺度，
+        不重新估计统计量（方案 §4.1）。
+        """
+        entry = self._get_subject(str(subj_id))
+        if 'cal_mu0' not in entry:
+            return None
+        return entry['cal_mu0'], entry['cal_s0']
+
+    def get_controls(self, subj_id: str) -> Optional[np.ndarray]:
+        """返回该被试的控制序列 u [T, F]；无 manifest 或该被试无条目时为 None。"""
+        if self.controls_by_subject is None:
+            return None
+        return self.controls_by_subject.get(str(subj_id), None)
+
     def legal_context_lengths(self, subj_id: str) -> List[int]:
-        """合法 context 长度：K <= min(context_max, T-1)（至少 1 个未来 TR）。"""
+        """合法 context 长度：K <= min(context_max, T-1)（至少 1 个未来 TR）。
+
+        raw 路线（calibration_length>0）锚点下界为 max(K-1, calib-1)，故还需
+        K <= T - max_offset 才存在合法锚点；否则训练视图会采样到空锚点区间。
+        """
         n = self.n_tr(subj_id)
         upper = min(self.context_max, n - 1)
+        if self.calibration_length > 0:
+            upper = min(upper, n - self.max_offset)
         if self.context_lengths:
             return [k for k in self.context_lengths if k <= upper]
         return list(range(self.context_min, upper + 1)) if upper >= self.context_min else []
 
     def legal_anchor_range(self, subj_id: str, context_len: int,
                            max_offset: int = None) -> Tuple[int, int]:
-        """合法预测位置区间（含端点，0 基 cutoff t）：t-K+1 >= 0 且 t+max_offset <= T-1。"""
+        """合法预测位置区间（含端点，0 基 cutoff t）：t-K+1 >= 0 且 t+max_offset <= T-1。
+
+        raw 路线（方案 §4.1）下界改为 max(K-1, calibration_length-1)：未来样本
+        不参与基线/profile 校准，首个预测至少是第 33 个 TR（calibration_length=32）。
+        """
         n = self.n_tr(subj_id)
         off = int(max_offset) if max_offset else self.max_offset
-        return context_len - 1, n - 1 - off
+        lo = context_len - 1
+        if self.calibration_length > 0:
+            lo = max(lo, self.calibration_length - 1)
+        return lo, n - 1 - off
 
     def legal_task_count(self, subj_id: str) -> int:
         """该被试的合法 (K, t) 组合数（训练视图的样本预算）。"""
@@ -776,6 +1005,9 @@ class NeuroTwinNextPointDataset(Dataset):
             x_last      [F]         context 末位 x_t（delta 重建与 baseline 使用）
             future      [F, R]      t+1..t+R 的真值（仅 future_steps>0，供 rollout 评分）
             sc / subj_id / context_len / cutoff / target_mask [H]
+        raw 路线附加：
+            calibration_bold [F, 1, calibration_length]  同一扫描最早校准前缀（数据尺度）
+            controls         [R, F]      u[t+1:t+R+1]，缺尾区间填零（有 manifest 时）
         """
         subj_id = self.subject_ids[subj_pos]
         n = self.n_tr(subj_id)
@@ -803,6 +1035,23 @@ class NeuroTwinNextPointDataset(Dataset):
             'cutoff': int(t),
             'target_mask': torch.ones(len(self.offsets), dtype=torch.float32),
         }
+        if self.calibration_length > 0:
+            # 固定基线校准前缀（数据尺度 X）：独立于当前锚点，profile 与 Raw
+            # 标准化使用同一前缀；锚点之后的样本不参与校准。
+            cal = series[:, :self.calibration_length]                  # [F, L]
+            out['calibration_bold'] = torch.from_numpy(np.ascontiguousarray(
+                np.asarray(cal[:, None, :], dtype=np.float32)))        # [F,1,L]
+        if self.controls_by_subject is not None:
+            u = self.controls_by_subject.get(subj_id, None)
+            h = int(future_steps)
+            ctrl = np.zeros((h, self.num_rois), dtype=np.float32)
+            if u is not None and h > 0:
+                # u[t] 对应到达观测 t 的区间；锚点 t 的未来区间切片 u[t+1:t+H+1]，
+                # 缺尾区间随 future_mask 填零（方案 §4.3）。
+                avail = max(0, min(h, int(u.shape[0]) - (t + 1)))
+                if avail > 0:
+                    ctrl[:avail] = u[t + 1: t + 1 + avail]
+            out['controls'] = torch.from_numpy(ctrl)                   # [H, F]
         if future_steps > 0:
             future_end = min(int(future_steps), n - 1 - t)
             future = np.zeros((series.shape[0], int(future_steps)), dtype=np.float32)
@@ -1123,6 +1372,11 @@ class NeuroTwinDataLoader:
         train_rollout_steps: int = 0,
         train_anchor_max_offset: int = 0,
         eval_all_future_steps: int = 0,
+        # ---- graph_ode 路线（方案 §4）：透传给 next-timepoint 数据集 ----
+        num_rois: int = 116,
+        graph_source: str = 'legacy_mask',
+        calibration_length: int = 0,
+        control_manifest: Optional[str] = None,
     ):
         task_mode = str(task_mode)
         if task_mode != 'next_timepoint':
@@ -1168,6 +1422,10 @@ class NeuroTwinDataLoader:
         # TFM 的 CPM 支持：训练锚点按 cpm_horizon 右移上界、评估全 anchor 带 future
         self.train_anchor_max_offset = int(train_anchor_max_offset)
         self.eval_all_future_steps = int(eval_all_future_steps)
+        self.num_rois = int(num_rois)
+        self.graph_source = str(graph_source)
+        self.calibration_length = int(calibration_length)
+        self.control_manifest = str(control_manifest) if control_manifest else None
         self.seed = seed
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size if eval_batch_size else batch_size * 4
@@ -1200,6 +1458,10 @@ class NeuroTwinDataLoader:
             bold_source=self.bold_source,
             subject_cache_size=self.subject_cache_size,
             cache_in_memory=cache_in_memory,
+            num_rois=self.num_rois,
+            graph_source=self.graph_source,
+            calibration_length=self.calibration_length,
+            control_manifest=self.control_manifest,
         )
 
         train_indices, val_indices, test_indices, train_subjects, val_subjects, test_subjects = self._split_indices_by_subject(

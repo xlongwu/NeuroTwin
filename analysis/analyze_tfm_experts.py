@@ -344,7 +344,7 @@ def main():
     if str(getattr(train_args, 'tfm_patho_mode', 'film')) != 'moe':
         raise ValueError(
             "该 checkpoint 不是 tfm_patho_mode=moe 训练的（无病理专家可分析）；"
-            "请使用 scripts/Finetune_MDD_tfm_moe.sh 或 _recc.sh 产出的权重。")
+            "请改用 tfm_patho_mode=moe 训练的 checkpoint（main.py --tfm_patho_mode moe）。")
     model = build_model_from_args(train_args, device)
     model, compat = load_checkpoint_compat(model, args_cli.ckpt, device,
                                            strict=True)

@@ -32,7 +32,8 @@ from utils.common import (parse_int_list, resolve_forecast_offsets,
 from models.conditioning import ConditioningConfig
 from models.tfm import NeuroTwinTFM, TFM_CANDIDATE_SCHEMA
 from utils.condition_schema import DROPOUT_SEED, parse_extra_codes
-from train.losses import TFMDualLoss, compute_graph_regularization, spatial_pcc
+from train.losses import (TFMDualLoss, compute_graph_regularization, spatial_pcc,
+                          compute_cpm_mask)
 from train.tfm_coupling import (
     compute_tfm_coupling_diagnostics,
     compute_tfm_expert_diversity,
@@ -167,6 +168,35 @@ def _index_condition(cond, index):
     if cond is None:
         return None
     return {k: (v[index] if torch.is_tensor(v) else v) for k, v in cond.items()}
+
+
+def dynamics_extras(batch, device):
+    """搬运 graph_ode 动态输入：calibration_bold [B,F,1,L] 与 controls [B,H,F]。
+
+    旧数据路径（discrete / legacy_mask / 非 raw）不产出这两个键，返回
+    ``(None, None)``，forward 与 loss 的行为与旧版完全一致。
+    """
+    cal = batch.get('calibration_bold', None)
+    if cal is not None:
+        cal = cal.to(device, non_blocking=True)
+    ctl = batch.get('controls', None)
+    if ctl is not None:
+        ctl = ctl.to(device, non_blocking=True)
+    return cal, ctl
+
+
+def _normalized_future(model, fut: torch.Tensor, norm_stats):
+    """用当前历史的 RevIN 统计量归一化未来真值（方差损失目标，方案 §9）。
+
+    fut: [B,F,H]（数据尺度）→ [B,F,H]（归一化空间）。norm_stats 为 None
+    （--norm 关闭 RevIN）时直接返回原值，不再另行估计统计量。
+    """
+    if norm_stats is None:
+        return fut
+    revin = getattr(model, 'rev_norm', None)
+    if revin is None:
+        return fut
+    return revin.normalize_with(fut.unsqueeze(-1), norm_stats).squeeze(-1)
 
 
 def condition_loader_kwargs(args, bundle=None):
@@ -308,6 +338,7 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
     for batch in pbar:
         bx, by, bl, bm, bs, bp = next_point_batch(batch, device)
         cond = condition_batch(batch, device)
+        bcal, bctl = dynamics_extras(batch, device)
         fut = batch['future'].to(device, non_blocking=True)          # [B,F,R]
         fmask = batch['future_mask'].to(device, non_blocking=True)   # [B,R]
         outputs, aux_info = model(bx, bs, bp,
@@ -315,12 +346,29 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                                   return_expert_pred=need_expert_pred,
                                   return_pair_pred=need_pair_pred,
                                   condition=cond,
-                                  condition_epoch=None)              # 验证：关闭随机 Dropout
+                                  condition_epoch=None,              # 验证：关闭随机 Dropout
+                                  controls=(bctl[:, :horizon] if bctl is not None else None),
+                                  calibration_bold=bcal)
         cpm_pred = aux_info['cpm_pred']                              # [B,F,H]
         cpm_target = fut[:, :, :horizon]                             # [B,F,H]
-        cpm_mask = fmask[:, :horizon]                                # [B,H]
+        if bctl is not None:
+            # graph_ode：CPM 是无控制辅助预测，从首个非零未来控制起屏蔽监督
+            cpm_mask = compute_cpm_mask(bctl[:, :horizon], fmask[:, :horizon])
+        else:
+            cpm_mask = fmask[:, :horizon]                            # [B,H]
+        dyn_kwargs = {}
+        if aux_info.get('dynamics_pred', None) is not None:
+            norm_stats = aux_info.get('norm_stats', None)
+            dyn_kwargs = dict(
+                dynamics_pred=aux_info['dynamics_pred'],
+                dynamics_target=cpm_target,                          # 数据尺度 [B,F,H]
+                dynamics_mask=fmask[:, :horizon],                    # 完整 future_mask
+                dynamics_mean_norm=aux_info.get('dynamics_mean_norm', None),
+                dynamics_logvar_norm=aux_info.get('dynamics_logvar_norm', None),
+                dynamics_target_norm=_normalized_future(model, cpm_target, norm_stats),
+            )
         total_loss, loss_stats = criterion(outputs, by, cpm_pred,
-                                           cpm_target, cpm_mask)
+                                           cpm_target, cpm_mask, **dyn_kwargs)
         graph_reg, graph_stats = compute_graph_regularization(
             aux_info, device,
             sparsity_weight=args.sc_sparsity_weight,
@@ -412,7 +460,10 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                     hist, bs[rf_gpu], (bp[rf_gpu] if bp is not None else None),
                     steps=int(rollout_steps),
                     pathology_epoch=pathology_epoch,
-                    condition=_index_condition(cond, rf_gpu))
+                    condition=_index_condition(cond, rf_gpu),
+                    controls=(bctl[rf_gpu][:, :int(rollout_steps)]
+                              if bctl is not None else None),
+                    calibration_bold=(bcal[rf_gpu] if bcal is not None else None))
                 fut_r = batch['future'][rf].transpose(1, 2).contiguous().to(
                     device).float()                                  # [n,R,F]
                 fmask_r = batch['future_mask'][rf].to(device).float()  # [n,R]
@@ -641,6 +692,12 @@ def main(args):
         train_rollout_steps=dims['cpm_horizon'],
         train_anchor_max_offset=dims['cpm_horizon'],
         eval_all_future_steps=dims['cpm_horizon'],
+        # graph_ode 动态路线的数据参数（方案 §4）：raw 源、可见历史 FC、
+        # 校准前缀与控制 manifest；旧默认值下这些参数不改变任何行为
+        num_rois=args.num_rois,
+        graph_source=args.graph_source,
+        calibration_length=args.calibration_length,
+        control_manifest=(args.control_manifest or None),
     )
     train_data, val_data = dl.get_train(), dl.get_val()
 
@@ -695,6 +752,14 @@ def main(args):
         pathology_norm_quantiles=args.pathology_norm_quantiles,
         pathology_norm_rbf_knots=args.pathology_norm_rbf_knots,
         use_revin=args.norm,
+        # graph_ode 动态路线（方案 §6）：旧默认 discrete / personalized=False /
+        # legacy_mask 不改变任何已有行为
+        dynamics_mode=args.dynamics_mode,
+        ode_steps=args.ode_steps,
+        dynamics_dt=args.dynamics_dt,
+        graph_source=args.graph_source,
+        personalized=args.personalized,
+        profile_dim=args.profile_dim,
     ).to(device)
 
     if args.mode == 'finetune':
@@ -783,10 +848,14 @@ def main(args):
         lambda_one=args.lambda_one, lambda_cpm=args.lambda_cpm,
         lambda_pcc=args.lambda_pcc, cpm_gamma=args.cpm_gamma,
         huber_delta=args.cpm_huber_delta,
+        lambda_dynamics=args.lambda_dynamics,
+        lambda_variance=args.lambda_variance,
     ).to(device)
     print(f"[TFM] 损失: lambda_one={args.lambda_one} "
           f"lambda_cpm={args.lambda_cpm} lambda_pcc={args.lambda_pcc} "
           f"cpm_gamma={args.cpm_gamma} huber_delta={args.cpm_huber_delta} | "
+          f"lambda_dynamics={args.lambda_dynamics} "
+          f"lambda_variance={args.lambda_variance} | "
           f"cpm_horizon={args.cpm_horizon}（One-Step + CPM 双头，方案 §9/§20）")
 
     # TFM 病理残差专家 / RECC 运行时开关（RECC 方案 §48–§50）
@@ -933,6 +1002,7 @@ def main(args):
             # next_timepoint：x [B,F,1,K] / y [B,F,H,1] / x_last [B,F] / mask [B,H]
             bx, by, bl, bm, bs, bp = next_point_batch(batch, device)
             cond = condition_batch(batch, device)
+            bcal, bctl = dynamics_extras(batch, device)
             by_roll = batch.get('future', None)
             bm_roll = batch.get('future_mask', None)
             if by_roll is not None: by_roll = by_roll.to(device, non_blocking=True)
@@ -943,10 +1013,29 @@ def main(args):
                                           pathology_epoch=epoch,
                                           return_expert_pred=need_expert_pred,
                                           condition=cond,
-                                          condition_epoch=epoch)
-                # CPM 目标：训练视图 future_steps=cpm_horizon → by_roll [B,F,H]
+                                          condition_epoch=epoch,
+                                          controls=bctl,
+                                          calibration_bold=bcal)
+                # CPM 目标：训练视图 future_steps=cpm_horizon → by_roll [B,F,H]。
+                # graph_ode 有控制序列时，CPM 监督从首个非零未来控制起屏蔽
+                # （受控区间的 CPM 辅助预测没有真值对应，方案 §9）。
+                cpm_mask_train = bm_roll
+                if bctl is not None and bm_roll is not None:
+                    cpm_mask_train = compute_cpm_mask(bctl, bm_roll)
+                dyn_kwargs = {}
+                if aux_info.get('dynamics_pred', None) is not None and by_roll is not None:
+                    dyn_kwargs = dict(
+                        dynamics_pred=aux_info['dynamics_pred'],
+                        dynamics_target=by_roll,                     # 数据尺度 [B,F,H]
+                        dynamics_mask=bm_roll,                       # 完整 future_mask
+                        dynamics_mean_norm=aux_info.get('dynamics_mean_norm', None),
+                        dynamics_logvar_norm=aux_info.get('dynamics_logvar_norm', None),
+                        dynamics_target_norm=_normalized_future(
+                            model, by_roll, aux_info.get('norm_stats', None)),
+                    )
                 total_loss, loss_stats = criterion(
-                    outputs, by, aux_info['cpm_pred'], by_roll, bm_roll)
+                    outputs, by, aux_info['cpm_pred'], by_roll,
+                    cpm_mask_train, **dyn_kwargs)
                 graph_reg, graph_stats = compute_graph_regularization(
                     aux_info, device,
                     sparsity_weight=args.sc_sparsity_weight,
@@ -1016,6 +1105,12 @@ def main(args):
                 'One': f"{live['loss_one']/step:.4f}",
                 'CPM': f"{live['loss_cpm']/step:.4f}",
             }
+            if 'loss_dynamics' in loss_stats:
+                live['_dyn'] = live.get('_dyn', 0.0) + float(loss_stats['loss_dynamics'].item())
+                postfix['Dyn'] = f"{live['_dyn']/step:.4f}"
+            if 'loss_variance' in loss_stats:
+                live['_var'] = live.get('_var', 0.0) + float(loss_stats['loss_variance'].item())
+                postfix['Var'] = f"{live['_var']/step:.4f}"
             if 'recc_loss' in coupled_stats:
                 live['_recc'] = live.get('_recc', 0.0) + float(coupled_stats['recc_loss'])
                 postfix['RECC'] = f"{live['_recc']/step:.4f}"
@@ -1299,7 +1394,7 @@ def parse_args():
                    help='条件适配器（adapter）参数组的学习率缩放（历史键；'
                         '未设 --condition_lr_scale 时作为其回退值）。')
 
-    # ---------- 条件注入（docs/NeuroTwin_condition_injection_v1_revised_20261008）----------
+    # ---------- 条件注入（docs/Version3_docs_1003/NeuroTwin_条件注入实验方案.md）----------
     # default=None 是「未声明」哨兵，与显式 ``--condition_arm none`` 语义不同：
     # 未声明保持 legacy 行为（tfm_patho_mode 决定要不要建 HAMD FiLM），显式 none
     # 是「结构性地不建条件通路」，必须连 legacy FiLM 一起关掉（§三）。
@@ -1429,8 +1524,7 @@ def parse_args():
     p.add_argument('--tfm_heads', type=int, default=4,
                    help='TFM temporal/ROI attention 的头数。')
     p.add_argument('--tfm_patch_len', type=int, default=8,
-                   help='TFM temporal patch 长度 p（G30_TFM 消融：p=8 最优，'
-                        '详见 docs/Version3_docs_1003/G30_TFM消融实验总结_20261005.md）。'
+                   help='TFM temporal patch 长度 p（G30_TFM 消融：p=8 最优）。'
                         'K 不是 p 的整数倍时开头补零对齐。')
     p.add_argument('--tfm_ff_ratio', type=int, default=4,
                    help='TFM FFN 隐层扩张倍数（ff_dim = ff_ratio × dim）。')
@@ -1529,9 +1623,12 @@ def parse_args():
                    help='训练是否随机采样 context 长度 K（False=固定为可用最大 K）。')
     p.add_argument('--random_cutoff', type=str2bool, default=True,
                    help='训练是否随机采样 cutoff t（False=固定最晚 cutoff）。')
-    p.add_argument('--bold_source', default='auto', choices=['auto', 'normlize', 'windows'],
+    p.add_argument('--bold_source', default='auto',
+                   choices=['auto', 'normlize', 'windows', 'raw'],
                    help='连续 BOLD 数据源：auto=优先 data/Normlize/<grp>/ROISignals_<id>.mat，'
-                        '缺失时回退用 50%% 重叠滑窗重构；normlize=仅用连续序列；windows=仅用滑窗重构。')
+                        '缺失时回退用 50%% 重叠滑窗重构；normlize=仅用连续序列；windows=仅用滑窗重构；'
+                        'raw=仅用 data/Raw/<grp>/ROISignals_<id>.mat（[T,F] 前 150 TR、前 num_rois 列，'
+                        '每 ROI 用最早 calibration_length 个 TR 固定 mu0/s0 标准化，缺失直接报错不回退）。')
     p.add_argument('--train_samples_per_subject', type=int, default=0,
                    help='训练每个被试每 epoch 的样本预算；0=auto（min(合法组合数, 12)）。')
     p.add_argument('--sampling_seed', type=int, default=2024,
@@ -1580,6 +1677,37 @@ def parse_args():
     p.add_argument('--load_backbone_only', type=str2bool, default=False,
                    help='finetune 时只加载主干权重（预测头 / 条件模块保持随机初始化），'
                         '并显式打印 loaded/missing/reinitialized 清单。')
+
+    # ---------- graph_ode 动态路线（神经微分方程优化，方案 §6/§9/§10） ----------
+    p.add_argument('--dynamics_mode', default='discrete',
+                   choices=['discrete', 'graph_ode'],
+                   help='动态分支：discrete=旧 OneStepDynamicsHead（delta_norm+x_last，默认）；'
+                        'graph_ode=受控条件图 ODE（Heun RK2 同步积分 z/q，持续状态预测）。')
+    p.add_argument('--ode_steps', type=int, default=2,
+                   help='graph_ode 每个区间的固定 Heun RK2 步数（>=1；默认 2）。')
+    p.add_argument('--dynamics_dt', type=float, default=1.0,
+                   help='graph_ode 每个区间的积分步长 dt（>0，单位=TR；默认 1.0）。')
+    p.add_argument('--graph_source', default='legacy_mask',
+                   choices=['legacy_mask', 'history_fc'],
+                   help='图来源：legacy_mask=外部解剖 Mask 图（旧路径）；'
+                        'history_fc=当前可见历史的 signed Pearson 绝对值功能耦合图'
+                        '（经 SoftAnatomicalPrior，不要求 Mask 文件）。')
+    p.add_argument('--personalized', type=str2bool, default=False,
+                   help='是否启用固定基线个体 profile（graph_ode 专用；需 --bold_source raw '
+                        '并提供 calibration_bold）。False 时不创建 profile 模块。')
+    p.add_argument('--profile_dim', type=int, default=32,
+                   help='个体 profile 维度（personalized=True 时生效；默认 32）。')
+    p.add_argument('--calibration_length', type=int, default=0,
+                   help='基线校准前缀长度（TR 数；bold_source=raw 时必须 >=1，'
+                        '同时决定合法锚点下界与 calibration_bold 输出）。')
+    p.add_argument('--control_manifest', default='',
+                   help='控制序列 manifest CSV（表头 subject_id,controls_path；'
+                        '相对路径相对 manifest 所在目录；NPZ 键 u，[T,F] 逐区间控制）。'
+                        '空=无控制（controls=None，不伪造刺激标签）。')
+    p.add_argument('--lambda_dynamics', type=float, default=0.5,
+                   help='graph_ode 动态多步损失权重（h=2..H masked Huber+PCC；默认 0.5）。')
+    p.add_argument('--lambda_variance', type=float, default=0.05,
+                   help='方差读出高斯 NLL 损失权重（只更新 VarianceHead；默认 0.05）。')
 
     args = p.parse_args()
     # 历史入口行为：finetune 省略 --pretrained_weight 时回填默认主权重路径。

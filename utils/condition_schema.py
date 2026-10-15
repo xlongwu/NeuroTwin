@@ -6,7 +6,7 @@
 语义、连续/类别分组切片与 ``layout_hash`` 全部在这里生成，其他模块只消费
 本模块的输出，不允许各自猜列序。
 
-协议要点（docs/NeuroTwin_condition_injection_v1_revised_20261008.md）：
+协议要点（docs/Version3_docs_1003/NeuroTwin_条件注入实验方案.md）：
 
 - 条件数据**只**读取 merged 文件（``Rest-meta-MDD-V1V2-Merged-{HC,MDD}.xlsx``），
   禁止回读单独的 V1/V2 源表补齐、覆盖或恢复编码；
@@ -35,8 +35,7 @@ SCHEMA_VERSION = 'condition_v1_20261008'
 #  随机来源登记处（方案 §四：split seed / model seed / sampling seed /
 #  Condition Dropout seed 两两分离）
 #
-#  这里原来是 ``experiments/condition_space.py`` 的常量——那个文件属于已移除的对比
-#  编排，但**种子本身不是对比工具**：``main.py`` 的 ``--sampling_seed`` /
+#  **种子本身不是对比工具**：``main.py`` 的 ``--sampling_seed`` /
 #  ``--cond_dropout_seed`` 与 ``models/conditioning.py`` 的 ``dropout_seed`` 默认值
 #  都要引用同一个登记值。留在别处就会有两份字面量，而两份字面量必然漂移（历史上
 #  ``--seed`` 与 ``--sampling_seed`` 的默认值都写成 2024，两条随机流因此并成一条，

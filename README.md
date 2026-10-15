@@ -147,7 +147,7 @@ PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
   bash scripts/Pretrain_HC_tfm.sh
 # 或直接调用（等价显式命令；宽度用 main.py 的锚点默认值 d_demo=16/C=32/H=64）：
 python main.py --mode pretrain \
-    --data_root ./data --checkpoint_dir ./runs/run1010 --name hc_demo \
+    --data_root ./data --checkpoint_dir ./runs/run1010 --name neurotwin_tfm_pretrain \
     --condition_group hc3 --condition_arm demo \
     --seed 2024 --sampling_seed 20261009 --cond_dropout_seed 20261008 \
     --task_mode next_timepoint --context_min 16 --context_max 64
@@ -167,15 +167,15 @@ PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
   bash scripts/Finetune_MDD_tfm.sh
 # 或直接调用：起点与继承统计量都用同一个 HC 权重文件
 python main.py --mode finetune \
-    --pretrained_weight ./runs/run1010/hc_demo/base_best.pt \
-    --condition_inherit_stats ./runs/run1010/hc_demo/base_best.pt \
-    --data_root ./data --checkpoint_dir ./runs/run1010 --name mdd_cat \
+    --pretrained_weight ./runs/run1010/neurotwin_tfm_pretrain/base_best.pt \
+    --condition_inherit_stats ./runs/run1010/neurotwin_tfm_pretrain/base_best.pt \
+    --data_root ./data --checkpoint_dir ./runs/run1010 --name neurotwin_tfm_finetune \
     --condition_group mdd8 --condition_arm cat \
     --seed 2024 --sampling_seed 20261009 --cond_dropout_seed 20261008 \
     --task_mode next_timepoint --context_min 16 --context_max 64
 ```
 
-- 微调脚本在 `$CHECKPOINT_DIR/hc_demo*/base_best.pt` 里找起点：找到 0 个报错（阶段一还没跑），
+- 微调脚本在 `$CHECKPOINT_DIR/neurotwin_tfm_pretrain*/base_best.pt` 里找起点：找到 0 个报错（阶段一还没跑），
   找到多个**拒绝替你猜**并要求 `HC_WEIGHT=<完整路径>` 显式指定
 
 - 自动加载预训练主干（校验任务口径与结构签名），前 `--freeze_backbone_epochs` 个 epoch 冻结主干
@@ -188,8 +188,8 @@ python main.py --mode finetune \
   `--no_eval_after_train`（TASK_HANDOFF §7.1 第 3 条）
 
 > **重跑注意**：`checkpoint_dir/<name>` 已存在时 `main.py:801-808` 会把新目录自增成
-> `hc_demo2`、`mdd_cat2`（不覆盖旧权重）。此时微调脚本会因为命中多个 `hc_demo*/base_best.pt`
-> 而拒绝启动，需要显式 `HC_WEIGHT=<完整路径>` 指定起点。
+> `neurotwin_tfm_pretrain2`、`neurotwin_tfm_finetune2`（不覆盖旧权重）。此时微调脚本会因为命中多个
+> `neurotwin_tfm_pretrain*/base_best.pt` 而拒绝启动，需要显式 `HC_WEIGHT=<完整路径>` 指定起点。
 
 > 注意：不给 `--device` 时 `main.py` 沿用历史默认（`torch.device('cuda:1' if cuda.is_available() else 'cpu')`，
 > `main.py:472-473`）。脚本通过 `DEVICE=` 环境变量显式传 `--device`，不依赖该默认值；
@@ -258,6 +258,119 @@ traj = forecast_horizon(model, hist, sc, hamd, steps=8)   # 2–8 步整段预�
 - 本轮零训练：未训练、未重新划分数据、未覆盖任何 checkpoint、未重跑全量评估；
   MoE/RECC 归档权重（B/C/D/E1/E2）经 `experiments.evaluate_variant` 按各自
   快照加载的路径不受影响。
+
+### Graph-ODE 动态路线：twin 家族（2026-10-12 实施框架）
+
+按 [docs/Version4_docs_1012/NeuroTwin_神经微分方程优化.md](docs/Version4_docs_1012/NeuroTwin_神经微分方程优化.md)
+实施的受控条件图 ODE 路线。**本次交付的是代码框架**：未经真实受控数据训练的控制分支
+只能输出未校准模拟；预测 std 不自动称校准置信区间；健康偏离不称诊断概率或因果病灶；
+不得把旧 discrete checkpoint 指标当作本路线结果。
+
+- 结构：graph_ode 动态头（组合 Laplacian + ConditionFiLM/PersonalFiLM + 状态相关控制门）
+  + 同步 Heun RK2（`ode_steps=2, dynamics_dt=1.0`）持续状态推进 + VarianceHead 对角方差
+  + ProfileEncoder（`personalized=True`，基线前 32 TR → 32 维固定 profile）
+- 数据：`--bold_source raw`（`Raw/<group>/ROISignals_<id>.mat`，[T,F] 明确布局取前 150 TR，
+  每 ROI 用最早 32 TR 计算固定 mu0/s0）+ `--graph_source history_fc`（当前可见历史 FC →
+  SoftAnatomicalPrior，不要求 Mask）+ 可选 `--control_manifest`（CSV 两列
+  `subject_id,controls_path`；NPZ 键 `u [T,F]`，锚点 t 的未来切片为 `u[t+1:t+H+1]`，
+  缺尾按 future_mask 填零；无 manifest 时 controls=None，不伪造刺激标签）
+- checkpoint：`ARCH_VERSION=6`；旧 discrete 快照按 discrete/personalized=False/legacy_mask
+  重建并 strict 加载，不把旧 One-Step 权重迁移到 ODE 头
+- 训练脚本输出目录家族：`hc_demo_twin` / `mdd_cat_twin`（不与旧
+  `neurotwin_tfm_pretrain/finetune` 产物混用）
+
+#### 新动态训练与复评
+
+```bash
+PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
+  CHECKPOINT_DIR=./runs/twin DEVICE=cuda:1 bash scripts/Pretrain_HC_tfm.sh
+PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
+  CHECKPOINT_DIR=./runs/twin DEVICE=cuda:1 bash scripts/Finetune_MDD_tfm.sh
+```
+
+twin 脚本显式传入的新 CLI（旧构造默认保持 discrete / personalized=False /
+legacy_mask / bold_source=auto，不受影响）：
+
+| 参数 | twin 脚本值 | 说明 |
+| --- | --- | --- |
+| `--dynamics_mode` | `graph_ode` | `discrete` 保留原 One-Step 残差逻辑 |
+| `--graph_source` | `history_fc` | `legacy_mask` 继续走外部 Mask 图 |
+| `--bold_source` | `raw` | Raw 前缀校准，首个预测至少第 33 个 TR |
+| `--personalized` / `--profile_dim` | `True` / `32` | profile 基线独立于当前 context |
+| `--calibration_length` | `32` | Raw 标准化与 profile 用同一前缀 |
+| `--ode_steps` / `--dynamics_dt` | `2` / `1.0` | 每区间 2 个 Heun 子步 |
+| `--lambda_dynamics` / `--lambda_variance` | `0.5` / `0.05` | 动态多步(Huber+PCC)与方差 NLL 权重 |
+
+复评沿用统一入口（评估 loader 自动传递 raw/history_fc/calibration/manifest 参数，
+rollout 使用同一 profile 与对齐控制切片）：
+
+```bash
+python -m experiments.evaluate_variant \
+    --ckpt ./runs/twin/mdd_cat_twin/finetuned_best.pt \
+    --out_dir ./results/eval/mdd_cat_twin --save_arrays
+```
+
+#### 健康人口学参照（HC train 被试拟合）
+
+```bash
+# fit：每被试最早 64 观测 → 6 个描述量（acf1/acf2/low_power/spectral_centroid/
+#      diff_rms/signed_fc_mean，频率单位 cycles/sample），人口学 ridge(alpha=1)
+python -m analysis.twin_reference fit \
+    --data_root ./data --mode pretrain --condition_group hc3 \
+    --bold_source raw --calibration_length 32 \
+    --out ./results/twin_reference/hc_demo_twin_ref.npz
+
+# score：单被试历史（不足 64 个真实观测时不执行参照分析）
+python -m analysis.twin_reference score \
+    --reference ./results/twin_reference/hc_demo_twin_ref.npz \
+    --history <被试 NPZ（键 bold，[T,F]，T>=64）> \
+    --age 26 --education 16 --sex 1 \
+    --out ./results/twin_reference/score_xxx.npz
+```
+
+#### 独立 HAMD/HAMA 随访变化读出（冻结动态模型与参照）
+
+配对 CSV 表头字段严格为
+`subject_id,baseline_visit_id,followup_visit_id,baseline_bold_path,control_path,followup_days,baseline_hamd,followup_hamd,baseline_hama,followup_hama,split`；
+基线 NPZ 键 `bold [T,F]`（T≥64，取最早 64 TR），控制 NPZ 键 `u [8,F]`
+（无治疗样本必须显式提供全零控制，不把缺路径当 sham）；同一 subject_id 不得跨 split。
+
+```bash
+python -m train.twin_outcome \
+    --pairs <配对 CSV> \
+    --dynamics_checkpoint ./runs/twin/mdd_cat_twin/finetuned_best.pt \
+    --reference ./results/twin_reference/hc_demo_twin_ref.npz \
+    --out_dir ./runs/twin_outcome
+```
+
+输出 `outcome_best.pt`（含 standardizer 与特征配置）；某分量完全没有有效训练标签时
+直接报错，不输出随机模型。未拟合 outcome 前不产生任何疗效评分。
+
+#### 孪生推理入口
+
+```bash
+python inference_twin.py \
+    --checkpoint ./runs/twin/mdd_cat_twin/finetuned_best.pt \
+    --raw data/Raw/MDD/ROISignals_<id>.mat \
+    --subject_id <id> \
+    --horizon 8 \
+    --controls <控制 NPZ（键 u [T,F]，与序列 T 匹配）> \
+    --observe 4 \
+    --reference ./results/twin_reference/hc_demo_twin_ref.npz \
+    --outcome ./runs/twin_outcome/outcome_best.pt \
+    --followup_days 84 --baseline_hamd 22 --baseline_hama 14 \
+    --out_npz ./results/twin_infer_<id>.npz --output ./results/twin_infer_<id>.json
+```
+
+- `--checkpoint` 必须显式指定，不自动搜索"最新"权重；`--reference` / `--outcome`
+  分别为 `analyze_pathology` / `predict_outcome` 的必需显式文件
+- Raw 前缀校准（固定 mu0/s0）→ profile 一次计算 → 持续状态 rollout → 控制双轨迹
+  （`--controls` 或显式 `--zero_controls`）→ 真实观测更新（`--observe N`，新观测用
+  同一扫描固定 mu0/s0 转数据尺度）
+- Python API：`TwinSession`（`calibrate_scan / compute_profile / init_state / advance /
+  observe / rollout / simulate / new_visit`，新访视 `new_visit(..., reuse_profile=True)`
+  显式沿用已有 p）、`analyze_pathology(history, demo, reference_path)`、
+  `predict_outcome(..., dynamics_checkpoint, outcome_path)`
 
 ### 完整参数说明
 
@@ -451,6 +564,7 @@ Raw ROI BOLD [F, T=150]（data/Normlize，已逐 ROI z-score）
 
 | 变更日期 | 文件名 | 主要修改 |
 | --- | --- | --- |
+| 2026-10-12 | models/{tfm_personal,tfm_dynamics,twin_outcome}.py（新增）、models/{tfm,graph_prior,__init__}.py、utils/dataloader.py、train/{losses,optim}.py、train/twin_outcome.py（新增）、main.py、analysis/{twin_reference,next_point_eval}.py（twin_reference 新增）、experiments/evaluate_variant.py、inference_twin.py（新增）、scripts/{Pretrain_HC_tfm,Finetune_MDD_tfm}.sh、README.md | 实施 graph_ode 动态路线（docs/Version4_docs_1012/NeuroTwin_神经微分方程优化.md，代码框架）：受控条件图 ODE（组合 Laplacian + ConditionFiLM/PersonalFiLM + 状态相关控制门）+ 同步 Heun RK2 持续状态推进 + VarianceHead + ProfileEncoder（新增 tfm_personal/tfm_dynamics）；graph_prior dp Xavier/dq 零初始化；dataloader 新增 bold_source=raw（前缀校准）/graph_source=history_fc/控制 manifest/锚点下界 max(K-1,calib-1)；TFMDualLoss 扩展动态多步与方差 NLL、dynamics_mask 与 cpm_mask 分离；main.py/optim 接通 CLI、loader、profile 解冻；ARCH_VERSION 5→6（旧 discrete 快照按默认重建、strict 加载、不迁移 ODE）；复评与 next_point_eval 传递新参数；新增健康人口学参照（twin_reference：6 描述量 + ridge）、独立 HAMD/HAMA 随访读出（twin_outcome：83 维特征 + masked Gaussian NLL）与孪生推理入口（inference_twin.py：Raw 前缀校准、profile/state、rollout、控制双轨迹、观测更新）；训练脚本切换 twin 家族 hc_demo_twin/mdd_cat_twin。**代码框架交付，未经真实数据训练** |
 | 2026-10-07 | configs/final_model.json（新增）、inference.py（新增）、tests/test_final_model.py（新增）、README.md、TASK_HANDOFF.md | 最终基线模型定型与推理配置固化（零训练）：configs/final_model.json 固化最终结构/损失/训练配方/结构签名/参数量/权重 sha256（唯一事实来源）；inference.py 提供主权重 strict 加载入口（哈希校验 → arch_version 校验 → FiLM 闸门拒绝 MoE/HC 权重 → normalizer buffers 校验 → 参数量核对）与 predict_next_state / forecast_horizon 接口（H≤8，超限明确报错不切换协议；SC 预处理复用数据侧口径）；新增 18 项定型契约测试（95 用例全通过）；MoE/RECC 归档加载路径不受影响 |
 | 2026-10-06 | models/tfm_experts.py（新增）、models/tfm.py、models/__init__.py、train/tfm_coupling.py（新增）、train/{optim,__init__}.py、main.py、analysis/analyze_tfm_experts.py（新增）、scripts/{Finetune_MDD_tfm_moe,Finetune_MDD_tfm_recc}.sh（新增）、tests/{test_tfm_experts,test_tfm_recc}.py（新增）、README.md | 实施 RECC 方案（docs/Version3_docs_1003/NeuroTwin_TFM_RECC_详细应用方案.md）：新增 TFM 病理残差专家模块（TFMPathologyRouter/Expert/MoE，`--tfm_patho_mode moe` 时 One-Step 头 z=z_t+Δz_shared+Δz_path，One-Step 关闭原 FiLM，CPM 不变）；`train/tfm_coupling.py` 实现 Expert competence→Router 校准（KL(sg(q)‖p_cpl) 梯度只更新 Router）、Pair-RECC、Router 正则与 §63–§70 机制指标；冻结阶段 MoE 可训练（is_conditioning_adapter）+ 独立参数组 tfm_moe；main.py 新增 §48–§51 CLI/fail-fast、dense warmup 与 λ_recc ramp 调度；HC 预训练结构与 arch_version 不变（§52/§92），finetune checkpoint 由 config.args 快照重建（evaluate_variant 自省兼容，已验证）；测试 29→57 用例 |
 | 2026-10-05 | models/{neurotwin,neurotwin_moe,decoder,common,pathology}.py、train/{moe,losses,optim,__init__}.py、main.py、utils/common.py、experiments/evaluate_variant.py、analysis/{analyzer,visualizer}.py、scripts/、README.md | 移除 legacy NeuroTwin 主干（NeuroTwin/MoE/DFCAdapter/BrainMDM/GraphODEDDI/预测头/MoE 正则/legacy CLI），唯一主干为 NeuroTwinTFM：main.py 展平双架构分支并删除 ~60 个 legacy 参数与 `--model_arch` 开关（内部固定 tfm，checkpoint 快照兼容）；`compute_graph_regularization` 移入 train/losses.py；evaluate_variant 仅重建 TFM（legacy 快照显式报错）；TFM checkpoint 与两阶段脚本行为不变 |

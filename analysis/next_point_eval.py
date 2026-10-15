@@ -675,6 +675,11 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
         eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
+        # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
+        num_rois=int(getattr(args, 'num_rois', 116)),
+        graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
+        calibration_length=int(getattr(args, 'calibration_length', 0) or 0),
+        control_manifest=(getattr(args, 'control_manifest', '') or None),
     )
     if split == 'test':
         return loader.get_test(), loader.get_test_subjects(), loader
@@ -701,7 +706,8 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                                          要求评估视图为所有 anchor 提供 future）
     """
     model.eval()
-    from main import _index_condition
+    from main import _index_condition, dynamics_extras
+    dyn_h = int(getattr(model, 'cpm_horizon', 0) or 0) or 8
     chunk = defaultdict(list)
     for batch in tqdm(data_loader, desc='[NextPoint eval]', leave=False):
         x = batch['x'].to(device, non_blocking=True)              # [B,F,1,K]
@@ -725,8 +731,11 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
             }
             if 'subject_index' in batch:
                 cond['subject_index'] = batch['subject_index'].to(device, non_blocking=True)
+        bcal, bctl = dynamics_extras(batch, device)
 
-        pred, aux_info = model(x, sc, pathology, condition=cond)     # [B,F,H,1]
+        pred, aux_info = model(x, sc, pathology, condition=cond,
+                               controls=(bctl[:, :dyn_h] if bctl is not None else None),
+                               calibration_bold=bcal)                  # [B,F,H,1]
         pred = pred[:, :, :, 0]                                   # [B,F,H]
         bases = baseline_next_state(x_last, x_prev, offsets, ar1=ar1)
 
@@ -779,6 +788,9 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                     hist, sc[rf_gpu], (pathology[rf_gpu] if pathology is not None else None),
                     steps=rollout_steps,
                     condition=(_index_condition(cond, rf_gpu) if cond else None),
+                    controls=(bctl[rf_gpu][:, :rollout_steps]
+                              if bctl is not None else None),
+                    calibration_bold=(bcal[rf_gpu] if bcal is not None else None),
                 )                                                   # [n,R,F]
                 base_roll = baseline_rollout(x_last[rf_gpu], (x_last - x_prev)[rf_gpu],
                                              rollout_steps, ar1=ar1)

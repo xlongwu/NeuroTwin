@@ -568,6 +568,11 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
                             model.sc_prior]
         if model.rev_norm is not None:
             backbone_modules.append(model.rev_norm)
+        # graph_ode 路线（方案 §10）：个体 profile 编码器属于共享主干解冻列表；
+        # VarianceHead 在 GraphODEDynamicsHead 内部，随 one_step_head 一起解冻。
+        # 条件 FiLM 等适配器已由上方条件模块循环解冻，不在此重复。
+        if getattr(model, 'profile_encoder', None) is not None:
+            backbone_modules.append(model.profile_encoder)
         for module in backbone_modules:
             for p in module.parameters():
                 p.requires_grad = True

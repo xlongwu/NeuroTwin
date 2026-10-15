@@ -24,8 +24,13 @@ ARCH_VERSION 用于检查点与当前代码的结构兼容性校验：
       v4 的无条件 checkpoint 需经 train.optim.migrate_pretrained_checkpoint 显式
       迁移（新增条件键记为 new_initialized / zero_expanded），不允许靠
       strict=False + shape 过滤静默忽略。
+  6 — graph_ode 动态路线（20261012）：NeuroTwinTFM 新增 dynamics_mode /
+      ode_steps / dynamics_dt / graph_source / personalized / profile_dim
+      结构参数；graph_ode 分支构建 GraphODEDynamicsHead（含 VarianceHead）、
+      personalized 时构建 ProfileEncoder/PersonalFiLM，discrete 分支结构与
+      v5 完全一致。旧 checkpoint（缺新字段）按 discrete/personalized=False/
+      legacy_mask 重建，不得将旧 one-step 头权重迁移到 ODE 头。
 """
-
-ARCH_VERSION = 5
+ARCH_VERSION = 6
 
 __all__ = ['ARCH_VERSION']
