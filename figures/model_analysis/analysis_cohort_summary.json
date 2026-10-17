@@ -1,0 +1,347 @@
+{
+  "analysis": "MDD-HC subject-level resting-state functional connectivity",
+  "primary_roi_metric": "mean of 115 off-diagonal Fisher-z transformed ROI correlations",
+  "secondary_edge_metric": "pairwise Fisher-z transformed ROI correlation",
+  "inference": "OLS adjusted for diagnosis/Age/Sex/Education/site fixed effects; CR1 site-clustered 95% CI and p-values; BH-FDR within ROI, edge, and exploratory HAMD families",
+  "roi_and_signal_validation": {
+    "roi_count": 116,
+    "edge_count_unique_upper_triangle": 6670,
+    "signal_correlation_spot_checks_by_group": {
+      "HC": 5,
+      "MDD": 5
+    },
+    "signal_to_correlation_max_abs_difference": 1.2212453270876722e-15,
+    "roi_order_evidence": "AAL IDs are exactly 1..116; project correlation code takes the first 116 normalized signal columns and computes corrcoef(signal.T). Correlation MAT files do not contain embedded ROI labels, so names follow that saved column order."
+  },
+  "cohort": {
+    "hc_sites_with_matched_rows": 42,
+    "mdd_sites_with_matched_rows": 38,
+    "shared_sites_before_complete_case": 38,
+    "matched_subjects_at_shared_sites": 4307,
+    "complete_case_subjects_before_site_pair_filter": 4299,
+    "analysis_sites_with_both_diagnoses": 38,
+    "complete_case_subjects_after_site_pair_filter": 4299,
+    "n_hc": 2049,
+    "n_mdd": 2250,
+    "n_site_clusters": 38,
+    "excluded_for_covariate_missing_at_shared_sites": 8,
+    "covariates": [
+      "site fixed effects",
+      "Age",
+      "Sex",
+      "Education"
+    ],
+    "excluded_covariate": "Dataset field (not harmonized across groups)",
+    "matched_source_counts": {
+      "HC": {
+        "correlation_files": 2222,
+        "unique_correlation_subjects": 2222,
+        "clinical_table_rows": 2445,
+        "exact_id_matches": 2195,
+        "correlation_ids_without_clinical_row": 27
+      },
+      "MDD": {
+        "correlation_files": 2253,
+        "unique_correlation_subjects": 2253,
+        "clinical_table_rows": 2490,
+        "exact_id_matches": 2253,
+        "correlation_ids_without_clinical_row": 0
+      }
+    },
+    "subject_unit": "one participant, one correlation matrix"
+  },
+  "matched_source_counts": {
+    "HC": {
+      "correlation_files": 2222,
+      "unique_correlation_subjects": 2222,
+      "clinical_table_rows": 2445,
+      "exact_id_matches": 2195,
+      "correlation_ids_without_clinical_row": 27
+    },
+    "MDD": {
+      "correlation_files": 2253,
+      "unique_correlation_subjects": 2253,
+      "clinical_table_rows": 2490,
+      "exact_id_matches": 2253,
+      "correlation_ids_without_clinical_row": 0
+    }
+  },
+  "model_roi_importance": {
+    "checkpoint": "checkpoints\\neurotwin_tfm_finetune\\finetuned_best.pt",
+    "status": "blocked_provenance_mismatch",
+    "mismatch_fields": [
+      "merged_sha256",
+      "resolved_source_map"
+    ],
+    "inference_run": false,
+    "note": "Validation inference and ROI permutation were not run because the saved clinical-table hash/source map do not match the current workbook. The checkpoint's provenance gate was not bypassed.",
+    "merged_sha256_matches": false,
+    "resolved_source_map_matches": false,
+    "saved": {
+      "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
+      "merged_sha256": "2a2ba7de5415900b2958c8dd55f34e90e7ad63320442a66bb4e967bce14822a5",
+      "resolved_source_map": {
+        "Sex": [
+          "Sex"
+        ],
+        "Age": [
+          "Age"
+        ],
+        "education": [
+          "education"
+        ],
+        "episode": [
+          "episode"
+        ],
+        "illness": [
+          "illness"
+        ],
+        "medication": [
+          "medication",
+          "OnMedication"
+        ],
+        "HAMD": [
+          "HAMD"
+        ],
+        "HAMA": [
+          "HAMA"
+        ]
+      }
+    },
+    "current": {
+      "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
+      "merged_sha256": "5eb2396a420da9f054af0ff1468661692d23164479452a05a9969278d3d9da19",
+      "resolved_source_map": {
+        "Sex": [
+          "Sex"
+        ],
+        "Age": [
+          "Age"
+        ],
+        "education": [
+          "education"
+        ],
+        "episode": [
+          "episode"
+        ],
+        "illness": [
+          "illness"
+        ],
+        "medication": [
+          "On medication?",
+          "OnMedication"
+        ],
+        "HAMD": [
+          "HAMD"
+        ],
+        "HAMA": [
+          "HAMA"
+        ]
+      }
+    },
+    "local_workbooks_with_checkpoint_filename": [
+      "Rest-meta-MDD-V1V2-Merged-MDD.xlsx"
+    ]
+  },
+  "roi_fdr_significant_count": 78,
+  "edge_fdr_significant_count": 1527,
+  "hamd_fdr_significant_count": 0,
+  "hamd_exploratory_n": 2250,
+  "hamd_design_columns": [
+    "Intercept",
+    "HAMD_z",
+    "Age_z",
+    "Education_z",
+    "Sex_2.0",
+    "site_IS002",
+    "site_IS003",
+    "site_IS004",
+    "site_IS005",
+    "site_IS006",
+    "site_IS007",
+    "site_IS010",
+    "site_IS011",
+    "site_IS012",
+    "site_IS013",
+    "site_IS014",
+    "site_IS016",
+    "site_IS018",
+    "site_IS019",
+    "site_IS020",
+    "site_IS021",
+    "site_IS022",
+    "site_S1",
+    "site_S10",
+    "site_S11",
+    "site_S12",
+    "site_S14",
+    "site_S15",
+    "site_S16",
+    "site_S17",
+    "site_S18",
+    "site_S19",
+    "site_S2",
+    "site_S20",
+    "site_S21",
+    "site_S22",
+    "site_S23",
+    "site_S24",
+    "site_S25",
+    "site_S6",
+    "site_S7",
+    "site_S8"
+  ],
+  "primary_design_columns": [
+    "Intercept",
+    "diagnosis_MDD",
+    "Age_z",
+    "Education_z",
+    "Sex_2.0",
+    "site_IS002",
+    "site_IS003",
+    "site_IS004",
+    "site_IS005",
+    "site_IS006",
+    "site_IS007",
+    "site_IS010",
+    "site_IS011",
+    "site_IS012",
+    "site_IS013",
+    "site_IS014",
+    "site_IS016",
+    "site_IS018",
+    "site_IS019",
+    "site_IS020",
+    "site_IS021",
+    "site_IS022",
+    "site_S1",
+    "site_S10",
+    "site_S11",
+    "site_S12",
+    "site_S14",
+    "site_S15",
+    "site_S16",
+    "site_S17",
+    "site_S18",
+    "site_S19",
+    "site_S2",
+    "site_S20",
+    "site_S21",
+    "site_S22",
+    "site_S23",
+    "site_S24",
+    "site_S25",
+    "site_S6",
+    "site_S7",
+    "site_S8"
+  ],
+  "top_roi_effects": [
+    {
+      "roi_index": 5,
+      "abbr": "ORBsup.L",
+      "network": "LN",
+      "adjusted_beta": -0.02990205120759794,
+      "ci_low": -0.04184659850488246,
+      "ci_high": -0.01795750391031342,
+      "p_value": 1.1276547954772722e-05,
+      "q_value": 0.0007086520912520654
+    },
+    {
+      "roi_index": 54,
+      "abbr": "IOG.R",
+      "network": "VN",
+      "adjusted_beta": -0.029675717274255768,
+      "ci_low": -0.04411591550655562,
+      "ci_high": -0.015235519041955917,
+      "p_value": 0.00017942811977820174,
+      "q_value": 0.00290070145099557
+    },
+    {
+      "roi_index": 2,
+      "abbr": "PreCG.R",
+      "network": "SMN",
+      "adjusted_beta": -0.029433964027274037,
+      "ci_low": -0.04353806534280435,
+      "ci_high": -0.015329862711743726,
+      "p_value": 0.00014801753798961083,
+      "q_value": 0.0028616724011324758
+    },
+    {
+      "roi_index": 6,
+      "abbr": "ORBsup.R",
+      "network": "LN",
+      "adjusted_beta": -0.02764648879466445,
+      "ci_low": -0.04032746564196654,
+      "ci_high": -0.014965511947362358,
+      "p_value": 8.387273763829779e-05,
+      "q_value": 0.0019458475132085086
+    },
+    {
+      "roi_index": 21,
+      "abbr": "OLF.L",
+      "network": "LN",
+      "adjusted_beta": -0.026351462668334356,
+      "ci_low": -0.03817430665808038,
+      "ci_high": -0.014528618678588331,
+      "p_value": 6.219729298314233e-05,
+      "q_value": 0.0018037214965111277
+    },
+    {
+      "roi_index": 18,
+      "abbr": "ROL.R",
+      "network": "SMN",
+      "adjusted_beta": -0.02603342023020631,
+      "ci_low": -0.03881354490394234,
+      "ci_high": -0.013253295556470274,
+      "p_value": 0.000200048375930729,
+      "q_value": 0.00290070145099557
+    },
+    {
+      "roi_index": 100,
+      "abbr": "Cere6.R",
+      "network": "SMN",
+      "adjusted_beta": -0.024557531160069382,
+      "ci_low": -0.03817845365937138,
+      "ci_high": -0.010936608660767382,
+      "p_value": 0.0007978177635350807,
+      "q_value": 0.004870887398424703
+    },
+    {
+      "roi_index": 7,
+      "abbr": "MFG.L",
+      "network": "DAN",
+      "adjusted_beta": -0.024535087626252113,
+      "ci_low": -0.03695811307313147,
+      "ci_high": -0.01211206217937276,
+      "p_value": 0.00029014839761066087,
+      "q_value": 0.003192816477751524
+    },
+    {
+      "roi_index": 19,
+      "abbr": "SMA.L",
+      "network": "FN",
+      "adjusted_beta": -0.024443945091804947,
+      "ci_low": -0.03712132371067674,
+      "ci_high": -0.011766566472933154,
+      "p_value": 0.0003832162040756274,
+      "q_value": 0.0034194676671363677
+    },
+    {
+      "roi_index": 40,
+      "abbr": "PHG.R",
+      "network": "LN",
+      "adjusted_beta": -0.02434965276324675,
+      "ci_low": -0.036518314311441785,
+      "ci_high": -0.012180991215051715,
+      "p_value": 0.00024832615749358734,
+      "q_value": 0.003192816477751524
+    }
+  ],
+  "limitations": [
+    "The input correlation files do not embed ROI names; names are aligned by the project's first-116-column preprocessing order.",
+    "AAL116.xlsx contains labels and networks but no MNI coordinates, so no anatomical surface localization is produced.",
+    "Per-subject full-series z-scoring prevents interpretation of BOLD means or SDs as absolute MDD-HC amplitude differences.",
+    "The group contrast is observational and does not imply causal disease mechanisms.",
+    "No treatment pre/post outcomes are used; virtual stimulation or real treatment response is not inferred."
+  ]
+}

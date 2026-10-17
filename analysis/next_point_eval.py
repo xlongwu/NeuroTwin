@@ -627,15 +627,21 @@ def write_feature_importance(out_dir, split, result, offsets):
 #  §4 评估主流程
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_next_point_loader(args, split, refresh_split_manifest=False):
-    """按 checkpoint 的训练配置重建 next_timepoint DataLoader（被试级切分 manifest 复用）。"""
-    from main import parse_pathology_fields
+def build_next_point_loader(args, split, refresh_split_manifest=False,
+                            condition_bundle=None):
+    """按 checkpoint 的训练配置重建 next_timepoint DataLoader（被试级切分 manifest 复用）。
+
+    ``condition_bundle`` 为 checkpoint 的 ``config.condition``；提供时条件统计量走
+    **inherit**（逐位复用训练期 train-only 快照），不在评估侧重拟合。
+    """
+    from main import condition_loader_kwargs, parse_pathology_fields
     dims = resolve_task_dims(args)
     if dims['task_mode'] != 'next_timepoint':
         raise ValueError("build_next_point_loader 仅支持 task_mode=next_timepoint 的配置快照")
     horizons = eval_horizons(args)
     loader = NeuroTwinDataLoader(
         data_root=args.data_root, mode=args.mode, batch_size=args.batch_size,
+        **condition_loader_kwargs(args, condition_bundle),
         pathology_input_dim=args.pathology_input_dim,
         pathology_fields=parse_pathology_fields(args.pathology_fields),
         pathology_missing=args.pathology_missing,
@@ -669,6 +675,11 @@ def build_next_point_loader(args, split, refresh_split_manifest=False):
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
         eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
+        # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
+        num_rois=int(getattr(args, 'num_rois', 116)),
+        graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
+        calibration_length=int(getattr(args, 'calibration_length', 0) or 0),
+        control_manifest=(getattr(args, 'control_manifest', '') or None),
     )
     if split == 'test':
         return loader.get_test(), loader.get_test_subjects(), loader
@@ -695,6 +706,8 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                                          要求评估视图为所有 anchor 提供 future）
     """
     model.eval()
+    from main import _index_condition, dynamics_extras
+    dyn_h = int(getattr(model, 'cpm_horizon', 0) or 0) or 8
     chunk = defaultdict(list)
     for batch in tqdm(data_loader, desc='[NextPoint eval]', leave=False):
         x = batch['x'].to(device, non_blocking=True)              # [B,F,1,K]
@@ -708,8 +721,21 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         pathology = batch.get('pathology_score', None)
         if pathology is not None:
             pathology = pathology.to(device, non_blocking=True)
+        # 字段级条件注入（与 legacy 数值通路互斥；由 Dataset 是否产出 cond_z 决定）
+        cond = None
+        if 'cond_z' in batch:
+            cond = {
+                'cond_z': batch['cond_z'].to(device, non_blocking=True),
+                'cond_code': batch['cond_code'].to(device, non_blocking=True),
+                'cond_mask': batch['cond_mask'].to(device, non_blocking=True),
+            }
+            if 'subject_index' in batch:
+                cond['subject_index'] = batch['subject_index'].to(device, non_blocking=True)
+        bcal, bctl = dynamics_extras(batch, device)
 
-        pred, aux_info = model(x, sc, pathology)                  # [B,F,H,1]
+        pred, aux_info = model(x, sc, pathology, condition=cond,
+                               controls=(bctl[:, :dyn_h] if bctl is not None else None),
+                               calibration_bold=bcal)                  # [B,F,H,1]
         pred = pred[:, :, :, 0]                                   # [B,F,H]
         bases = baseline_next_state(x_last, x_prev, offsets, ar1=ar1)
 
@@ -724,7 +750,18 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         chunk['cutoff'].append(batch['cutoff'].numpy())
         chunk['ctx_len'].append(batch['context_len'].numpy())
         if pathology is not None:
-            chunk['hamd'].append(pathology.detach().cpu().numpy().reshape(-1))
+            p_np = pathology.detach().cpu().numpy()
+            chunk['hamd'].append(np.asarray(p_np).reshape(p_np.shape[0], -1)[:, 0])
+        if cond is not None:
+            # 逐 anchor 的**矩阵**：绝不 reshape(-1)，否则行数会变成 anchor 数的 K 倍
+            # （把 [N, K] 当成 [N] 读是经典口径错误，方案 §14 明确要求避免）
+            for key in ('cond_z', 'cond_code', 'cond_mask'):
+                chunk[key].append(cond[key].detach().cpu().numpy())
+            if 'cond_raw' in batch:
+                chunk['cond_raw'].append(batch['cond_raw'].numpy())
+            if 'subject_index' in cond:
+                chunk['subject_index'].append(
+                    cond['subject_index'].detach().cpu().numpy())
 
         # ---- CPM 全 horizon 预测（TFM；评估视图须为所有 anchor 提供 future）----
         if collect_cpm:
@@ -749,7 +786,12 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                 hist = x[rf_gpu][:, :, 0, :].transpose(1, 2).contiguous()   # [n,K,F]
                 roll = model.rollout_next_states(
                     hist, sc[rf_gpu], (pathology[rf_gpu] if pathology is not None else None),
-                    steps=rollout_steps)                                # [n,R,F]
+                    steps=rollout_steps,
+                    condition=(_index_condition(cond, rf_gpu) if cond else None),
+                    controls=(bctl[rf_gpu][:, :rollout_steps]
+                              if bctl is not None else None),
+                    calibration_bold=(bcal[rf_gpu] if bcal is not None else None),
+                )                                                   # [n,R,F]
                 base_roll = baseline_rollout(x_last[rf_gpu], (x_last - x_prev)[rf_gpu],
                                              rollout_steps, ar1=ar1)
                 chunk['roll_pred'].append(roll.float().detach().cpu().numpy())
@@ -790,6 +832,24 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         'roll_cutoff': (np.concatenate(chunk['roll_cutoff'], axis=0)
                         if chunk['roll_cutoff'] else None),
     }
+    # ---- 字段级条件矩阵（按**字段名**读取，绝不假设第 0 列是 HAMD）----
+    conditioner = getattr(model, 'conditioner', None)
+    fields = list(conditioner.names) if conditioner is not None else []
+    data['condition_fields'] = fields
+    if chunk['cond_z']:
+        n_anchor = len(chunk['subj'])
+        for key in ('cond_z', 'cond_code', 'cond_mask', 'cond_raw', 'subject_index'):
+            if not chunk[key]:
+                continue
+            arr = np.concatenate(chunk[key], axis=0)
+            if arr.shape[0] != n_anchor:
+                raise AssertionError(
+                    f'条件数组 {key} 行数 {arr.shape[0]} != anchor 数 {n_anchor}；'
+                    '多字段评估必须保持 [N, K]，把 [N, K] 展平成 N*K 会让每个被试'
+                    '被计成 K 次（方案 §14 明确禁止 reshape(-1)）')
+            data[key] = arr
+        if chunk['cond_raw'] and 'HAMD' in fields:
+            data['hamd'] = data['cond_raw'][:, fields.index('HAMD')].astype(np.float64)
     if collect_cpm:
         data['cpm_pred'] = (np.concatenate(chunk['cpm_pred'], axis=0)
                             if chunk['cpm_pred'] else None)
@@ -1093,6 +1153,14 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
                        base_arrays, subj_idx, labels)
     _write_task_csv(out_dir / f'per_task_metrics_{split}.csv', data, arrays, labels)
     if save_arrays:
+        extra = {}
+        # 条件矩阵按 [N, K] 原样落盘（**不展平**），字段名一并保存，供置换诊断、
+        # 缺失分层与逐被试复核复用（HAMD/HAMA 按字段名读取，不假设列序）
+        for key in ('cond_z', 'cond_code', 'cond_mask', 'cond_raw', 'subject_index'):
+            if data.get(key) is not None:
+                extra[key] = data[key]
+        extra['condition_fields'] = np.array(data.get('condition_fields', []),
+                                             dtype=object)
         np.savez_compressed(
             out_dir / f'predictions_{split}.npz',
             pred=pred, target=target, mask=mask, x_last=data['x_last'],
@@ -1104,7 +1172,8 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
             pred_ar1=data['baselines'].get('ar1'),
             rollout=(data['roll_pred'] if data['roll_pred'] is not None else []),
             rollout_target=(data['roll_target'] if data['roll_target'] is not None else []),
-            rollout_preds_ar1=data['roll_baselines'].get('ar1', []))
+            rollout_preds_ar1=data['roll_baselines'].get('ar1', []),
+            **extra)
     log.info('[next_timepoint] %s 评估完成 | next MAE=%.4f | spatial PCC=%.4f',
              split, model_block.get(labels[0], {}).get('MAE', float('nan')),
              model_block.get(labels[0], {}).get('PCC_spatial', float('nan')))
@@ -1127,7 +1196,11 @@ def _overall_block(agg, labels):
 
 
 def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
-    """被试级 CSV（论文统计的主口径：先被试内平均，再跨被试统计）。"""
+    """被试级 CSV（论文统计的主口径：先被试内平均，再跨被试统计）。
+
+    条件注入时逐字段值与有效性按**字段名**成列写出（不假设第 0 列是 HAMD），
+    并附真实缺失模式，供缺失分层与来源分层报告直接使用。
+    """
     subjects = sorted(set(str(s) for s in subj_idx))
     hamd_map, n_tasks = {}, {}
     for i, s in enumerate(subj_idx):
@@ -1135,11 +1208,25 @@ def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
         n_tasks[s] = n_tasks.get(s, 0) + 1
         if np.isfinite(data['hamd'][i]):
             hamd_map[s] = float(data['hamd'][i])
+    fields = list(data.get('condition_fields') or [])
+    raw = data.get('cond_raw')
+    msk = data.get('cond_mask')
+    cond_map, obs_map = {}, {}
+    if raw is not None and fields:
+        for i, s in enumerate(subj_idx):
+            s = str(s)
+            cond_map[s] = {name: (float(raw[i, j]) if np.isfinite(raw[i, j]) else float('nan'))
+                           for j, name in enumerate(fields)}
+            obs_map[s] = {name: int(msk[i, j] > 0) for j, name in enumerate(fields)} \
+                if msk is not None else {}
     rows = []
     for s in subjects:
         sel = subj_idx == s
         row = {'subject_id': s, 'hamd': hamd_map.get(s, float('nan')),
                'n_tasks': n_tasks[s]}
+        for j, name in enumerate(fields):
+            row[f'cond_{name}'] = cond_map.get(s, {}).get(name, float('nan'))
+            row[f'obs_{name}'] = obs_map.get(s, {}).get(name, -1)
         for i, label in enumerate(labels):
             for metric, arr in (('MAE', arrays['mae']), ('RMSE', arrays['rmse']),
                                 ('PCC_spatial', arrays['spatial_pcc']),
@@ -1154,6 +1241,7 @@ def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
                 row[f'{name}_{label}_MAE'] = float(col.mean()) if len(col) else float('nan')
         rows.append(row)
     cols = (['subject_id', 'hamd', 'n_tasks']
+            + sum(([f'cond_{name}', f'obs_{name}'] for name in fields), [])
             + [f'{label}_{m}' for label in labels
                for m in ('MAE', 'RMSE', 'PCC_spatial', 'R2')]
             + [f'{name}_{label}_MAE' for name in base_arrays for label in labels])

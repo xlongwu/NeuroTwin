@@ -1,0 +1,77 @@
+{
+  "checkpoint": "checkpoints\\neurotwin_tfm_finetune\\finetuned_best.pt",
+  "status": "blocked_provenance_mismatch",
+  "mismatch_fields": [
+    "merged_sha256",
+    "resolved_source_map"
+  ],
+  "inference_run": false,
+  "note": "Validation inference and ROI permutation were not run because the saved clinical-table hash/source map do not match the current workbook. The checkpoint's provenance gate was not bypassed.",
+  "merged_sha256_matches": false,
+  "resolved_source_map_matches": false,
+  "saved": {
+    "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
+    "merged_sha256": "2a2ba7de5415900b2958c8dd55f34e90e7ad63320442a66bb4e967bce14822a5",
+    "resolved_source_map": {
+      "Sex": [
+        "Sex"
+      ],
+      "Age": [
+        "Age"
+      ],
+      "education": [
+        "education"
+      ],
+      "episode": [
+        "episode"
+      ],
+      "illness": [
+        "illness"
+      ],
+      "medication": [
+        "medication",
+        "OnMedication"
+      ],
+      "HAMD": [
+        "HAMD"
+      ],
+      "HAMA": [
+        "HAMA"
+      ]
+    }
+  },
+  "current": {
+    "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
+    "merged_sha256": "5eb2396a420da9f054af0ff1468661692d23164479452a05a9969278d3d9da19",
+    "resolved_source_map": {
+      "Sex": [
+        "Sex"
+      ],
+      "Age": [
+        "Age"
+      ],
+      "education": [
+        "education"
+      ],
+      "episode": [
+        "episode"
+      ],
+      "illness": [
+        "illness"
+      ],
+      "medication": [
+        "On medication?",
+        "OnMedication"
+      ],
+      "HAMD": [
+        "HAMD"
+      ],
+      "HAMA": [
+        "HAMA"
+      ]
+    }
+  },
+  "local_workbooks_with_checkpoint_filename": [
+    "Rest-meta-MDD-V1V2-Merged-MDD.xlsx"
+  ]
+}

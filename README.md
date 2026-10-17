@@ -24,7 +24,11 @@
 1. **TimesFM-3 风格时序主干**：temporal patching（`--tfm_patch_len`）+ 逐 ROI Causal Temporal Attention，长 context 用 `[B,F,K]` 单窗口口径建模。
 2. **SC 软解剖先验全层共享**：`SoftAnatomicalPrior` 一次计算 `A_eff = λ·A_SC + (1-λ)·A_func + ΔA`，以加性偏置注入全部 ROI attention，并由 One-Step 头做一次图混合。
 3. **One-Step + CPM 双预测头**：One-Step 头以 x_t 为锚点建模下一 TR（零初始化残差，初始 = persistence）；CPM 头用 ROI × Horizon 查询一次非自回归输出 t+1..t+H 全轨迹。
-4. **病理条件 FiLM 注入**：HAMD 评分 → `PathologyNormalizer`（仅用训练集拟合，随 checkpoint 保存）→ 零初始化 FiLM 调制两个预测头；冻结主干阶段条件适配器仍参与训练。
+4. **字段级临床条件注入**：merged 表 8 个字段逐字段独立编码 → `cat` 融合 $\Phi$ → **零初始化**
+   $\Delta E$（起点与 HC 侧 $c_{\text{demo}}$ 逐位相同）→ 双头独立 FiLM 调制 One-Step 与 CPM，
+   支持 Condition Dropout；统计量与类别词表由 HC→MDD **按位继承**（仅 train subjects 拟合）。
+   冻结主干阶段只有条件模块参与训练。另有 legacy 单标量 HAMD FiLM 通路
+   （`PathologyNormalizer` + `--pathology_input_dim`），声明条件臂时由模型显式互斥。
 5. **双目标损失**：`TFMDualLoss` = one-step Huber + spatial PCC + γ 加权逐 horizon CPM Huber，不再使用数学等价的 abs+delta 双计项。
 6. **严格 subject-level 数据划分**：同一被试样本不跨 train/val/test，支持按 HAMD 分数分层切分，防泄漏。
 7. **完整评估链路**：next-state 主指标与被试级聚合、3 条 trivial baseline 对照、free rollout 逐 horizon 退化分析、CPM 逐 horizon 对照、FC/频谱层面指标、ROI 置换重要性（含 BH-FDR 校正）。
@@ -34,31 +38,37 @@
 ```
 NeuroTwin/
 ├── main.py                     # 训练入口：main 训练/验证循环与 CLI 定义
+├── inference.py                # 最终定型主模型加载与推理入口（predict_next_state / forecast_horizon）
+├── configs/
+│   └── final_model.json        # 最终定型配置唯一事实来源（结构签名、参数量、权重哈希、训练配方）
 ├── models/
 │   ├── tfm.py                  # NeuroTwinTFM：唯一主干（Context-only RevIN + SoftAnatomicalPrior + One-Step/CPM 双头 + 病理 FiLM）
 │   ├── tfm_backbone.py         # TFM 构件：TemporalPatchEmbed / CausalTemporalAttention / SCGuidedROIAttention / TFMEncoderBlock
 │   ├── graph_prior.py          # SoftAnatomicalPrior：SC 软解剖先验（A_eff）
 │   ├── pathology.py            # PathologyNormalizer：临床评分（HAMD）→ 条件向量
+│   ├── conditioning.py         # 字段级条件注入：独立编码器 / cat 融合 / ΔE / Condition Dropout / AdaRMSNorm
 │   └── common.py               # BrainRevIN / prepare_sc_matrix / 变长前缀切片工具
 ├── train/
 │   ├── losses.py               # TFMDualLoss（One-Step+CPM 双目标）+ SC 图正则
 │   └── optim.py                # AdamW 参数组 / Warmup+Cosine 调度 / ModelEMA / 分阶段微调 / 权重加载
 ├── utils/
 │   ├── dataloader.py           # NeuroTwinNextPointDataset / NeuroTwinDataLoader（连续 context 样本、subject-level 划分；支持 CPM future 目标）
+│   ├── condition_schema.py     # 8 字段白名单与清洗/码值协议、layout/schema 哈希、随机来源常量
 │   ├── augmentation.py         # BrainSignalAugmentation 训练集增强
 │   └── common.py               # set_seed / 任务维度推导 / 通用工具
-├── tests/                      # 单元测试（pytest）：TFM backbone / 完整模型 / 双目标损失
+├── tests/                      # 单元测试（pytest）：TFM backbone / 完整模型 / 双目标损失 / 病理专家 MoE / RECC
 ├── analysis/
 │   ├── metrics.py / checkpoint.py
 │   ├── next_point_eval.py            # next-state 指标 + 被试级聚合 + baselines + free rollout + FC + CPM 逐 horizon
 │   ├── analyze_low_pcc_samples.py    # 低 PCC 被试临床特征关联分析（消费 per_subject/per_task CSV）
+│   ├── analyze_tfm_experts.py        # TFM 病理专家机制分析：Router–Expert competence 诊断（§94–§95）
 │   ├── visualize_roi_importance.py   # 结合 AAL116 图谱的 ROI 重要性可视化（消费 feature_importance_<split>.json）
 │   └── visualize_sig_region.py       # 按脑网络分组的显著脑区玻璃脑图（消费 feature_importance_<split>.json）
 ├── experiments/                # evaluate_variant：从 checkpoint 重建 NeuroTwinTFM 并统一评估
+│                                 # （2026-10-10：condition_study / condition_diagnostics 已删除，见 TASK_HANDOFF §0.27）
 ├── scripts/
-│   ├── Pretrain_HC_tfm.sh      # 阶段一：HC 预训练
-│   ├── Finetune_MDD_tfm.sh     # 阶段二：MDD 病理 FiLM 微调
-│   └── Phase0_test_eval.sh     # 独立 test 集锁定评估
+│   ├── Pretrain_HC_tfm.sh      # 阶段一：HC 预训练（条件臂 hc3/demo，随机初始化）
+│   └── Finetune_MDD_tfm.sh     # 阶段二：MDD 字段级条件微调（条件臂 mdd8/cat，起点=阶段一产物）
 ├── docs/                       # 模型架构、机理与可解释性文档（见文末索引）
 └── checkpoints/                # 权重与 TensorBoard 日志（runs/）输出目录
 ```
@@ -117,41 +127,266 @@ data_root/
 
 ## 快速开始
 
-### 阶段一：HC 预训练
+> **2026-10-10 第三次口径变更（TASK_HANDOFF §0.27）**：`experiments/condition_study.py` 与
+> `main.py` 的 fresh 身份闸门已删除，脚本不再需要 `STUDY_ID`/`STUDY_ROOT`/`LEGACY`。
+> 条件注入仍按选定方案固定为 **HC 侧 `hc3/demo` + MDD 侧 `mdd8/cat`**
+> （`cat` 是**选定方案，不是实测最优**，见 §0.26）。
+> ⚠️ 「HC 从随机初始化训练」「MDD 起点是本轮 HC」现在**不再由代码校验**，只由脚本不传
+> `--pretrained_weight` 以及两脚本按顺序串接这两件事维持。
+
+两个脚本共用这些环境变量：`PYTHON`（装了 torch 的 ≥3.10 解释器）、`CHECKPOINT_DIR`
+（默认 `$ROOT/checkpoints`；想隔离本轮产物就指到一个空目录）、`DEVICE`、`DATA_ROOT`、
+`PRINT_CMD`（=`1` 时打印完整命令行；默认只打印 mode/name/条件臂/epochs/bs/输出目录摘要，
+生效参数的完整快照始终写在 checkpoint 的 `config.args` 里）。
+
+### 阶段一：HC 预训练（条件臂 demo，随机初始化）
 
 ```bash
-bash scripts/Pretrain_HC_tfm.sh
-# 或直接调用：
+PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
+  CHECKPOINT_DIR=./runs/run1010 DEVICE=cuda:1 \
+  bash scripts/Pretrain_HC_tfm.sh
+# 或直接调用（等价显式命令；宽度用 main.py 的锚点默认值 d_demo=16/C=32/H=64）：
 python main.py --mode pretrain \
-    --data_root ./data --checkpoint_dir ./checkpoints \
-    --name neurotwin_tfm_pretrain \
+    --data_root ./data --checkpoint_dir ./runs/run1010 --name neurotwin_tfm_pretrain \
+    --condition_group hc3 --condition_arm demo \
+    --seed 2024 --sampling_seed 20261009 --cond_dropout_seed 20261008 \
     --task_mode next_timepoint --context_min 16 --context_max 64
 ```
 
-- 输出权重：`checkpoints/<name>/base_best.pt`（按验证 next-state MAE 早停选优）与 `base_last.pt`
-- TensorBoard 日志：`checkpoints/runs/<name>_<时间戳>/`
+- 输出权重：`$CHECKPOINT_DIR/<name>/base_best.pt`（早停选优判据：`graph_ode` 用
+  验证集 H1..N 被试级多步 MAE，`discrete` 用验证 next-state MAE）
+  与 `base_last.pt`；TensorBoard 日志在 `$CHECKPOINT_DIR/runs/<name>_<时间戳>/`
+- 三个 seed 必须两两不同，由 `main.py:414 check_seed_separation()` 无条件校验
+  （登记值在 `utils/condition_schema.py`）；同时沿用两个历史默认值（`--seed` 与
+  `--sampling_seed` 都是 2024）会被拒
 
-### 阶段二：MDD 病理条件微调（NeuroTwinTFM FiLM）
+### 阶段二：MDD 条件微调（条件臂 cat，起点=阶段一的产物）
 
 ```bash
-bash scripts/Finetune_MDD_tfm.sh
-# 或直接调用：
+PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
+  CHECKPOINT_DIR=./runs/run1010 DEVICE=cuda:1 \
+  bash scripts/Finetune_MDD_tfm.sh
+# 或直接调用：起点与继承统计量都用同一个 HC 权重文件
 python main.py --mode finetune \
-    --pretrained_weight ./checkpoints/neurotwin_tfm_pretrain/base_best.pt \
-    --data_root ./data --checkpoint_dir ./checkpoints \
-    --name neurotwin_tfm_finetune \
+    --pretrained_weight ./runs/run1010/neurotwin_tfm_pretrain/base_best.pt \
+    --condition_inherit_stats ./runs/run1010/neurotwin_tfm_pretrain/base_best.pt \
+    --data_root ./data --checkpoint_dir ./runs/run1010 --name neurotwin_tfm_finetune \
+    --condition_group mdd8 --condition_arm cat \
+    --seed 2024 --sampling_seed 20261009 --cond_dropout_seed 20261008 \
     --task_mode next_timepoint --context_min 16 --context_max 64
 ```
 
-- 自动加载预训练主干（校验任务口径与结构签名），前 `--freeze_backbone_epochs` 个 epoch 冻结主干仅训练病理 FiLM 条件适配器，随后解冻联合优化
+- 微调脚本在 `$CHECKPOINT_DIR/neurotwin_tfm_pretrain*/base_best.pt` 里找起点：找到 0 个报错（阶段一还没跑），
+  找到多个**拒绝替你猜**并要求 `HC_WEIGHT=<完整路径>` 显式指定
+
+- 自动加载预训练主干（校验任务口径与结构签名），前 `--freeze_backbone_epochs` 个 epoch 冻结主干
+  仅训练条件模块（独立字段编码器、$\Delta E$、双头 FiLM；`train/optim.py:556-576`），
+  随后解冻联合优化（主干组学习率 × `--backbone_lr_scale`）
 - 微调模式用**仅 train subjects** 的 HAMD 评分拟合 `PathologyNormalizer`（统计量随 checkpoint 保存，`--reuse_pretrained_norm_stats` 可复用已加载统计量）
 - 输出权重：`finetuned_best.pt` 与 `finetuned_last.pt`
+- ⚠️ 微调结束后 `main.py:1149-1159` 会**自动评一次 test** 并写
+  `<save_dir>/eval/metrics_test.json`；要把 test 留作人工闸门，加
+  `--no_eval_after_train`（TASK_HANDOFF §7.1 第 3 条）
 
-> 注意：`main.py` 中设备选择硬编码为 `cuda:1`（`torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')`），多卡机器请按需调整或通过 `CUDA_VISIBLE_DEVICES` 控制。
+> **重跑注意**：`checkpoint_dir/<name>` 已存在时 `main.py:801-808` 会把新目录自增成
+> `neurotwin_tfm_pretrain2`、`neurotwin_tfm_finetune2`（不覆盖旧权重）。此时微调脚本会因为命中多个
+> `neurotwin_tfm_pretrain*/base_best.pt` 而拒绝启动，需要显式 `HC_WEIGHT=<完整路径>` 指定起点。
+
+> 注意：不给 `--device` 时 `main.py` 沿用历史默认（`torch.device('cuda:1' if cuda.is_available() else 'cpu')`，
+> `main.py:472-473`）。脚本通过 `DEVICE=` 环境变量显式传 `--device`，不依赖该默认值；
+> 多卡机器也可用 `CUDA_VISIBLE_DEVICES` 控制可见设备。
+
+### 阶段二变体：病理残差专家 MoE 与 RECC（TFM 专属）
+
+One-Step 头病理条件模式 `--tfm_patho_mode ∈ {none, film, moe}`（方案
+`docs/Version3_docs_1003/NeuroTwin_TFM_RECC_详细应用方案.md`）：`film` 为基线
+行为，`moe` 把共享 HC 动力学与病理残差专家解耦（`z_(t+1) = z_t + Δz_shared +
+Δz_path`），病理模块仅在 MDD 微调阶段创建，HC 预训练权重完整复用。
+
+> ⚠ 本节原来的 `Finetune_MDD_tfm_moe.sh` / `Finetune_MDD_tfm_recc.sh` 四条命令对应的脚本
+> 已不在仓库里（早前的变体收敛中删除，`git status` 里是 `D`）。MoE/RECC 的模型能力仍在
+> `models/` 内，需要跑该变体时请直接给 `--tfm_patho_mode moe` 等参数调用 `main.py`，
+> 命令口径见方案 §56/§96–§100。
+
+- 实验分层与验收顺序（A→B→C→D→E）见方案 §56/§96–§100；RECC/路由正则不进入
+  checkpoint 判据（`discrete` 路线判据为 val next-state MAE，`graph_ode` 路线为
+  验证集 H1..N 被试级多步 MAE，见「graph_ode 动态路线」）
+- 训练日志输出 Router–Expert 机制指标（top1 agreement / top2 recall / regret /
+  spearman / competence entropy / oracle gap，方案 §63–§70）
+- 专家机制分析（competence matrix、逐被试路由一致性、逐专家 ROI/网络修正画像）：
+
+```bash
+python -m analysis.analyze_tfm_experts --ckpt <finetuned_best.pt> \
+    --out_dir results/tfm_experts --split test
+```
+
+### 最终定型主模型与推理入口（2026-10-07 定型，零训练）
+
+最终主模型 = **NeuroTwinTFM + SC 软先验 + 单路 FiLM + One-Step/CPM 双头（patch=4）**，
+主权重为现存 FiLM baseline `finetuned_best.pt`；不使用 MoE/Router/RECC/Pair-RECC。
+定型决定与会话记录见 [TASK_HANDOFF.md](TASK_HANDOFF.md)（2026-10-07 第四次会话）；
+最终配置的唯一事实来源为 [configs/final_model.json](configs/final_model.json)
+（结构签名、参数量 6,029,728 / FiLM 2,048、权重 sha256、损失与历史训练配方）。
+
+```bash
+# 加载自检：哈希校验 → arch_version 校验 → FiLM 闸门 → strict 加载 → 摘要
+python inference.py                # 加 --device cpu 可强制 CPU；--ckpt 可指定其它 FiLM 权重
+```
+
+```python
+from inference import (load_final_model, predict_next_state,
+                       forecast_horizon, normalize_raw_sc)
+
+model = load_final_model()                       # eval 模式；HAMD normalizer buffers 随权重加载
+out = predict_next_state(model, hist, sc, hamd)  # 下一状态：out['pred_next'] [B,F,1]
+traj = forecast_horizon(model, hist, sc, hamd, steps=8)   # 2–8 步整段预测 [B,8,F]
+```
+
+- 输入口径沿用训练版本：`hist` 为上游逐 ROI 全序列 z-score 后的 BOLD `[B,K,F]`
+  （K ≤ 64，训练分布 K∈[16,64]，评估协议固定 K=64）；`sc` 为数据侧
+  `NeuroTwinNextPointDataset._normalize_sc` 清洗后的 SC（原始 Mask 矩阵先过
+  `normalize_raw_sc`）；`hamd` 为原始 HAMD 评分（必要输入，模型内按 checkpoint
+  保存的 robust_z 统计量归一化，禁止在 val/test 重新拟合）。
+- One-Step 保持 residual → 加 x_last_norm → 同 context 统计量 denorm；CPM 输出
+  完整状态预测，不加 One-Step 锚点、不用 One-Step 替换 CPM 第一帧。
+- **主模型范围 H≤8**：`forecast_horizon(steps>8)` 明确报错，不静默切换权重或
+  rollout 协议。H16 长程参考是 B（MoE）best 的固定 CPM 分块滚动
+  （`checkpoints/neurotwin_tfm_finetune_moe/finetuned_best.pt`，独立归档配置，
+  不得与主权重混用）。
+- 已知限制：历史 cosine 调度 `eta_min=5e-5` 高于 MDD backbone 组初始峰值
+  （`1e-4×0.2=2e-5`），不能把旧训练描述为 backbone 全程以 adapter 0.2 倍学习率
+  退火——已列为下一次重训前的独立修复项（记录于 configs/final_model.json
+  的 `training_recipe.known_issue_lr_schedule`），本轮不改该行为。
+- 本轮零训练：未训练、未重新划分数据、未覆盖任何 checkpoint、未重跑全量评估；
+  MoE/RECC 归档权重（B/C/D/E1/E2）经 `experiments.evaluate_variant` 按各自
+  快照加载的路径不受影响。
+
+### Graph-ODE 动态路线：twin 家族（2026-10-12 实施框架）
+
+按 [docs/Version4_docs_1012/NeuroTwin_神经微分方程优化.md](docs/Version4_docs_1012/NeuroTwin_神经微分方程优化.md)
+实施的受控条件图 ODE 路线。**本次交付的是代码框架**：未经真实受控数据训练的控制分支
+只能输出未校准模拟；预测 std 不自动称校准置信区间；健康偏离不称诊断概率或因果病灶；
+不得把旧 discrete checkpoint 指标当作本路线结果。
+
+- 结构：graph_ode 动态头（组合 Laplacian + ConditionFiLM/PersonalFiLM + 状态相关控制门）
+  + 同步 Heun RK2（`ode_steps=2, dynamics_dt=1.0`）持续状态推进 + VarianceHead 对角方差
+  + ProfileEncoder（`personalized=True`，基线前 32 TR → 32 维固定 profile）
+- 数据：`--bold_source raw`（`Raw/<group>/ROISignals_<id>.mat`，[T,F] 明确布局取前 150 TR，
+  每 ROI 用最早 32 TR 计算固定 mu0/s0）+ `--graph_source history_fc`（当前可见历史 FC →
+  SoftAnatomicalPrior，不要求 Mask）+ 可选 `--control_manifest`（CSV 两列
+  `subject_id,controls_path`；NPZ 键 `u [T,F]`，锚点 t 的未来切片为 `u[t+1:t+H+1]`，
+  缺尾按 future_mask 填零；无 manifest 时 controls=None，不伪造刺激标签）
+- checkpoint：`ARCH_VERSION=6`；旧 discrete 快照按 discrete/personalized=False/legacy_mask
+  重建并 strict 加载，不把旧 One-Step 权重迁移到 ODE 头
+- 训练脚本输出目录家族：`hc_demo_twin` / `mdd_cat_twin`（不与旧
+  `neurotwin_tfm_pretrain/finetune` 产物混用）
+
+#### 新动态训练与复评
+
+```bash
+PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
+  CHECKPOINT_DIR=./runs/twin DEVICE=cuda:1 bash scripts/Pretrain_HC_tfm.sh
+PYTHON="$HOME/anaconda3/envs/mamba/bin/python" \
+  CHECKPOINT_DIR=./runs/twin DEVICE=cuda:1 bash scripts/Finetune_MDD_tfm.sh
+```
+
+twin 脚本显式传入的新 CLI（旧构造默认保持 discrete / personalized=False /
+legacy_mask / bold_source=auto，不受影响）：
+
+| 参数 | twin 脚本值 | 说明 |
+| --- | --- | --- |
+| `--dynamics_mode` | `graph_ode` | `discrete` 保留原 One-Step 残差逻辑 |
+| `--graph_source` | `history_fc` | `legacy_mask` 继续走外部 Mask 图 |
+| `--bold_source` | `raw` | Raw 前缀校准，首个预测至少第 33 个 TR |
+| `--personalized` / `--profile_dim` | `True` / `32` | profile 基线独立于当前 context |
+| `--calibration_length` | `32` | Raw 标准化与 profile 用同一前缀 |
+| `--ode_steps` / `--dynamics_dt` | `2` / `1.0` | 每区间 2 个 Heun 子步 |
+| `--lambda_dynamics` / `--lambda_variance` | `0.5` / `0.05` | 动态多步(Huber+PCC)与方差 NLL 权重 |
+| `--dynamics_metric_horizon` | `8` | checkpoint 选优覆盖的步数 N（H1..N）；须 `<= --cpm_horizon` |
+
+`dynamics_mode=graph_ode` 时，checkpoint 选优与早停判据为
+`metric_mae_dynamics_h1_N_subject`：同一前向里 Graph-ODE 持续推进得到的
+`dynamics_pred`（数据尺度，不用 CPM 输出替代、预测中不补真值），对每个锚点取
+H1..N、全部 ROI 的平均绝对误差，**只纳入 `future_mask` 显示具备完整 N 步真值的锚点**，
+先按被试内平均、再跨被试等权平均（与 batch 划分和人均锚点数无关）；验证集没有
+任何完整 N 步锚点时直接报错，不回退。单步 `metric_mae_next` 继续输出，仅作
+短期退化观察，不参与选优。`dynamics_mode=discrete` 无该轨迹，判据保持
+val next-state MAE；两个口径数值不可互比，同一 run 内判据固定。
+
+复评沿用统一入口（评估 loader 自动传递 raw/history_fc/calibration/manifest 参数，
+rollout 使用同一 profile 与对齐控制切片）：
+
+```bash
+python -m experiments.evaluate_variant \
+    --ckpt ./runs/twin/mdd_cat_twin/finetuned_best.pt \
+    --out_dir ./results/eval/mdd_cat_twin --save_arrays
+```
+
+#### 健康人口学参照（HC train 被试拟合）
+
+```bash
+# fit：每被试最早 64 观测 → 6 个描述量（acf1/acf2/low_power/spectral_centroid/
+#      diff_rms/signed_fc_mean，频率单位 cycles/sample），人口学 ridge(alpha=1)
+python -m analysis.twin_reference fit \
+    --data_root ./data --mode pretrain --condition_group hc3 \
+    --bold_source raw --calibration_length 32 \
+    --out ./results/twin_reference/hc_demo_twin_ref.npz
+
+# score：单被试历史（不足 64 个真实观测时不执行参照分析）
+python -m analysis.twin_reference score \
+    --reference ./results/twin_reference/hc_demo_twin_ref.npz \
+    --history <被试 NPZ（键 bold，[T,F]，T>=64）> \
+    --age 26 --education 16 --sex 1 \
+    --out ./results/twin_reference/score_xxx.npz
+```
+
+#### 独立 HAMD/HAMA 随访变化读出（冻结动态模型与参照）
+
+配对 CSV 表头字段严格为
+`subject_id,baseline_visit_id,followup_visit_id,baseline_bold_path,control_path,followup_days,baseline_hamd,followup_hamd,baseline_hama,followup_hama,split`；
+基线 NPZ 键 `bold [T,F]`（T≥64，取最早 64 TR），控制 NPZ 键 `u [8,F]`
+（无治疗样本必须显式提供全零控制，不把缺路径当 sham）；同一 subject_id 不得跨 split。
+
+```bash
+python -m train.twin_outcome \
+    --pairs <配对 CSV> \
+    --dynamics_checkpoint ./runs/twin/mdd_cat_twin/finetuned_best.pt \
+    --reference ./results/twin_reference/hc_demo_twin_ref.npz \
+    --out_dir ./runs/twin_outcome
+```
+
+输出 `outcome_best.pt`（含 standardizer 与特征配置）；某分量完全没有有效训练标签时
+直接报错，不输出随机模型。未拟合 outcome 前不产生任何疗效评分。
+
+#### 孪生推理入口
+
+```bash
+python inference_twin.py \
+    --checkpoint ./runs/twin/mdd_cat_twin/finetuned_best.pt \
+    --raw data/Raw/MDD/ROISignals_<id>.mat \
+    --subject_id <id> \
+    --horizon 8 \
+    --controls <控制 NPZ（键 u [T,F]，与序列 T 匹配）> \
+    --observe 4 \
+    --reference ./results/twin_reference/hc_demo_twin_ref.npz \
+    --outcome ./runs/twin_outcome/outcome_best.pt \
+    --followup_days 84 --baseline_hamd 22 --baseline_hama 14 \
+    --out_npz ./results/twin_infer_<id>.npz --output ./results/twin_infer_<id>.json
+```
+
+- `--checkpoint` 必须显式指定，不自动搜索"最新"权重；`--reference` / `--outcome`
+  分别为 `analyze_pathology` / `predict_outcome` 的必需显式文件
+- Raw 前缀校准（固定 mu0/s0）→ profile 一次计算 → 持续状态 rollout → 控制双轨迹
+  （`--controls` 或显式 `--zero_controls`）→ 真实观测更新（`--observe N`，新观测用
+  同一扫描固定 mu0/s0 转数据尺度）
+- Python API：`TwinSession`（`calibrate_scan / compute_profile / init_state / advance /
+  observe / rollout / simulate / new_visit`，新访视 `new_visit(..., reuse_profile=True)`
+  显式沿用已有 p）、`analyze_pathology(history, demo, reference_path)`、
+  `predict_outcome(..., dynamics_checkpoint, outcome_path)`
 
 ### 完整参数说明
 
-运行 `python main.py --help` 查看全部 CLI 参数（数据、TFM 结构、优化器、损失权重、病理归一化、SC 软先验、next_timepoint 任务与评估开关等），脚本中的典型配置见 [scripts/Pretrain_HC_tfm.sh](scripts/Pretrain_HC_tfm.sh) 与 [scripts/Finetune_MDD_tfm.sh](scripts/Finetune_MDD_tfm.sh)。
+运行 `python main.py --help` 查看全部 CLI 参数（数据、TFM 结构、优化器、损失权重、病理归一化、SC 软先验、TFM 病理专家 MoE 与 RECC、next_timepoint 任务与评估开关等），脚本中的典型配置见 [scripts/Pretrain_HC_tfm.sh](scripts/Pretrain_HC_tfm.sh) 与 [scripts/Finetune_MDD_tfm.sh](scripts/Finetune_MDD_tfm.sh)。
 
 ## 模型架构概览
 
@@ -194,7 +429,7 @@ BOLD context [B,F,K]
 | 调度器 | Warmup + Cosine 退火 | Warmup + Cosine 退火 |
 | 输出权重 | `base_best.pt` / `base_last.pt` | `finetuned_best.pt` / `finetuned_last.pt` |
 
-通用稳定性组件：AMP 混合精度、EMA 权重滑动平均、梯度裁剪、按验证 next-state MAE 的早停（`patience`）、全局固定随机种子（`set_seed`）。
+通用稳定性组件：AMP 混合精度、EMA 权重滑动平均、梯度裁剪、按验证指标的早停（`patience`；判据随 `--dynamics_mode` 变化，`graph_ode` 为 H1..N 被试级多步 MAE，`discrete` 为 val next-state MAE）、全局固定随机种子（`set_seed`）。
 
 ## 损失函数与图正则
 
@@ -294,9 +529,9 @@ python analysis/analyze_low_pcc_samples.py \
 | --- | --- |
 | 数据 | `num_rois=116`、`context_min=16`、`context_max=64`、`eval_context_length=64` |
 | 优化 | `train_epochs=150`、`warmup_epochs=15`、`batch_size=32`、`patience=20`、`lr_init=5e-5 / lr_peak=1e-4 / lr_final=5e-5`、`weight_decay=1e-2`、`grad_clip=1.0` |
-| TFM 结构 | `tfm_dim=256`、`tfm_layers=4`、`tfm_heads=4`、`tfm_patch_len=8`（G30_TFM 消融最优）、`tfm_ff_ratio=4`、`dropout=0.2` |
+| TFM 结构 | `tfm_dim=256`、`tfm_layers=4`、`tfm_heads=4`、`tfm_ff_ratio=4`、`dropout=0.1`；`tfm_patch_len` CLI 默认 8（G30_TFM 消融最优，另一研究候选），**最终定型主模型为 4**（checkpoint 快照固化，见 configs/final_model.json） |
 | CPM | `cpm_horizon=8`、`cpm_layers=2`、`cpm_gamma=1.0`、`cpm_huber_delta=1.0` |
-| 微调专属 | `freeze_backbone_epochs=10`、`backbone_lr_scale=0.2`、`loss_lr_scale=0.5`、`adapter_lr_scale=1.0` |
+| 微调专属 | `freeze_backbone_epochs=10`、`backbone_lr_scale=0.2`、`loss_lr_scale=1.0`（CLI 默认）、`adapter_lr_scale=1.0` |
 | 损失权重 | `lambda_one=1.0`、`lambda_cpm=1.0`、`lambda_pcc=0.1` |
 
 ## 文档索引
@@ -305,6 +540,8 @@ python analysis/analyze_low_pcc_samples.py \
 | --- | --- |
 | [docs/NeuroTwinTFM_模型结构流程图.png](docs/NeuroTwinTFM_模型结构流程图.png) | TFM 主干结构流程图 |
 | [docs/Version3_docs_1003/NeuroTwin_TimesFM3_改进方案.md](docs/Version3_docs_1003/NeuroTwin_TimesFM3_改进方案.md) | TFM 设计方案（§30 V1 四项改动 + 双头 + 条件化协议） |
+| [docs/Version3_docs_1003/NeuroTwin_TFM_RECC_详细应用方案.md](docs/Version3_docs_1003/NeuroTwin_TFM_RECC_详细应用方案.md) | TFM 病理专家 MoE / RECC 方案（§1–§100，已结题的扩展研究线） |
+| [docs/Version3_docs_1003/G30_TFM消融实验总结_20261005.md](docs/Version3_docs_1003/G30_TFM消融实验总结_20261005.md) | G30_TFM 9 变体消融结论（patch_len 最优、HAMD 条件等） |
 | docs/Version0-2 版本文档目录 | 历史（legacy 主干时代）架构与机理档案，仅供追溯；所述模块已随 legacy 移除 |
 
 ## 任务口径：Next-Timepoint Prediction（连续 BOLD → 下一 TR 全脑状态）
@@ -331,7 +568,9 @@ Raw ROI BOLD [F, T=150]（data/Normlize，已逐 ROI z-score）
   **within-network / between-network FC**（标签不可用时自动跳过）；
   频谱评估可选（`--eval_spectral`）；
 - **被试级聚合 + 确定性评估协议**（固定 K_eval 与等间隔 anchor，禁止随机位置）；
-- **checkpoint 判据 = val next-state MAE**；选主干预训练权重时用
+- **checkpoint 判据**：`--dynamics_mode graph_ode` 用验证集
+  `metric_mae_dynamics_h1_N_subject`（N=`--dynamics_metric_horizon`，默认 8），
+  `discrete` 用 val next-state MAE；选主干预训练权重时用
   `--load_backbone_only`（显式打印 loaded / missing / incompatible / reinitialized
   四类键清单，形状不匹配的键不被静默忽略）。
 
@@ -339,6 +578,10 @@ Raw ROI BOLD [F, T=150]（data/Normlize，已逐 ROI z-score）
 
 | 变更日期 | 文件名 | 主要修改 |
 | --- | --- | --- |
+| 2026-10-15 | main.py、tests/test_dynamics_ckpt_metric.py（新增）、README.md | graph_ode 路线的 checkpoint 选优标准从单步验证 MAE 改为多步：新增 `evaluate_tfm` 内的 `metric_mae_dynamics_h1_N_subject`（复用同一次前向的 `dynamics_pred`，H1..N 全 ROI 逐锚点 MAE，只纳入 `future_mask` 完整 N 步的锚点，先被试内再跨被试等权；无完整锚点直接报错不回退）与计数键；新增 `--dynamics_metric_horizon`（默认 8）；`CheckpointSelector` 统一驱动 best 保存与 early stopping，checkpoint 元数据补 `ckpt_metric_name`；单步 `metric_mae_next` 保留为观察指标；`discrete` 路线判据不变。**仅改选优口径，损失/结构/前向未动，多步性能是否提升未经训练验证** |
+| 2026-10-12 | models/{tfm_personal,tfm_dynamics,twin_outcome}.py（新增）、models/{tfm,graph_prior,__init__}.py、utils/dataloader.py、train/{losses,optim}.py、train/twin_outcome.py（新增）、main.py、analysis/{twin_reference,next_point_eval}.py（twin_reference 新增）、experiments/evaluate_variant.py、inference_twin.py（新增）、scripts/{Pretrain_HC_tfm,Finetune_MDD_tfm}.sh、README.md | 实施 graph_ode 动态路线（docs/Version4_docs_1012/NeuroTwin_神经微分方程优化.md，代码框架）：受控条件图 ODE（组合 Laplacian + ConditionFiLM/PersonalFiLM + 状态相关控制门）+ 同步 Heun RK2 持续状态推进 + VarianceHead + ProfileEncoder（新增 tfm_personal/tfm_dynamics）；graph_prior dp Xavier/dq 零初始化；dataloader 新增 bold_source=raw（前缀校准）/graph_source=history_fc/控制 manifest/锚点下界 max(K-1,calib-1)；TFMDualLoss 扩展动态多步与方差 NLL、dynamics_mask 与 cpm_mask 分离；main.py/optim 接通 CLI、loader、profile 解冻；ARCH_VERSION 5→6（旧 discrete 快照按默认重建、strict 加载、不迁移 ODE）；复评与 next_point_eval 传递新参数；新增健康人口学参照（twin_reference：6 描述量 + ridge）、独立 HAMD/HAMA 随访读出（twin_outcome：83 维特征 + masked Gaussian NLL）与孪生推理入口（inference_twin.py：Raw 前缀校准、profile/state、rollout、控制双轨迹、观测更新）；训练脚本切换 twin 家族 hc_demo_twin/mdd_cat_twin。**代码框架交付，未经真实数据训练** |
+| 2026-10-07 | configs/final_model.json（新增）、inference.py（新增）、tests/test_final_model.py（新增）、README.md、TASK_HANDOFF.md | 最终基线模型定型与推理配置固化（零训练）：configs/final_model.json 固化最终结构/损失/训练配方/结构签名/参数量/权重 sha256（唯一事实来源）；inference.py 提供主权重 strict 加载入口（哈希校验 → arch_version 校验 → FiLM 闸门拒绝 MoE/HC 权重 → normalizer buffers 校验 → 参数量核对）与 predict_next_state / forecast_horizon 接口（H≤8，超限明确报错不切换协议；SC 预处理复用数据侧口径）；新增 18 项定型契约测试（95 用例全通过）；MoE/RECC 归档加载路径不受影响 |
+| 2026-10-06 | models/tfm_experts.py（新增）、models/tfm.py、models/__init__.py、train/tfm_coupling.py（新增）、train/{optim,__init__}.py、main.py、analysis/analyze_tfm_experts.py（新增）、scripts/{Finetune_MDD_tfm_moe,Finetune_MDD_tfm_recc}.sh（新增）、tests/{test_tfm_experts,test_tfm_recc}.py（新增）、README.md | 实施 RECC 方案（docs/Version3_docs_1003/NeuroTwin_TFM_RECC_详细应用方案.md）：新增 TFM 病理残差专家模块（TFMPathologyRouter/Expert/MoE，`--tfm_patho_mode moe` 时 One-Step 头 z=z_t+Δz_shared+Δz_path，One-Step 关闭原 FiLM，CPM 不变）；`train/tfm_coupling.py` 实现 Expert competence→Router 校准（KL(sg(q)‖p_cpl) 梯度只更新 Router）、Pair-RECC、Router 正则与 §63–§70 机制指标；冻结阶段 MoE 可训练（is_conditioning_adapter）+ 独立参数组 tfm_moe；main.py 新增 §48–§51 CLI/fail-fast、dense warmup 与 λ_recc ramp 调度；HC 预训练结构与 arch_version 不变（§52/§92），finetune checkpoint 由 config.args 快照重建（evaluate_variant 自省兼容，已验证）；测试 29→57 用例 |
 | 2026-10-05 | models/{neurotwin,neurotwin_moe,decoder,common,pathology}.py、train/{moe,losses,optim,__init__}.py、main.py、utils/common.py、experiments/evaluate_variant.py、analysis/{analyzer,visualizer}.py、scripts/、README.md | 移除 legacy NeuroTwin 主干（NeuroTwin/MoE/DFCAdapter/BrainMDM/GraphODEDDI/预测头/MoE 正则/legacy CLI），唯一主干为 NeuroTwinTFM：main.py 展平双架构分支并删除 ~60 个 legacy 参数与 `--model_arch` 开关（内部固定 tfm，checkpoint 快照兼容）；`compute_graph_regularization` 移入 train/losses.py；evaluate_variant 仅重建 TFM（legacy 快照显式报错）；TFM checkpoint 与两阶段脚本行为不变 |
 | 2026-10-05 | main.py、models/tfm.py、train/optim.py、analysis/next_point_eval.py、experiments/、tests/、README.md | G30_TFM 消融完成后的精简：`--tfm_patch_len` 默认 4→8（消融最优）；移除消融专用开关 `--tfm_use_patho_cond` 及配套分支（模型构造/冻结阶段/评估别名）；移除 shuffled-HAMD 负对照评估；移除消融框架（variants/run_experiments/registry/compare/base_config 与 test_ablation.py，代码归档于提交 `a673ca5`）；`experiments/` 仅保留统一评估入口 `evaluate_variant` |
 | 2026-10-03 | models/tfm.py、main.py、train/optim.py、experiments/evaluate_variant.py | 新增 `--tfm_use_patho_cond`（§25.4 条件消融开关：不构建 Normalizer/FiLM、前向忽略评分）；`set_finetune_stage` 对无条件适配器的 TFM 自动跳过冻结阶段（避免优化器空参数组）；`_KWARG_ALIAS_TFM` 补 `use_patho_cond` 别名（修复快照重建 strict 加载失败） |

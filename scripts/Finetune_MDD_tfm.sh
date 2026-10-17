@@ -1,29 +1,83 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NeuroTwin-TFM 微调（MDD 队列，病理 FiLM 条件化，方案 §12.2 / Task E）
+# NeuroTwin-TFM 微调（MDD 队列，graph_ode 动态路线 + 临床条件注入）
 #
-# 用法：bash scripts/Finetune_MDD_tfm.sh
+# 用法（起点必须是 Pretrain_HC_tfm.sh 刚产出的 hc_demo_twin 权重）
+#   PYTHON="$HOME/anaconda3/envs/mamba/bin/python" bash scripts/Finetune_MDD_tfm.sh
+#   # 前置：先跑 scripts/Pretrain_HC_tfm.sh（两者用同一 CHECKPOINT_DIR）
+#   # 可选环境变量：
+#   #   CHECKPOINT_DIR=<目录>   默认 $ROOT/checkpoints（HC 起点与本轮产物都在这个目录下）
+#   #   HC_WEIGHT=<权重路径>    覆盖自动查找，显式指定起点
+#   #   DEVICE=cuda:1           不给则沿用 main.py 的设备默认
+#   #   DATA_ROOT=<数据根目录>   默认 $ROOT/data
+#   #   PRINT_CMD=1             打印完整命令行（默认只打印关键参数摘要）
 #
-# 先在 HC 上按 scripts/Pretrain_HC_tfm.sh 预训练，得到
-#   checkpoints/neurotwin_tfm_pretrain/base_best.pt，再运行本脚本。
-# 两阶段逻辑：冻结 TFM 主干（仅训练病理 FiLM 条件适配器）→ 解冻联合优化
-#   （backbone 学习率 × backbone_lr_scale）。
+# 条件注入（2026-10-10 选定方案，见 TASK_HANDOFF §0.26）：
+#   ``--condition_group mdd8 --condition_arm cat`` —— 八个字段各自独立编码，
+#   新增五字段按 ``d_new`` 拼接成 Φ 后过**零初始化** DeltaE，因此训练起点的条件向量
+#   与 HC 侧的 c_demo 逐位相同；条件经双头独立 FiLM 注入 One-Step 与 CPM 两头。
 #
-# ⚠️ 必须与预训练使用同一 model_arch/patch_len/cpm_horizon 任务口径
-#   （检查点签名校验会拦截不匹配的组合）。
+# graph_ode 动态路线（方案 docs/Version4_docs_1012）：twin 家族 mdd_cat_twin，
+#   与预训练同口径（raw + history_fc + personalized + graph_ode），动态 H 复用
+#   cpm_horizon=8；起点权重默认只在 hc_demo_twin 家族内匹配，不混选旧
+#   neurotwin_tfm_pretrain 的 discrete 产物。
+#
+# 统计量继承（方案 §四）：``--condition_inherit_stats`` 指向**同一个起点权重文件**，
+#   共享三字段的 median/IQR 与类别词表从里面逐位读出、不重新拟合。
+#   ⚠️ 2026-10-10 起不再有 study/fresh 身份闸门（`experiments/condition_study.py` 已删除，
+#   §0.27）：脚本只在**本目录里**找 HC 起点并在有多个候选时拒绝替你猜，但不会核对权重内嵌
+#   来源、也不校验 SHA256 —— 「起点确实是本轮 HC」这件事现在靠串接顺序，不靠代码保证。
+#
+# 两阶段逻辑：冻结 TFM 主干（仅训练条件模块）→ 解冻联合优化
+#   （backbone 学习率 × backbone_lr_scale；profile_encoder 随共享 backbone 解冻，
+#   VarianceHead 随动力学头解冻）。
+#
+# ⚠️ 必须与预训练使用同一 graph_ode/raw/history_fc/personalized 口径
+#   （ARCH_VERSION=6 结构校验会拦截不匹配的组合；旧 discrete 权重不迁移）。
 # ============================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-data_root="$ROOT/data"
-checkpoint_dir="$ROOT/checkpoints"
-pretrained_weight="$checkpoint_dir/neurotwin_tfm_pretrain/base_best.pt"
+PYTHON_BIN="${PYTHON:-python}"
+data_root="${DATA_ROOT:-$ROOT/data}"
+checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
+DEVICE="${DEVICE:-}"
+HC_WEIGHT="${HC_WEIGHT:-}"
 name="neurotwin_tfm_finetune"
+hc_name="neurotwin_tfm_pretrain"   # 与 Pretrain_HC_tfm.sh 的 name 同步（twin 家族）
+
+# 起点权重：hc_demo_twin 试次目录下的 base_best.pt。找到 0 个→还没训；
+# 找到多个→必须显式指定，绝不静默挑一个（一个融合家族只能共享一个起点）。
+# 只匹配 twin 家族：旧 neurotwin_tfm_pretrain 的 discrete 产物不会被混选。
+if [[ -z "$HC_WEIGHT" ]]; then
+  mapfile -t hc_cands < <(compgen -G "$checkpoint_dir/$hc_name*/base_best.pt" || true)
+  [[ ${#hc_cands[@]} -gt 0 ]] || {
+    echo "[错误] 找不到 HC 起点（$checkpoint_dir/$hc_name*/base_best.pt 不存在）；" \
+         "先用同一 CHECKPOINT_DIR 跑 scripts/Pretrain_HC_tfm.sh，" \
+         "或用 HC_WEIGHT=<完整路径> 显式指定" >&2
+    exit 1
+  }
+  [[ ${#hc_cands[@]} -eq 1 ]] || {
+    echo "[错误] 找到 ${#hc_cands[@]} 个候选 HC 起点，无法判断该继承哪一个：${hc_cands[*]}"
+    echo "        请用 HC_WEIGHT=<完整路径> 显式指定（不替你猜）" >&2
+    exit 1
+  }
+  HC_WEIGHT="${hc_cands[0]}"
+fi
+pretrained_weight="$HC_WEIGHT"
 
 # ---- 实验规模（与预训练保持一致的任务口径） ----
-seed=2024
+# 随机来源只在 utils/condition_schema.py 登记一次（与 Pretrain 脚本同源，不抄字面量）
+read -r seed sampling_seed cond_dropout_seed < <(
+  PYTHONPATH=. "$PYTHON_BIN" -c 'from utils.condition_schema import (DROPOUT_SEED, MODEL_SEED, SAMPLING_SEED); print(MODEL_SEED, SAMPLING_SEED, DROPOUT_SEED)') \
+  || { echo "[错误] $PYTHON_BIN 读取 utils.condition_schema 的随机来源常量失败" >&2; exit 1; }
+if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
+      || "$sampling_seed" == "$cond_dropout_seed" ]]; then
+  echo "[错误] 随机来源未分离（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed）" >&2
+  exit 1
+fi
 num_rois=116
 context_min=16
 context_max=64
@@ -48,15 +102,16 @@ freeze_backbone_epochs=10
 backbone_lr_scale=0.2
 
 # ---- 预检查 ----
-[ -d "$data_root/Normlize/MDD" ] || {
-  echo "[错误] 缺少 MDD 连续 BOLD 目录：$data_root/Normlize/MDD"; exit 1; }
-[ -d "$data_root/Mask/MDD" ] || {
-  echo "[错误] 缺少 MDD 结构连接目录：$data_root/Mask/MDD"; exit 1; }
+# graph_ode 路线用 raw + history_fc：只要求 Raw 目录与临床表，不要求 Mask，
+# 也不回退 Normlize/窗口缓存（方案 §4.1）。
+[ -d "$data_root/Raw/MDD" ] || {
+  echo "[错误] 缺少 MDD Raw 目录（$data_root/Raw/MDD/ROISignals_<id>.mat，[T,F] 布局）"; exit 1; }
 [ -f "$data_root/Rest-meta-MDD-V1V2-Merged-MDD.xlsx" ] || {
   echo "[错误] 缺少临床评分表：$data_root/Rest-meta-MDD-V1V2-Merged-MDD.xlsx"; exit 1; }
 [ -f "$pretrained_weight" ] || {
-  echo "[错误] 缺少预训练权重：$pretrained_weight"
-  echo "        请先运行 bash scripts/Pretrain_HC_tfm.sh"; exit 1; }
+  echo "[错误] 起点权重文件不存在：$pretrained_weight"
+  echo "        它应当是 scripts/Pretrain_HC_tfm.sh 在同一个 CHECKPOINT_DIR 下产出的" \
+       "base_best.pt；请先跑预训练，或用 HC_WEIGHT=<完整路径> 指定真实存在的路径" >&2; exit 1; }
 
 ARGS=(
   # ---- 基础与路径 ----
@@ -104,9 +159,7 @@ ARGS=(
   --cpm_huber_delta 1.0
   --norm True
   --dropout 0.1
-  # ---- 病理条件（HAMD → FiLM；冻结期 FiLM 仍参与训练）----
-  --pathology_input_dim 1
-  --pathology_norm_mode robust_z
+  # ---- 两阶段冻结（前期只训条件模块，后期解冻主干）----
   --freeze_backbone_epochs "$freeze_backbone_epochs"
   --backbone_lr_scale "$backbone_lr_scale"
   # ---- 优化与训练规模 ----
@@ -123,8 +176,49 @@ ARGS=(
   --amp True
   --num_workers 4
   --train_samples_per_subject 0
-  --sampling_seed "$seed"
+  --sampling_seed "$sampling_seed"
 )
 
-echo "[CMD] python -u main.py ${ARGS[*]}"
-python -u main.py "${ARGS[@]}"
+# ---- 本轮条件注入（选定方案：mdd8 + cat）----
+ARGS+=(
+  --condition_group mdd8 --condition_arm cat   # 选定方案：逐字段独立编码 + cat 融合
+  --cond_dropout_seed "$cond_dropout_seed"
+  # 统计量快照直接取自同一个 HC 起点权重文件：共享三字段的 median/IQR/类别词表逐位继承，
+  # 不重新拟合（方案 §四）。
+  --condition_inherit_stats "$pretrained_weight"
+)
+# ---- graph_ode 动态路线（与预训练严格同口径；twin 家族固定参数）----
+ARGS+=(
+  --dynamics_mode graph_ode
+  --graph_source history_fc        # 功能耦合图来自当前可见历史，不要求 Mask
+  --bold_source raw                # Raw/MDD/ROISignals_<id>.mat，前 32 TR 校准
+  --personalized True
+  --profile_dim 32
+  --calibration_length 32
+  --ode_steps 2
+  --dynamics_dt 1.0
+  --lambda_dynamics 0.5
+  --lambda_variance 0.05
+)
+if [[ -n "$DEVICE" ]]; then
+  ARGS+=(--device "$DEVICE")
+fi
+
+# 生效参数已随 checkpoint 的 config.args 快照保存，完整命令行只在 PRINT_CMD=1 时打印。
+arg_value() {   # 从 ARGS 取开关取值，避免把同一个字面量抄进第二处
+  local key="--$1" i
+  for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    [[ ${ARGS[i]} == "$key" ]] && { echo "${ARGS[i + 1]}"; return 0; }
+  done
+}
+
+if [[ "${PRINT_CMD:-0}" == "1" ]]; then
+  echo "[CMD] $PYTHON_BIN -u main.py ${ARGS[*]}"
+else
+  echo "[CMD] main.py --mode $(arg_value mode) --name $(arg_value name)" \
+       "| condition=$(arg_value condition_group)/$(arg_value condition_arm)" \
+       "| epochs=$(arg_value train_epochs) bs=$(arg_value batch_size)" \
+       "| ckpt=$(arg_value checkpoint_dir)" \
+       "| ${#ARGS[@]} 个参数（PRINT_CMD=1 看完整命令行）"
+fi
+PYTHONPATH=. "$PYTHON_BIN" -u main.py "${ARGS[@]}"

@@ -2,8 +2,9 @@
 import json
 import random
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from utils.augmentation import BrainSignalAugmentation
+from utils.condition_schema import FieldSpec
 
 
 def load_clinical_scores(data_root, clinical_file: str, fields: List[str],
@@ -49,6 +51,110 @@ def load_clinical_scores(data_root, clinical_file: str, fields: List[str],
         f"{'/'.join(value_cols)} 数据（缺失策略: {missing}）。"
     )
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  条件注入表（v1 revised 20261008）：**只**读取 merged 文件
+# ══════════════════════════════════════════════════════════════════════════
+
+#: 阶段 → 条件 merged 文件（路径 = data_root + 文件名；禁止任何其他 xlsx）
+CONDITION_FILE_BY_MODE = {
+    'pretrain': 'Rest-meta-MDD-V1V2-Merged-HC.xlsx',
+    'finetune': 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
+}
+#: 阶段 → 条件字段分组
+CONDITION_GROUP_BY_MODE = {'pretrain': 'hc3', 'finetune': 'mdd8'}
+#: 显式分层键（**不随条件 fields[0] 变化**）；MDD 保持历史 HAMD 口径
+STRATIFY_KEY_BY_MODE = {'finetune': 'HAMD'}
+#: 仅用于划分审计 / 结果分层的辅助列（绝不进入条件向量）
+AUX_AUDIT_COLUMNS = ('Dataset', 'site')
+
+
+@dataclass
+class ConditionTable:
+    """merged 条件表的一次性加载结果（值、有效性 mask、ID 对齐与审计）。
+
+    Args:
+        values: ``[N_merged, K]`` float32；缺失格为 ``nan``（不做任何填补）。
+        mask: ``[N_merged, K]`` uint8，:math:`m_{ij}` = 单元格可解析为有限数值。
+        ids: merged 行的被试 ID（只用于匹配）。
+        row_of_id: ID → merged 行下标。
+        audit: :class:`~utils.condition_schema.LoadAudit`（哨兵计数、缺失原因、
+            实际解析到的来源列）。
+        aux: 审计用辅助列（如 ``Dataset`` 的 V1/V2），不进条件向量。
+        merged_sha256: merged 文件快照哈希（写入 checkpoint）。
+        missing_row_subjects: 影像队列中在 merged 无整行记录的被试（全字段缺失）。
+    """
+
+    group: str
+    file_name: str
+    values: np.ndarray
+    mask: np.ndarray
+    ids: List[str]
+    row_of_id: Dict[str, int]
+    audit: object
+    aux: Dict[str, np.ndarray]
+    merged_sha256: str
+    specs: Tuple[FieldSpec, ...]
+    missing_row_subjects: List[str] = field(default_factory=list)
+
+    @property
+    def k(self) -> int:
+        return int(self.values.shape[1])
+
+    def rows_for(self, subject_ids: Sequence[str]) -> np.ndarray:
+        """被试 ID → merged 行下标；无整行记录者映射到 ``-1``（全缺失分支）。"""
+        return np.asarray([self.row_of_id.get(str(s), -1) for s in subject_ids],
+                          dtype=np.int64)
+
+    def align(self, subject_ids: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """按影像队列取 ``(values, mask)``；缺行被试得到全 ``nan`` + 全 0 mask。"""
+        rows = self.rows_for(subject_ids)
+        v = np.full((len(subject_ids), self.k), np.nan, dtype=np.float32)
+        m = np.zeros((len(subject_ids), self.k), dtype=np.uint8)
+        hit = rows >= 0
+        if hit.any():
+            v[hit] = self.values[rows[hit]]
+            m[hit] = self.mask[rows[hit]]
+        return v, m
+
+
+def load_condition_table(data_root, file_name: str, group: str,
+                         id_column: str = 'ID') -> ConditionTable:
+    """加载条件 merged 表（唯一允许的条件数据来源），并读取审计辅助列。
+
+    显式拒绝任何其他文件：本函数不接受目录外的路径，也不会因为目标缺失而回退
+    到单独的 V1/V2 源表（方案 §2：禁止回读补齐/覆盖/恢复编码/创建 mask）。
+    """
+    from utils.condition_schema import (field_names, file_sha256,
+                                        load_merged_conditions, schema_for)
+
+    path = Path(data_root) / file_name
+    if not path.exists():
+        raise FileNotFoundError(
+            f'条件数据只允许读取 merged 文件，但 {path} 不存在；'
+            f'禁止改用单独的 V1/V2 源表（{file_name} 之外的文件不作为条件来源）。')
+    specs = schema_for(group)
+    values, mask, ids, audit = load_merged_conditions(path, specs, id_column=id_column)
+    df = pd.read_excel(path)
+    aux: Dict[str, np.ndarray] = {}
+    wanted = [c for c in AUX_AUDIT_COLUMNS
+              if str(c).strip().casefold() in
+              {str(x).strip().casefold() for x in df.columns}]
+    if wanted:
+        norm = {str(x).strip().casefold(): x for x in df.columns}
+        for col in wanted:
+            aux[col] = df[norm[str(col).strip().casefold()]].astype(str).str.strip().values
+    return ConditionTable(
+        group=group, file_name=file_name, values=values, mask=mask, ids=ids,
+        row_of_id={sid: i for i, sid in enumerate(ids)}, audit=audit, aux=aux,
+        merged_sha256=file_sha256(path), specs=tuple(specs))
+
+
+def attach_missing_rows(table: ConditionTable, subject_ids: Sequence[str]) -> ConditionTable:
+    """记录影像队列中 merged 无整行记录的被试（保留样本，条件全缺失）。"""
+    table.missing_row_subjects = [str(s) for s in subject_ids if str(s) not in table.row_of_id]
+    return table
 
 
 def _extract_mat(mat_dict, preferred_keys=None):
@@ -109,7 +215,11 @@ class NeuroTwinNextPointDataset(Dataset):
     被试级缓存、ROI 顺序校验。
     """
 
-    BOLD_SOURCES = ('auto', 'normlize', 'windows')
+    BOLD_SOURCES = ('auto', 'normlize', 'windows', 'raw')
+
+    #: graph_source：legacy_mask = 现有 Mask_<id>.mat 外部图；history_fc = 当前可见
+    #: 历史 signed Pearson 绝对值功能耦合图（模型侧计算，loader 只给单位图占位）。
+    GRAPH_SOURCES = ('legacy_mask', 'history_fc')
 
     def __init__(
         self,
@@ -123,11 +233,20 @@ class NeuroTwinNextPointDataset(Dataset):
         pathology_fields: Optional[List[str]] = None,
         pathology_missing: str = 'drop',
         clinical_file: str = 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
+        # ---- 条件注入（v1 revised 20261008）：None = 关闭，走 legacy 数值通路 ----
+        condition_group: Optional[str] = None,
+        condition_file: Optional[str] = None,
+        condition_control: str = 'none',
         total_windows: int = 9,
         seq_len: int = 30,
         bold_source: str = 'auto',
         subject_cache_size: int = 256,
         cache_in_memory: bool = False,
+        # ---- graph_ode 路线（方案 §4）：旧调用完全不传时行为与历史一致 ----
+        num_rois: int = 116,
+        graph_source: str = 'legacy_mask',
+        calibration_length: int = 0,          # 0 = 关闭（legacy）；raw 分支必须 >=1
+        control_manifest: Optional[str] = None,
     ):
         self.data_root = Path(data_root)
         self.mode = mode
@@ -151,6 +270,23 @@ class NeuroTwinNextPointDataset(Dataset):
         self.cache_in_memory = cache_in_memory
         self.subject_cache_size = int(subject_cache_size)
 
+        # ---- graph_ode 路线参数（方案 §4.1–§4.3）----
+        if graph_source not in self.GRAPH_SOURCES:
+            raise ValueError(
+                f"graph_source 仅支持 {self.GRAPH_SOURCES}，收到 '{graph_source}'")
+        self.graph_source = str(graph_source)
+        self.num_rois = int(num_rois)
+        if self.num_rois < 1:
+            raise ValueError(f"num_rois 必须 >= 1，收到 {self.num_rois}")
+        self.calibration_length = int(calibration_length)
+        if self.bold_source == 'raw' and self.calibration_length < 1:
+            raise ValueError(
+                "bold_source='raw' 必须显式传 calibration_length >= 1"
+                "（Raw 标准化与 profile 使用同一前缀；新路线固定 32）")
+        self.control_manifest = str(control_manifest) if control_manifest else None
+        # 逐被试控制序列 {subj_id: u [T,F] float32}；manifest 未提供时保持 None
+        self.controls_by_subject: Optional[Dict[str, np.ndarray]] = None
+
         self.pathology_input_dim = pathology_input_dim
         # 病理条件字段（默认仅 HAMD 总分；条目级缺失率高，向量路径需显式开启）
         self.pathology_fields = list(pathology_fields) if pathology_fields else ['HAMD']
@@ -160,14 +296,43 @@ class NeuroTwinNextPointDataset(Dataset):
         self.pathology_missing = pathology_missing
         if self.mode == 'finetune' and self.pathology_input_dim != len(self.pathology_fields):
             raise ValueError(
-                f"pathology_input_dim={self.pathology_input_dim} 与 pathology_fields="
+                f"pathology_input_dim={pathology_input_dim} 与 pathology_fields="
                 f"{self.pathology_fields}（宽度 {len(self.pathology_fields)}）不一致。")
 
+        # ---- 条件注入通路 ----
+        # 开启后：条件只来自 merged 文件，且**不因临床缺失或整行缺失删除被试**；
+        # legacy 数值通路（clinical_dict / pathology_score）同时关闭，避免同一
+        # 样本存在两套互相冲突的条件输入。
+        self.condition_group = str(condition_group) if condition_group else None
+        self.condition_enabled = self.condition_group is not None
+        if self.condition_enabled and self.condition_group not in ('hc3', 'mdd8'):
+            raise ValueError(
+                f"condition_group 仅支持 hc3/mdd8，收到 '{self.condition_group}'")
+        self.condition_file = (condition_file or CONDITION_FILE_BY_MODE.get(self.mode)
+                               if self.condition_enabled else None)
+        # 信息/容量对照（方案 §12）：none | static_new（新增组值与 mask 都固定）
+        # | mask_only（新增组值固定但保留真实 mask，检验缺失模式的独立贡献）
+        if condition_control not in ('none', 'static_new', 'mask_only'):
+            raise ValueError(
+                "condition_control 仅支持 none/static_new/mask_only，收到 "
+                f"'{condition_control}'")
+        self.condition_control = str(condition_control)
+        if self.condition_enabled and self.condition_file is None:
+            raise ValueError(
+                f'mode={self.mode} 没有登记的条件 merged 文件，请显式传 --condition_file')
+
         self.clinical_dict: Dict[str, np.ndarray] = {}
-        if self.mode == 'finetune':
+        if self.mode == 'finetune' and not self.condition_enabled:
             self.clinical_dict = load_clinical_scores(
                 self.data_root, clinical_file, self.pathology_fields,
                 self.pathology_missing)
+
+        self.condition_table: Optional[ConditionTable] = None
+        self.cond_values: Optional[np.ndarray] = None      # [N_subj, K]（缺失=nan）
+        self.cond_mask: Optional[np.ndarray] = None        # [N_subj, K] uint8
+        self.cond_z: Optional[np.ndarray] = None           # 拟合后填充
+        self.cond_code: Optional[np.ndarray] = None
+        self.condition_stats = None
 
         group_folder = 'HC' if mode == 'pretrain' else 'MDD'
         self.window_dir = self.data_root / 'ROISignals_window' / group_folder
@@ -177,16 +342,106 @@ class NeuroTwinNextPointDataset(Dataset):
         self.npz_dir = self.data_root / 'npz_cache' / group_folder
         self.npz_dir = self.npz_dir if self.npz_dir.is_dir() else None
         self.normlize_dir = self.data_root / 'Normlize' / group_folder
+        # raw 分支目录（方案 §4.1）：Raw/HC|MDD/ROISignals_<id>.mat
+        self.raw_dir = self.data_root / 'Raw' / group_folder
 
         self.subject_ids: List[str] = []
         self._subject_pos: Dict[str, int] = {}
         self.subject_series_len: Dict[str, int] = {}
         self.subject_n_tr: Dict[str, int] = {}
         self.subject_to_score: Dict[str, float] = {}
+        #: 影像队列里在临床表中**无整行记录**的被试（保留，不删人）
+        self.no_clinical_subjects: List[str] = []
         self._cache: Dict[str, Dict[str, np.ndarray]] = {}
         self._mat_cache: Dict[str, np.ndarray] = {}
         self._source_logged = False
         self._build_index()
+
+    def attach_condition_stats(self, stats) -> None:
+        """附加 train-only 统计量并**一次性**编码整个队列（z / 类别索引）。
+
+        统计量必须由 DataLoader 在冻结划分之后用 train 被试拟合；本方法只做变换，
+        不再拟合，避免 val/test 影响统计量（验收 E）。
+        """
+        from utils.condition_schema import field_names
+        table = self.condition_table
+        if table is None:
+            raise RuntimeError('条件表尚未加载，无法附加统计量。')
+        names = field_names(table.specs)
+        if names != [s.name for s in stats.specs]:
+            raise ValueError(
+                f'统计量字段顺序与条件 schema 不一致：{names} vs '
+                f'{[s.name for s in stats.specs]}（顺序参与 layout_hash，不允许重排）')
+        # 用 merged 的**队列对齐**矩阵（缺行被试为全缺失）做编码
+        z, code = stats.encode(self.cond_values, self.cond_mask)
+        self.condition_stats = stats
+        self.cond_z, self.cond_code = z, code
+        print(f'[condition] train-only 统计量已附加 | 连续字段 '
+              + ', '.join(f'{s.name}: mu={stats.get(s.name).mu:.3f} '
+                          f'scale={stats.get(s.name).scale:.3f} '
+                          f'({stats.get(s.name).scale_source}, n={stats.get(s.name).n_valid})'
+                          for s in table.specs if s.is_continuous))
+        for s in table.specs:
+            if not s.is_continuous:
+                print(f'[condition] {s.name} 类别词表={list(stats.get(s.name).codes)} '
+                      f'+ Unknown（n_valid={stats.get(s.name).n_valid}）')
+        self._apply_condition_control()
+
+    def _apply_condition_control(self) -> None:
+        r"""新增组（MDD 五字段）的信息 / 容量对照变换（方案 §12）。
+
+        - ``static_new``：新增五字段全部取**训练常量**（连续 :math:`z=0`，即训练
+          中位数；类别 → 该字段已登记的第一个有效类别码，**不是** Unknown），并把
+          新增组 mask **固定为全 1**。这会同时取消「新增值的个体差异」与「新增缺失
+          模式的个体差异」，报告时必须如此标注。
+        - ``mask_only``：值同样固定到常量，但**保留真实 mask**，用来检验收益是否
+          只由缺失模式解释。分类保留 mask，不把整块改成 Unknown 而丢失观测状态。
+
+        共享三字段（Sex/Age/education）在两种对照下都保持逐人真实值不变。
+        """
+        from utils.condition_schema import MDD_NEW_GROUP, group_indices
+        if self.condition_control == 'none':
+            return
+        table = self.condition_table
+        new_idx = group_indices(table.specs, MDD_NEW_GROUP)
+        stats = self.condition_stats
+        fixed_code, const_raw = {}, {}
+        for j, spec in enumerate(table.specs):
+            if j not in new_idx or spec.is_continuous:
+                continue
+            codes = stats.get(spec.name).codes
+            if not codes:
+                raise RuntimeError(
+                    f'对照 {self.condition_control} 需要字段 {spec.name} 的合法常量，'
+                    f'但其类别词表为空（训练集无有效观测）；无法构造「保留观测状态」'
+                    f'的对照，请显式登记类别码后重试。')
+            fixed_code[j] = 1                  # codes[0] → 内部索引 1（0 留给 Unknown）
+            const_raw[j] = float(codes[0])
+        for j in new_idx:
+            spec = table.specs[j]
+            if spec.is_continuous:
+                self.cond_z[:, j] = 0.0        # z=0 ⇔ 训练填补中心（中位数）
+                self.cond_values[:, j] = np.float32(stats.get(spec.name).mu)
+            else:
+                self.cond_code[:, j] = fixed_code[j]
+                self.cond_values[:, j] = np.float32(const_raw[j])
+            if self.condition_control == 'static_new':
+                self.cond_mask[:, j] = 1
+        mask_note = ('全部固定为 1（同时取消值与缺失模式的个体差异）'
+                     if self.condition_control == 'static_new'
+                     else '保持真实（检验缺失模式的独立贡献）')
+        print(f'[condition control] {self.condition_control}：新增组 {MDD_NEW_GROUP} '
+              f'的值已固定为训练常量；mask {mask_note}；共享三字段保持逐人真实值')
+
+    def condition_matrix_for(self, subject_ids: Sequence[str]) -> Dict[str, np.ndarray]:
+        """按被试 ID 取条件矩阵（供诊断/置换对照与逐被试评估使用）。"""
+        pos = [self._subject_pos[str(s)] for s in subject_ids
+               if str(s) in self._subject_pos]
+        return {
+            'z': self.cond_z[pos], 'code': self.cond_code[pos],
+            'mask': self.cond_mask[pos], 'raw': self.cond_values[pos],
+            'subject_index': np.asarray(pos, dtype=np.int64),
+        }
 
     # ------------------------------------------------------------------
     # 索引与数据加载
@@ -198,13 +453,43 @@ class NeuroTwinNextPointDataset(Dataset):
         return [self.window_dir / f"ROISignals_{subj_id}-{i}.mat"
                 for i in range(1, self.total_windows + 1)]
 
+    def _raw_path(self, subj_id: str) -> Path:
+        return self.raw_dir / f"ROISignals_{subj_id}.mat"
+
+    def _load_raw_array(self, subj_id: str) -> np.ndarray:
+        """读取 raw 原始序列并按该来源明确的 [T, F] 布局解释（方案 §4.1）。
+
+        不使用 ``max(shape)`` 猜时间轴：Raw 的 ROISignals 约定第 0 维为 TR、
+        第 1 维为 ROI。缺失或形状非法直接报告路径，不回退 Normlize/窗口缓存。
+        """
+        path = self._raw_path(subj_id)
+        if not path.exists():
+            raise FileNotFoundError(f"raw 分支缺少原始序列文件: {path}")
+        arr = self._read_mat_array(path, preferred_keys=['ROISignals', 'Data'])
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"{subj_id} 的 Raw BOLD 期望二维 [T, F]，收到 {arr.shape}（{path}）")
+        if arr.shape[1] < self.num_rois:
+            raise ValueError(
+                f"{subj_id} 的 Raw BOLD 仅 {arr.shape[1]} 列 ROI，少于 "
+                f"num_rois={self.num_rois}，无法取前 {self.num_rois} 列（{path}）")
+        return arr
+
     def _probe_series_length(self, subj_id: str) -> Optional[int]:
         """探测单被试连续序列长度 T（不读取全部数据，仅取 shape）。
 
         优先 Normlize 连续序列（原始 ROI BOLD，[T, F] 或 [F, T]）；不可用时按
         ``ROISignals_window`` 的 50% 重叠布局推算：偶数序号窗（1,3,5,...）恰好
         覆盖 0:S, S:2S, ... 的连续片段（见 data/utils/window_stride.py）。
+        raw 分支从 Raw 的明确时间轴取长度（截取前 150 TR 后的有效长度）。
         """
+        if self.bold_source == 'raw':
+            path = self._raw_path(subj_id)
+            if not path.exists():
+                return None
+            arr = self._load_raw_array(subj_id)
+            return min(int(arr.shape[0]), 150)
         if self.bold_source in ('auto', 'normlize'):
             path = self._normlize_path(subj_id)
             if path.exists():
@@ -220,20 +505,53 @@ class NeuroTwinNextPointDataset(Dataset):
         return n_used * self.source_window_len
 
     def _build_index(self):
-        """按 TR 直接索引：每个被试一条连续序列 [F, T]，T 即该被试的 TR 总数。"""
-        sc_files = sorted(self.sc_dir.glob('Mask_*.mat'), key=lambda p: p.stem)
-        skipped_clinical = skipped_missing = 0
-        too_short: List[str] = []
-        min_required = self.context_min + 1  # 至少 context_min 段历史 + 1 个目标 TR
+        """按 TR 直接索引：每个被试一条连续序列 [F, T]，T 即该被试的 TR 总数。
 
-        for sc_file in sc_files:
-            subj_id = str(sc_file.stem.replace('Mask_', '')).strip()
-            if self.mode == 'finetune' and subj_id not in self.clinical_dict:
-                skipped_clinical += 1
-                continue
+        条件注入开启时，队列**只由影像有效性决定**（BOLD/SC 存在且长度足够）；
+        在 merged 中缺整行或字段缺失的被试全部保留，条件记为缺失（方案 §4）。
+        legacy 数值通路（``condition_group=None``）同样**不因临床缺行删人**：
+        所有对照臂必须共用同一完整影像队列与同一份 split（验收 F），否则
+        「条件开 / 条件关」两次运行会得到不同 cohort 与不同划分。
+
+        raw 分支（方案 §4.1）从 ``Raw/<group>/ROISignals_*.mat`` 枚举被试，
+        不要求 Mask 存在（history_fc 的图来自当前可见历史）；legacy_mask 图在
+        ``_get_subject`` 按需读取，缺失时直接报路径错误。
+        """
+        if self.bold_source == 'raw':
+            if not self.raw_dir.is_dir():
+                raise FileNotFoundError(
+                    f"bold_source='raw' 需要 Raw 目录: {self.raw_dir}")
+            source_files = sorted(self.raw_dir.glob('ROISignals_*.mat'),
+                                  key=lambda p: p.stem)
+            prefix = 'ROISignals_'
+        else:
+            source_files = sorted(self.sc_dir.glob('Mask_*.mat'), key=lambda p: p.stem)
+            prefix = 'Mask_'
+        skipped_missing = 0
+        missing_examples: List[str] = []
+        no_clinical: List[str] = []
+        too_short: List[str] = []
+        # raw 路线（calibration_length>0）：锚点下界 max(K-1, calib-1)，故被试
+        # 至少需要 max(context_min, calibration_length) + max_offset 个 TR；
+        # legacy 路线保持历史口径 context_min + 1 不变。
+        if self.calibration_length > 0:
+            min_required = max(self.context_min, self.calibration_length) \
+                + self.max_offset
+        else:
+            min_required = self.context_min + 1  # 至少 context_min 段历史 + 1 个目标 TR
+        self._min_series_len = min_required
+
+        for src_file in source_files:
+            subj_id = str(src_file.stem.replace(prefix, '')).strip()
+            has_clinical = subj_id in self.clinical_dict
+            if self.mode == 'finetune' and not self.condition_enabled and not has_clinical:
+                # 只登记，不删人：评分缺失按「无临床信息」编码（见 _get_subject）
+                no_clinical.append(subj_id)
             series_len = self._probe_series_length(subj_id)
             if series_len is None or series_len <= 0:
                 skipped_missing += 1
+                if self.bold_source == 'raw':
+                    missing_examples.append(str(self._raw_path(subj_id)))
                 continue
             if series_len < min_required:
                 too_short.append(f"{subj_id}(T={series_len})")
@@ -242,7 +560,7 @@ class NeuroTwinNextPointDataset(Dataset):
             self.subject_ids.append(subj_id)
             self.subject_series_len[subj_id] = series_len
             self.subject_n_tr[subj_id] = series_len
-            if self.mode == 'finetune':
+            if self.mode == 'finetune' and not self.condition_enabled and has_clinical:
                 # 分层划分使用首个字段（默认 HAMD 总分）作为标量分层依据
                 self.subject_to_score[subj_id] = float(self.clinical_dict[subj_id][0])
 
@@ -252,6 +570,11 @@ class NeuroTwinNextPointDataset(Dataset):
                 f"（需 T >= {min_required}）。"
                 "请检查 data_root 下的 Normlize / ROISignals_window / Mask 目录。")
 
+        if self.condition_enabled:
+            self._load_condition_columns()
+        else:
+            self.no_clinical_subjects = no_clinical
+
         series_lens = sorted(self.subject_n_tr.values())
         print(
             f"[next_timepoint] 数据集构建完毕 | 模式: {self.mode} | 有效被试数: "
@@ -259,11 +582,126 @@ class NeuroTwinNextPointDataset(Dataset):
             f"{series_lens[0]}/{int(np.median(series_lens))}/{series_lens[-1]}"
         )
         print(
-            f"[next_timepoint] 数据源={self.bold_source} | 跳过: "
-            f"无临床评分 {skipped_clinical} | 数据缺失 {skipped_missing} | "
-            f"序列过短 {len(too_short)}"
+            f"[next_timepoint] 数据源={self.bold_source} | 图来源={self.graph_source}"
+            f" | 校准长度={self.calibration_length if self.calibration_length > 0 else 'off'}"
+            f" | 临床表无评分被试="
+            f"{len(self.no_clinical_subjects)}（**保留**，按无临床信息编码）| 跳过: "
+            f"数据缺失 {skipped_missing} | "
+            f"序列过短 {len(too_short)}（需 T >= {min_required}）"
             + (f"（例如 {too_short[:3]}）" if too_short else "")
         )
+        if missing_examples:
+            print(f"[next_timepoint] raw 缺失文件示例: {missing_examples[:3]}")
+
+        # 控制 manifest（方案 §4.3）：在索引建立后加载，逐条校验文件存在性与
+        # 队列内被试的 T/F 匹配；无 manifest 时 controls 保持 None（不伪造刺激）。
+        if self.control_manifest is not None:
+            self._load_control_manifest(self.control_manifest)
+
+    def _load_control_manifest(self, manifest_path: str) -> None:
+        """读取控制 manifest CSV 并校验每个条目（方案 §4.3）。
+
+        CSV 两列 ``subject_id,controls_path``；相对路径相对 manifest 所在目录。
+        每个 NPZ 只有必需数组 ``u [T, F]``：u[t] 对应到达观测 t 的区间，因此
+        锚点 t 的未来切片是 ``u[t+1:t+H+1]``。要求：
+
+        - 条目文件缺失、NPZ 缺 ``u`` 键、维度/宽度/长度不匹配或含非有限值 →
+          **明确报错**（不用无刺激代替缺文件，不静默跳过）；
+        - T 与该被试（截取前 150 TR 后的）序列长度严格一致；
+        - 控制幅值不使用 BOLD 均值/方差标准化，按上游定义的原值进入模型。
+        """
+        path = Path(manifest_path)
+        if not path.exists():
+            raise FileNotFoundError(f"control_manifest 不存在: {path}")
+        df = pd.read_csv(path)
+        cols = [c.strip() for c in df.columns]
+        if len(cols) < 2 or cols[0] != 'subject_id' or cols[1] != 'controls_path':
+            raise ValueError(
+                f"control_manifest 需要表头 'subject_id,controls_path'，收到 {cols}（{path}）")
+        controls: Dict[str, np.ndarray] = {}
+        base_dir = path.parent
+        for _, row in df.iterrows():
+            subj_id = str(row['subject_id']).strip()
+            rel = str(row['controls_path']).strip()
+            npz_path = Path(rel) if Path(rel).is_absolute() else base_dir / rel
+            if not npz_path.exists():
+                raise FileNotFoundError(
+                    f"control_manifest 条目 {subj_id} 的控制文件缺失: {npz_path}（{path}）")
+            with np.load(npz_path) as z:
+                if 'u' not in z:
+                    raise ValueError(
+                        f"{subj_id} 的控制 NPZ 缺少 'u' 键（{npz_path}）")
+                u = np.asarray(z['u'], dtype=np.float32)
+            if u.ndim != 2:
+                raise ValueError(
+                    f"{subj_id} 的控制 u 期望二维 [T, F]，收到 {u.shape}（{npz_path}）")
+            if u.shape[1] != self.num_rois:
+                raise ValueError(
+                    f"{subj_id} 的控制 u 末维 {u.shape[1]} 与 num_rois={self.num_rois} "
+                    f"不一致（{npz_path}）")
+            if not np.isfinite(u).all():
+                raise ValueError(f"{subj_id} 的控制 u 含非有限值（{npz_path}）")
+            expected_t = self.subject_series_len.get(subj_id, None)
+            if expected_t is not None and u.shape[0] != expected_t:
+                raise ValueError(
+                    f"{subj_id} 的控制 u 长度 {u.shape[0]} 与序列 T={expected_t} "
+                    f"不一致（{npz_path}；序列长度按 raw 前 150 TR 截取口径）")
+            controls[subj_id] = u
+        queue_hits = sum(1 for s in controls if s in self._subject_pos)
+        print(f"[controls] manifest 已加载: {path} | 条目={len(controls)} "
+              f"| 命中当前队列={queue_hits} | u 布局 [T,F]，区间 u[t] 到达观测 t")
+        self.controls_by_subject = controls
+
+    def _load_condition_columns(self) -> None:
+        """加载 merged 条件表并与影像队列对齐（缺行被试 → 全字段缺失）。"""
+        table = load_condition_table(self.data_root, self.condition_file,
+                                     self.condition_group)
+        attach_missing_rows(table, self.subject_ids)
+        self.condition_table = table
+        v, m = table.align(self.subject_ids)
+        self.cond_values, self.cond_mask = v, m
+        audit = table.audit
+        print(
+            f"[condition] merged={table.file_name} group={table.group} "
+            f"K={table.k} 行={audit.n_rows} | 影像队列={len(self.subject_ids)} "
+            f"（merged 无整行 {len(table.missing_row_subjects)} 人，保留并记全字段缺失）")
+        print(f"[condition] 有效观测数/被试队列 = {audit.n_valid}")
+        print(f"[condition] 实际来源列 = {audit.alias_sources}")
+        for name, info in audit.sentinel_counts.items():
+            if info.get('remap_applied'):
+                print(f"[condition] {name} 哨兵检测 原始={info['raw_sentinel_counts']} "
+                      f"映射后={info['mapped_sentinel_counts']}（-1→2、-9999→0，mask 恒为 1）")
+        if table.missing_row_subjects:
+            print(f"[condition] 无表行被试示例: {table.missing_row_subjects[:5]}")
+
+    def stratify_value_by_subject(self, subj_id: str,
+                                  key: Optional[str]) -> Optional[float]:
+        """按**显式分层键**取被试的分层数值；缺失返回 ``None``。
+
+        分层键由调用方指定（MDD 保持 HAMD），不随条件字段顺序 ``fields[0]`` 变化；
+        键缺失时由调用方使用预注册的缺失分桶 + 确定性分配，**不因人**。
+        """
+        if key is None:
+            return None
+        if self.condition_enabled:
+            table = self.condition_table
+            names = [s.name for s in table.specs]
+            if key not in names:
+                raise ValueError(
+                    f'分层键 {key} 不在条件 schema {names} 中；分层键必须显式登记。')
+            row = table.row_of_id.get(str(subj_id), -1)
+            if row < 0:
+                return None
+            j = names.index(key)
+            if not int(table.mask[row, j]):
+                return None
+            val = float(table.values[row, j])
+            return val if np.isfinite(val) else None
+        if key != self.pathology_fields[0]:
+            raise ValueError(
+                f'legacy 数值通路只提供 {self.pathology_fields[0]} 作为分层标量，'
+                f'无法按 {key} 分层；请开启条件注入（--condition_group）。')
+        return self.subject_to_score.get(str(subj_id), None)
 
     @staticmethod
     def _normalize_sc(sc_matrix: np.ndarray) -> np.ndarray:
@@ -292,8 +730,13 @@ class NeuroTwinNextPointDataset(Dataset):
             self._mat_cache[key] = arr
         return arr
 
-    def _load_series(self, subj_id: str, n_rois: int) -> np.ndarray:
-        """返回连续 ROI BOLD 序列 [F, T]（float32）。"""
+    def _load_series(self, subj_id: str, n_rois: int) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """返回 (连续 ROI BOLD 序列 [F, T], 校准统计量或 None)。
+
+        raw 分支序列为校准后数据尺度 X，校准统计量为 (mu0, s0)，各 [F, 1]
+        （每 ROI 只用最早 calibration_length 个 TR 估计，方案 §4.1）；
+        其余分支 cal_stats=None（无前缀校准概念）。
+        """
         def _orient(arr: np.ndarray, src: str) -> np.ndarray:
             arr = np.asarray(arr, dtype=np.float32)
             if arr.ndim != 2:
@@ -305,6 +748,29 @@ class NeuroTwinNextPointDataset(Dataset):
             raise ValueError(
                 f"{subj_id} 的 BOLD 形状 {arr.shape} 无法与 ROI 数 {n_rois} 对齐（{src}）")
 
+        if self.bold_source == 'raw':
+            # raw 分支（方案 §4.1）：明确 [T, F] 布局取前 150 TR、前 num_rois 列，
+            # 每 ROI 只用最早 calibration_length 个 TR 计算固定 mu0/s0 后标准化
+            # 整个序列；缺失直接报路径（_load_raw_array 内），不回退旧缓存。
+            arr = self._load_raw_array(subj_id)
+            n_tr = min(int(arr.shape[0]), 150)
+            if n_tr < self.calibration_length:
+                raise ValueError(
+                    f"{subj_id} 的 Raw BOLD 只有 {n_tr} 个 TR，少于 "
+                    f"calibration_length={self.calibration_length}（{self._raw_path(subj_id)}）")
+            x = np.ascontiguousarray(arr[:n_tr, :self.num_rois].T)      # [F, T]
+            cal = x[:, :self.calibration_length]
+            mu0 = cal.mean(axis=1, keepdims=True)                       # [F, 1]
+            s0 = np.sqrt(cal.var(axis=1, keepdims=True) + 1e-6)         # [F, 1]
+            cal_stats = (mu0.astype(np.float32), s0.astype(np.float32))
+            if not self._source_logged:
+                print(f"[next_timepoint] raw 数据源: {self.raw_dir}"
+                      f"（[T,F] → 前 150 TR/前 {self.num_rois} 列 → [F,T]，"
+                      f"最早 {self.calibration_length} TR 固定 mu0/s0 校准）")
+                self._source_logged = True
+            series = ((x - mu0) / s0).astype(np.float32, copy=False)
+            return series, cal_stats
+
         if self.bold_source in ('auto', 'normlize'):
             path = self._normlize_path(subj_id)
             if path.exists():
@@ -312,7 +778,8 @@ class NeuroTwinNextPointDataset(Dataset):
                     print(f"[next_timepoint] 连续 BOLD 数据源: {path.parent}（[T,F] → [F,T]）")
                     self._source_logged = True
                 return _orient(self._read_mat_array(
-                    path, preferred_keys=['ROISignals', 'Data', 'bold']), 'Normlize')
+                    path, preferred_keys=['ROISignals', 'Data', 'bold']),
+                    'Normlize'), None
 
         # fallback：从 50% 重叠滑窗重构连续序列（取偶数序号窗 = 0:S, S:2S, ...）
         if self.source_window_len % 2 != 0:
@@ -347,36 +814,56 @@ class NeuroTwinNextPointDataset(Dataset):
             print("[next_timepoint] 未找到 Normlize 连续序列，回退用 50% 重叠滑窗重构"
                   "（偶数序号窗拼接，布局见 data/utils/window_stride.py）")
             self._source_logged = True
-        return series.astype(np.float32, copy=False)
+        return series.astype(np.float32, copy=False), None
 
     def _get_subject(self, subj_id: str) -> Dict[str, np.ndarray]:
         cached = self._cache.get(subj_id, None)
         if cached is not None:
             return cached
 
-        sc_path = self.sc_dir / f"Mask_{subj_id}.mat"
-        sc_matrix = self._read_mat_array(
-            sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
-        if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
-            raise ValueError(f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
-        sc_matrix = self._normalize_sc(sc_matrix)
-        n_rois = int(sc_matrix.shape[0])
+        cal_stats = None
+        if self.bold_source == 'raw':
+            # raw 分支：ROI 数由 num_rois 参数提供（方案 §4.1），不依赖 Mask 推断。
+            n_rois = self.num_rois
+            if self.graph_source == 'legacy_mask':
+                sc_path = self.sc_dir / f"Mask_{subj_id}.mat"
+                if not sc_path.exists():
+                    raise FileNotFoundError(
+                        f"graph_source='legacy_mask' 需要 mask 文件: {sc_path}")
+                sc_matrix = self._read_mat_array(
+                    sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
+                if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
+                    raise ValueError(
+                        f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
+                sc_matrix = self._normalize_sc(sc_matrix)
+            else:
+                # history_fc：单位图占位以兼容现有 batch 拆包；模型实际图来自
+                # 当前可见历史（_history_fc_adj），不会把占位当实际图。
+                sc_matrix = np.eye(self.num_rois, dtype=np.float32)
+        else:
+            sc_path = self.sc_dir / f"Mask_{subj_id}.mat"
+            sc_matrix = self._read_mat_array(
+                sc_path, preferred_keys=['SC', 'sc_matrix', 'mask', 'Mask'])
+            if sc_matrix.ndim != 2 or sc_matrix.shape[0] != sc_matrix.shape[1]:
+                raise ValueError(f"SC/mask must be square [F, F], got {sc_matrix.shape} for {subj_id}")
+            sc_matrix = self._normalize_sc(sc_matrix)
+            n_rois = int(sc_matrix.shape[0])
 
-        series = self._load_series(subj_id, n_rois)
+        series, cal_stats = self._load_series(subj_id, n_rois)
         if series.shape[0] != n_rois:
             raise ValueError(
-                f"ROI 顺序/数量不一致：{subj_id} BOLD {series.shape[0]} vs SC {n_rois}；"
-                "next_timepoint 要求 BOLD ROI i 与 SC ROI i 严格对应。")
+                f"ROI 顺序/数量不一致：{subj_id} BOLD {series.shape[0]} vs 期望 {n_rois}；"
+                "next_timepoint 要求 BOLD ROI i 与图 ROI i 严格对应。")
         T = int(series.shape[1])
         expected = self.subject_series_len.get(subj_id, None)
         if expected is not None and T != expected:
             raise ValueError(
                 f"{subj_id} 实际序列长度 {T} 与索引阶段探测的 {expected} 不一致："
                 "请检查数据目录是否在两次运行之间发生变化。")
-        if T < self.context_min + 1:
+        if T < self._min_series_len:
             raise ValueError(
-                f"{subj_id} 只有 {T} 个 TR，不足以构成 context_min+1="
-                f"{self.context_min + 1} 的最小样本。")
+                f"{subj_id} 只有 {T} 个 TR，不足以构成最小样本（需 T >= "
+                f"{self._min_series_len}）。")
 
         entry: Dict[str, np.ndarray] = {
             'series': np.ascontiguousarray(series.astype(np.float32, copy=True)),  # [F, T]
@@ -384,9 +871,19 @@ class NeuroTwinNextPointDataset(Dataset):
             'subj_id': subj_id,
             'series_len': T,
         }
-        if self.mode == 'finetune':
-            entry['pathology_score'] = np.asarray(
-                self.clinical_dict[subj_id], dtype=np.float32)
+        if cal_stats is not None:
+            # raw 前缀校准统计量（固定 mu0/s0，各 [F,1]）：供推理侧把新原始观测
+            # 转换到同一数据尺度（inference_twin 复用，不再重新估计）。
+            entry['cal_mu0'] = cal_stats[0]
+            entry['cal_s0'] = cal_stats[1]
+        if self.mode == 'finetune' and not self.condition_enabled:
+            vec = self.clinical_dict.get(subj_id, None)
+            if vec is None:
+                # 临床表无该被试：为保住「所有臂共用一个完整影像队列」（验收 F）
+                # 仍然保留此人，评分按无信息常量 0 编码（与 pathology_missing='zero'
+                # 同口径）；分层标量保持缺失（None），由缺失桶确定性分配。
+                vec = np.zeros(self.pathology_input_dim, dtype=np.float32)
+            entry['pathology_score'] = np.asarray(vec, dtype=np.float32)
 
         if self.subject_cache_size > 0:
             if len(self._cache) >= self.subject_cache_size:
@@ -437,24 +934,54 @@ class NeuroTwinNextPointDataset(Dataset):
         """返回被试的连续 BOLD 序列 [F, T]（只读）。
 
         供评估侧拟合 AR(1) baseline 等只读用途；数据来源与训练完全一致
-        （Normlize 连续序列，缺失时按 50% 重叠滑窗重构）。
+        （raw 分支为校准后序列，否则 Normlize 连续序列，缺失时按 50% 重叠滑窗重构）。
         """
         return self._get_subject(str(subj_id))['series']
 
+    def get_calibration_stats(self, subj_id: str):
+        """返回该被试的固定前缀校准统计量 (mu0, s0)，各 [F, 1]；非 raw 分支为 None。
+
+        供推理侧把新原始观测用**同一扫描**的 mu0/s0 转换到数据尺度，
+        不重新估计统计量（方案 §4.1）。
+        """
+        entry = self._get_subject(str(subj_id))
+        if 'cal_mu0' not in entry:
+            return None
+        return entry['cal_mu0'], entry['cal_s0']
+
+    def get_controls(self, subj_id: str) -> Optional[np.ndarray]:
+        """返回该被试的控制序列 u [T, F]；无 manifest 或该被试无条目时为 None。"""
+        if self.controls_by_subject is None:
+            return None
+        return self.controls_by_subject.get(str(subj_id), None)
+
     def legal_context_lengths(self, subj_id: str) -> List[int]:
-        """合法 context 长度：K <= min(context_max, T-1)（至少 1 个未来 TR）。"""
+        """合法 context 长度：K <= min(context_max, T-1)（至少 1 个未来 TR）。
+
+        raw 路线（calibration_length>0）锚点下界为 max(K-1, calib-1)，故还需
+        K <= T - max_offset 才存在合法锚点；否则训练视图会采样到空锚点区间。
+        """
         n = self.n_tr(subj_id)
         upper = min(self.context_max, n - 1)
+        if self.calibration_length > 0:
+            upper = min(upper, n - self.max_offset)
         if self.context_lengths:
             return [k for k in self.context_lengths if k <= upper]
         return list(range(self.context_min, upper + 1)) if upper >= self.context_min else []
 
     def legal_anchor_range(self, subj_id: str, context_len: int,
                            max_offset: int = None) -> Tuple[int, int]:
-        """合法预测位置区间（含端点，0 基 cutoff t）：t-K+1 >= 0 且 t+max_offset <= T-1。"""
+        """合法预测位置区间（含端点，0 基 cutoff t）：t-K+1 >= 0 且 t+max_offset <= T-1。
+
+        raw 路线（方案 §4.1）下界改为 max(K-1, calibration_length-1)：未来样本
+        不参与基线/profile 校准，首个预测至少是第 33 个 TR（calibration_length=32）。
+        """
         n = self.n_tr(subj_id)
         off = int(max_offset) if max_offset else self.max_offset
-        return context_len - 1, n - 1 - off
+        lo = context_len - 1
+        if self.calibration_length > 0:
+            lo = max(lo, self.calibration_length - 1)
+        return lo, n - 1 - off
 
     def legal_task_count(self, subj_id: str) -> int:
         """该被试的合法 (K, t) 组合数（训练视图的样本预算）。"""
@@ -478,6 +1005,9 @@ class NeuroTwinNextPointDataset(Dataset):
             x_last      [F]         context 末位 x_t（delta 重建与 baseline 使用）
             future      [F, R]      t+1..t+R 的真值（仅 future_steps>0，供 rollout 评分）
             sc / subj_id / context_len / cutoff / target_mask [H]
+        raw 路线附加：
+            calibration_bold [F, 1, calibration_length]  同一扫描最早校准前缀（数据尺度）
+            controls         [R, F]      u[t+1:t+R+1]，缺尾区间填零（有 manifest 时）
         """
         subj_id = self.subject_ids[subj_pos]
         n = self.n_tr(subj_id)
@@ -505,6 +1035,23 @@ class NeuroTwinNextPointDataset(Dataset):
             'cutoff': int(t),
             'target_mask': torch.ones(len(self.offsets), dtype=torch.float32),
         }
+        if self.calibration_length > 0:
+            # 固定基线校准前缀（数据尺度 X）：独立于当前锚点，profile 与 Raw
+            # 标准化使用同一前缀；锚点之后的样本不参与校准。
+            cal = series[:, :self.calibration_length]                  # [F, L]
+            out['calibration_bold'] = torch.from_numpy(np.ascontiguousarray(
+                np.asarray(cal[:, None, :], dtype=np.float32)))        # [F,1,L]
+        if self.controls_by_subject is not None:
+            u = self.controls_by_subject.get(subj_id, None)
+            h = int(future_steps)
+            ctrl = np.zeros((h, self.num_rois), dtype=np.float32)
+            if u is not None and h > 0:
+                # u[t] 对应到达观测 t 的区间；锚点 t 的未来区间切片 u[t+1:t+H+1]，
+                # 缺尾区间随 future_mask 填零（方案 §4.3）。
+                avail = max(0, min(h, int(u.shape[0]) - (t + 1)))
+                if avail > 0:
+                    ctrl[:avail] = u[t + 1: t + 1 + avail]
+            out['controls'] = torch.from_numpy(ctrl)                   # [H, F]
         if future_steps > 0:
             future_end = min(int(future_steps), n - 1 - t)
             future = np.zeros((series.shape[0], int(future_steps)), dtype=np.float32)
@@ -514,7 +1061,23 @@ class NeuroTwinNextPointDataset(Dataset):
             mask[:future_end] = 1.0
             out['future'] = torch.from_numpy(future)
             out['future_mask'] = torch.from_numpy(mask)
-        if self.mode == 'finetune':
+        if self.condition_enabled:
+            if self.cond_z is None:
+                raise RuntimeError(
+                    '条件统计量尚未附加（attach_condition_stats 未调用）；'
+                    'train-only 统计量必须在冻结划分后拟合，不能靠运行时默认值猜测。')
+            out['cond_z'] = torch.from_numpy(np.ascontiguousarray(
+                self.cond_z[subj_pos], dtype=np.float32))              # [K]
+            out['cond_code'] = torch.from_numpy(np.ascontiguousarray(
+                self.cond_code[subj_pos], dtype=np.int64))             # [K]
+            out['cond_mask'] = torch.from_numpy(np.ascontiguousarray(
+                self.cond_mask[subj_pos], dtype=np.float32))           # [K]
+            # 原值（替换后类别码 / 连续原始值，缺失=nan）只供诊断与置换对照，
+            # 不直接进模型；模型消费 z/code/mask。
+            out['cond_raw'] = torch.from_numpy(np.ascontiguousarray(
+                self.cond_values[subj_pos], dtype=np.float32))          # [K]
+            out['subject_index'] = torch.tensor(int(subj_pos), dtype=torch.long)
+        elif self.mode == 'finetune':
             out['pathology_score'] = torch.tensor(
                 np.asarray(entry['pathology_score'], dtype=np.float32),
                 dtype=torch.float32)
@@ -769,6 +1332,15 @@ class NeuroTwinDataLoader:
         pathology_fields: Optional[List[str]] = None,
         pathology_missing: str = 'drop',
         clinical_file: str = 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx',
+        # ---- 条件注入（v1 revised 20261008）----
+        condition_group: Optional[str] = None,
+        condition_file: Optional[str] = None,
+        split_file: Optional[str] = None,
+        stratify_key: Optional[str] = None,
+        condition_base_stats=None,
+        condition_extra_codes: Optional[Dict[str, Sequence[float]]] = None,
+        condition_stats_mode: str = 'fit',
+        condition_control: str = 'none',
         total_windows: int = 9,
         seq_len: int = 30,
         num_workers: int = 4,
@@ -800,12 +1372,36 @@ class NeuroTwinDataLoader:
         train_rollout_steps: int = 0,
         train_anchor_max_offset: int = 0,
         eval_all_future_steps: int = 0,
+        # ---- graph_ode 路线（方案 §4）：透传给 next-timepoint 数据集 ----
+        num_rois: int = 116,
+        graph_source: str = 'legacy_mask',
+        calibration_length: int = 0,
+        control_manifest: Optional[str] = None,
     ):
         task_mode = str(task_mode)
         if task_mode != 'next_timepoint':
             raise ValueError(
                 f"task_mode 仅支持 'next_timepoint'，收到 '{task_mode}'")
         self.task_mode = task_mode
+        self.mode = str(mode)
+        self.condition_group = str(condition_group) if condition_group else None
+        self.condition_file = condition_file
+        self.split_file = str(split_file) if split_file else None
+        self.condition_base_stats = condition_base_stats
+        self.condition_extra_codes = dict(condition_extra_codes or {})
+        if condition_stats_mode not in ('fit', 'inherit'):
+            raise ValueError(
+                f"condition_stats_mode 仅支持 fit/inherit，收到 '{condition_stats_mode}'")
+        self.condition_stats_mode = str(condition_stats_mode)
+        if condition_control not in ('none', 'static_new', 'mask_only'):
+            raise ValueError(
+                "condition_control 仅支持 none/static_new/mask_only，收到 "
+                f"'{condition_control}'")
+        self.condition_control = str(condition_control)
+        # 分层键显式固定（MDD 保持 HAMD），不随条件字段顺序变化
+        self.stratify_key = (str(stratify_key) if stratify_key
+                             else STRATIFY_KEY_BY_MODE.get(self.mode))
+        self.condition_stats = None
         self.bold_source = bold_source
         self.random_context = bool(random_context)
         self.random_cutoff = bool(random_cutoff)
@@ -826,6 +1422,10 @@ class NeuroTwinDataLoader:
         # TFM 的 CPM 支持：训练锚点按 cpm_horizon 右移上界、评估全 anchor 带 future
         self.train_anchor_max_offset = int(train_anchor_max_offset)
         self.eval_all_future_steps = int(eval_all_future_steps)
+        self.num_rois = int(num_rois)
+        self.graph_source = str(graph_source)
+        self.calibration_length = int(calibration_length)
+        self.control_manifest = str(control_manifest) if control_manifest else None
         self.seed = seed
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size if eval_batch_size else batch_size * 4
@@ -850,11 +1450,18 @@ class NeuroTwinDataLoader:
             pathology_fields=pathology_fields,
             pathology_missing=pathology_missing,
             clinical_file=clinical_file,
+            condition_group=self.condition_group,
+            condition_file=self.condition_file,
+            condition_control=self.condition_control,
             total_windows=total_windows,
             seq_len=seq_len,
             bold_source=self.bold_source,
             subject_cache_size=self.subject_cache_size,
             cache_in_memory=cache_in_memory,
+            num_rois=self.num_rois,
+            graph_source=self.graph_source,
+            calibration_length=self.calibration_length,
+            control_manifest=self.control_manifest,
         )
 
         train_indices, val_indices, test_indices, train_subjects, val_subjects, test_subjects = self._split_indices_by_subject(
@@ -862,6 +1469,7 @@ class NeuroTwinDataLoader:
             val_ratio=val_ratio,
             test_ratio=test_ratio,
             stratify_bins=stratify_bins,
+            stratify_key=self.stratify_key,
         )
 
         augmentation = BrainSignalAugmentation(
@@ -922,20 +1530,132 @@ class NeuroTwinDataLoader:
             f"train_samples={len(self.train_dataset)} | val_samples={len(self.val_dataset)} | test_samples={len(self.test_dataset)}"
         )
 
+        # 划分冻结**之后**才拟合预处理统计量（train-only；方案 §4 / 验收 E）
+        if self.base_dataset.condition_enabled:
+            self._fit_condition_stats()
+
         if mode == 'finetune' and len(train_subjects) > 0 and len(val_subjects) > 0:
-            train_scores = [self.base_dataset.get_pathology_scalar_by_subject(sid) for sid in train_subjects]
-            val_scores = [self.base_dataset.get_pathology_scalar_by_subject(sid) for sid in val_subjects]
-            test_scores = [self.base_dataset.get_pathology_scalar_by_subject(sid) for sid in test_subjects]
-            train_scores = [s for s in train_scores if s is not None]
-            val_scores = [s for s in val_scores if s is not None]
-            test_scores = [s for s in test_scores if s is not None]
+            key = self.stratify_key
+            def _vals(sids):
+                if self.base_dataset.condition_enabled:
+                    return [v for v in (self.base_dataset.stratify_value_by_subject(s, key)
+                                        for s in sids) if v is not None]
+                return [s for s in (self.base_dataset.get_pathology_scalar_by_subject(sid)
+                                    for sid in sids) if s is not None]
+            train_scores = _vals(train_subjects)
+            val_scores = _vals(val_subjects)
+            test_scores = _vals(test_subjects)
             if train_scores and val_scores:
                 print(
-                    "HAMD 分布 | "
+                    f"{key} 分布 | "
                     f"train mean={np.mean(train_scores):.3f}, std={np.std(train_scores):.3f} | "
                     f"val mean={np.mean(val_scores):.3f}, std={np.std(val_scores):.3f} | "
                     f"test mean={np.mean(test_scores):.3f}, std={np.std(test_scores):.3f}"
                 )
+
+    def _fit_condition_stats(self) -> None:
+        """冻结划分**之后**用 train 被试的有效观测拟合 train-only 统计量。
+
+        - 连续字段：:math:`\\mu_j`=train 有效观测中位数，:math:`s_j=\\operatorname{IQR}/1.349`
+          （退化回退 std，再回退 1）；
+        - 类别字段：类别词表只在 train 有效观测上登记，外加
+          ``condition_extra_codes`` 显式预注册的码（不允许运行时静默扩表）；
+        - HC→MDD：给出 ``condition_base_stats`` 时，Age/education 的 mu/scale 与类别
+          协议**逐字段继承** HC-train，只对新增五字段拟合；绝不调用一次通用 fit
+          覆盖继承统计量（方案 §4，验收 E）。
+        """
+        from utils.condition_schema import (DEMO_GROUP, MDD_NEW_GROUP,
+                                            audit_unseen_codes,
+                                            fit_condition_stats, layout_hash)
+        ds = self.base_dataset
+        table = ds.condition_table
+        specs = table.specs
+        train_rows = np.asarray([ds._subject_pos[s] for s in self.train_subjects],
+                                dtype=np.int64)
+        if train_rows.size == 0:
+            raise RuntimeError('训练被试为空，无法拟合 train-only 统计量。')
+        v, m = ds.cond_values, ds.cond_mask
+        base = self.condition_base_stats
+
+        if self.condition_stats_mode == 'inherit':
+            # 独立评估/推理：统计量**必须**逐位复用 checkpoint 内的 train-only 快照，
+            # 不能在这里重新拟合（否则评估编码与训练编码可能因队列/划分漂移而不一致）
+            if base is None:
+                raise ValueError(
+                    "condition_stats_mode='inherit' 需要 condition_base_stats"
+                    '（通常来自 checkpoint 的 config.condition.stats）')
+            stats = fit_condition_stats(specs, v, m, train_rows, only_fields=[], base=base)
+            self.condition_stats = stats
+            ds.attach_condition_stats(stats)
+            print('[condition] inherit 模式：全部字段逐位复用传入统计量，未重新拟合')
+            return
+        if base is not None:
+            if table.group != 'mdd8':
+                raise ValueError(
+                    f'condition_base_stats 仅用于 mdd8 继承 HC 统计量，收到 '
+                    f'group={table.group}')
+            # 继承路径同样要接收 extra_codes：新增五字段的预注册码只有在这里进词表，
+            # 否则下方 audit 报错建议的 --condition_extra_codes 传进来会被静默丢弃。
+            demo = set(DEMO_GROUP)
+            shared_reg = sorted(demo & set(self.condition_extra_codes))
+            if shared_reg:
+                raise ValueError(
+                    f'--condition_extra_codes 含继承字段 {shared_reg}：Sex/education 的类别'
+                    '协议由本轮 HC-train 冻结并逐位继承（方案 §四），MDD 侧不得扩大它。'
+                    '确实需要新增码时，必须在 HC 试次登记该码并重新训练 HC，再继承新快照。')
+            stats = fit_condition_stats(specs, v, m, train_rows,
+                                        only_fields=list(MDD_NEW_GROUP), base=base,
+                                        extra_codes=self.condition_extra_codes)
+            for name in DEMO_GROUP:
+                got, src = stats.get(name), base.get(name)
+                if (got.fitted, got.mu, got.scale, got.codes) != (
+                        src.fitted, src.mu, src.scale, src.codes):
+                    raise AssertionError(
+                        f'继承字段 {name} 的统计量被覆盖：{got} vs {src}。'
+                        'HC→MDD 必须逐字段继承 Age/education 的 mu/scale 与类别协议。')
+            print(f'[condition] 继承 HC-train 统计量：{list(DEMO_GROUP)}；'
+                  f'仅在 MDD-train 拟合 {list(MDD_NEW_GROUP)}')
+        else:
+            if table.group == 'mdd8':
+                print('[condition] 警告: 未提供 HC 统计量（condition_base_stats=None），'
+                      '全部字段在 MDD-train 拟合；这是「无继承」变体，与 HC→MDD '
+                      '迁移实验不同口径，比较时须显式区分。')
+            stats = fit_condition_stats(specs, v, m, train_rows)
+
+        unfitted = [s.name for s in specs if s.is_continuous
+                    and not stats.get(s.name).fitted]
+        if unfitted:
+            print(f'[condition] 全训练缺失字段（fitted=false, n_valid=0，编码走 z=0/m=0 '
+                  f'分支，不从 val/test 取值）：{unfitted}')
+
+        unseen = audit_unseen_codes(specs, stats, v, m, train_rows)
+        if unseen:
+            def _fmt_code(c: float) -> str:
+                return str(int(c)) if float(c).is_integer() else repr(c)
+
+            # 继承来的共享字段不能靠 --condition_extra_codes 补码（那个开关对
+            # only_fields=MDD_NEW_GROUP 的拟合是空转），必须回到 HC 侧登记重训；
+            # 否则报错会建议一个对本路径无效的修复，用户按提示改完仍然报同一个错。
+            if base is not None:
+                shared_hits = {k: vv for k, vv in unseen.items() if k in set(DEMO_GROUP)}
+                if shared_hits:
+                    raise ValueError(
+                        f'继承字段出现未登记的有效类别码：{shared_hits}。这些字段的词表由本轮 '
+                        'HC-train 冻结并逐位继承（方案 §四），MDD 侧禁止扩大；'
+                        '正确处置是在 HC 试次用 --condition_extra_codes 登记该码并重新训练 HC，'
+                        '再继承新的统计量快照。')
+            suggestion = ';'.join(
+                f'{k}:{",".join(_fmt_code(c) for c in vv)}' for k, vv in unseen.items())
+            raise ValueError(
+                f'训练集之外存在未登记的有效类别码：{unseen}。协议要求显式登记而不是'
+                f'伪装成缺失；请确认后传 --condition_extra_codes "{suggestion}"'
+                f'（运行时禁止静默扩大 Embedding，否则 checkpoint 不可重建）。')
+
+        self.condition_stats = stats
+        ds.attach_condition_stats(stats)
+        print('[condition] layout_hash='
+              f'{layout_hash(specs, stats=stats)} | merged_sha256='
+              f'{table.merged_sha256[:16]}… | 实际来源列={table.audit.alias_sources}')
 
     def _expand_subjects_to_sample_indices(self, subject_ids: List[str]) -> List[int]:
         indices: List[int] = []
@@ -976,18 +1696,31 @@ class NeuroTwinDataLoader:
 
         return allocations
 
-    def _split_subject_ids(self, mode: str, val_ratio: float, test_ratio: float, stratify_bins: int) -> Tuple[List[str], List[str], List[str]]:
+    def _split_subject_ids(self, mode: str, val_ratio: float, test_ratio: float,
+                           stratify_bins: int,
+                           stratify_key: Optional[str] = None) -> Tuple[List[str], List[str], List[str]]:
         """将受试者划分为训练集、验证集和测试集（8:1:1）。
 
+        优先级：显式 ``split_file`` > 版本化 manifest > 现场生成并落盘。
+
         版本化固定：切分结果落盘到 ``<data_root>/subject_split_<mode>.json``
-        （含 seed/比例/分箱等配置指纹）。同配置的后续运行直接复用名单，
-        防止代码演化导致的切分漂移（跨实验 test 集一致性）；配置变化或
-        被试集合变化时默认报错，需显式 ``refresh_split_manifest=True`` 重新生成。
+        （含 seed/比例/分箱/分层键等配置指纹）。同配置的后续运行直接复用名单，
+        防止代码演化导致的切分漂移（跨实验 test 集一致性）；配置变化或被试集合
+        变化时默认报错，需显式 ``refresh_split_manifest=True`` 重新生成。
+
+        所有对照臂（无条件 / 各条件臂）共用同一份 cohort 与 split：cohort 由影像
+        有效性决定，**不因条件缺失删人**（验收 F）。
         """
+        cohort = set(self.base_dataset.get_subject_ids())
+        if self.split_file:
+            return self._load_split_file(self.split_file, cohort)
+
         manifest_path = self._split_manifest_path(mode)
         meta = {'mode': mode, 'seed': int(self.seed), 'val_ratio': float(val_ratio),
                 'test_ratio': float(test_ratio), 'stratify_bins': int(stratify_bins),
-                'n_subjects': len(self.base_dataset.get_subject_ids())}
+                'n_subjects': len(cohort)}
+        if stratify_key is not None:
+            meta['stratify_key'] = str(stratify_key)
         if manifest_path is not None and manifest_path.exists() \
                 and not self.refresh_split_manifest:
             try:
@@ -996,13 +1729,18 @@ class NeuroTwinDataLoader:
                 raise RuntimeError(
                     f'切分 manifest 损坏（{manifest_path}）：{e}。'
                     '删除该文件或传 refresh_split_manifest=True 重新生成。') from e
+            if stratify_key is not None and 'stratify_key' not in old:
+                # 历史 manifest 未记录分层键；其实际口径即模式默认键，显式声明后复用
+                old = {**old, 'stratify_key': stratify_key}
+                print(f'[split] manifest 无 stratify_key 字段，按模式默认键 '
+                      f'"{stratify_key}" 解释（与历史切分口径一致）。')
             mismatch = {k: (old.get(k), v) for k, v in meta.items() if old.get(k) != v}
             if mismatch:
                 raise RuntimeError(
                     f'切分 manifest 配置与当前运行不一致（{manifest_path}）：{mismatch}。'
                     '确认数据或配置变更后传 refresh_split_manifest=True 重新生成；'
                     '若非有意变更，请回退当前运行的 seed/比例设置以复用固定切分。')
-            cur = set(self.base_dataset.get_subject_ids())
+            cur = cohort
             train, val, test = old.get('train'), old.get('val'), old.get('test')
             if train and val and test and (set(train) | set(val) | set(test)) == cur:
                 print(f'[split] 复用版本化切分 manifest: {manifest_path}')
@@ -1012,7 +1750,7 @@ class NeuroTwinDataLoader:
                 '数据目录可能已变化。删除该文件或传 refresh_split_manifest=True 重新生成。')
 
         train, val, test = self._split_subject_ids_impl(mode, val_ratio, test_ratio,
-                                                        stratify_bins)
+                                                        stratify_bins, stratify_key)
         if manifest_path is not None:
             manifest_path.write_text(
                 json.dumps({**meta, 'train': train, 'val': val, 'test': test},
@@ -1022,6 +1760,51 @@ class NeuroTwinDataLoader:
                   f'(train/val/test = {len(train)}/{len(val)}/{len(test)})')
         return train, val, test
 
+    @staticmethod
+    def _load_split_file(path: str, cohort: set) -> Tuple[List[str], List[str], List[str]]:
+        """读取并校验外部被试划分文件（互斥、重复、覆盖、队列成员）。
+
+        校验失败一律报错：划分是实验对照的地基，静默容忍会让不同臂用不同队列，
+        从而使「条件 vs 无条件」的比较失去意义。
+        """
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f'--split_file 指定的划分文件不存在: {path}')
+        payload = json.loads(p.read_text(encoding='utf-8'))
+        if not isinstance(payload, dict):
+            raise ValueError(f'--split_file 需为含 train/val/test 键的 JSON 对象，收到 {type(payload)}')
+        parts = {}
+        for key in ('train', 'val', 'test'):
+            v = payload.get(key, None)
+            if not isinstance(v, (list, tuple)) or not v:
+                raise ValueError(f'--split_file 缺少非空列表键 "{key}"（{path}）')
+            parts[key] = [str(s).strip() for s in v]
+        tr, va, te = parts['train'], parts['val'], parts['test']
+        pairs = {'train∩val': set(tr) & set(va), 'train∩test': set(tr) & set(te),
+                 'val∩test': set(va) & set(te)}
+        overlap = {k: sorted(v)[:5] for k, v in pairs.items() if v}
+        if overlap:
+            raise ValueError(f'--split_file 集合不互斥（{path}）：{overlap}')
+        dup = {k: sorted({s for s in v if v.count(s) > 1})[:5]
+               for k, v in parts.items()}
+        dup = {k: v for k, v in dup.items() if v}
+        if dup:
+            raise ValueError(f'--split_file 存在重复被试（{path}）：{dup}')
+        union = set(tr) | set(va) | set(te)
+        unknown = sorted(union - cohort)[:5]
+        if unknown:
+            raise ValueError(
+                f'--split_file 含当前影像队列之外的被试（{path}），例如 {unknown}。')
+        uncovered = sorted(cohort - union)
+        if uncovered:
+            raise ValueError(
+                f'--split_file 未覆盖影像队列中的 {len(uncovered)} 个被试（{path}），'
+                f'例如 {uncovered[:5]}。所有对照臂必须共用同一完整队列；'
+                f'请补齐该划分文件或按预先固定规则重新生成完整队列划分。')
+        print(f'[split] 复用外部划分文件（已校验互斥/无重复/全覆盖）: {path} '
+              f'| train/val/test = {len(tr)}/{len(va)}/{len(te)}')
+        return sorted(tr), sorted(va), sorted(te)
+
     def _split_manifest_path(self, mode: str):
         root = getattr(self.base_dataset, 'data_root', None)
         if not root:
@@ -1029,7 +1812,9 @@ class NeuroTwinDataLoader:
         return Path(str(root)) / f'subject_split_{mode}.json'
 
     def _split_subject_ids_impl(self, mode: str, val_ratio: float, test_ratio: float,
-                                stratify_bins: int) -> Tuple[List[str], List[str], List[str]]:
+                                stratify_bins: int,
+                                stratify_key: Optional[str] = None
+                                ) -> Tuple[List[str], List[str], List[str]]:
         subject_ids = self.base_dataset.get_subject_ids()
         rng = random.Random(self.seed)
 
@@ -1046,18 +1831,19 @@ class NeuroTwinDataLoader:
         target_val_subjects = max(1, min(total_subjects - 2, int(round(total_subjects * val_ratio))))
         target_test_subjects = max(1, min(total_subjects - target_val_subjects - 1, int(round(total_subjects * test_ratio))))
 
-        if mode != 'finetune':
-            # 非finetune模式：直接按比例划分
+        if mode != 'finetune' or stratify_key is None:
+            # 非分层模式：直接按比例划分
             test_subjects = shuffled_subjects[:target_test_subjects]
             val_subjects = shuffled_subjects[target_test_subjects:target_test_subjects + target_val_subjects]
             train_subjects = shuffled_subjects[target_test_subjects + target_val_subjects:]
             return sorted(train_subjects), sorted(val_subjects), sorted(test_subjects)
 
-        scores = [self.base_dataset.get_pathology_scalar_by_subject(sid) for sid in subject_ids]
-        if any(score is None for score in scores):
-            raise ValueError("finetune 模式下存在缺失 pathology_score 的被试，无法做 subject-level stratified split。")
-
-        score_values = [float(s) for s in scores if s is not None]
+        # 分层键**显式指定**（MDD 保持 HAMD），不随条件 fields[0] 变化
+        values = [self.base_dataset.stratify_value_by_subject(sid, stratify_key)
+                  for sid in subject_ids]
+        missing = [sid for sid, v in zip(subject_ids, values) if v is None]
+        score_map = {sid: float(v) for sid, v in zip(subject_ids, values) if v is not None}
+        score_values = sorted(score_map.values())
         unique_scores = len(set(score_values))
         if unique_scores <= 1:
             test_subjects = shuffled_subjects[:target_test_subjects]
@@ -1065,17 +1851,28 @@ class NeuroTwinDataLoader:
             train_subjects = shuffled_subjects[target_test_subjects + target_val_subjects:]
             return sorted(train_subjects), sorted(val_subjects), sorted(test_subjects)
 
-        # 分层划分
+        # 分层划分（分层键缺失者进预注册的「缺失桶」并按确定性顺序分配，不删人）
         n_bins = max(2, min(stratify_bins, unique_scores, total_subjects))
         score_series = pd.Series(score_values)
-        bin_ids = pd.qcut(score_series, q=n_bins, labels=False, duplicates='drop')
-        bin_list = [int(b) for b in bin_ids.tolist()]
+        bin_edges = pd.qcut(score_series, q=n_bins, labels=False, duplicates='drop')
+        bins_sorted = [int(b) for b in bin_edges.tolist()]
+        sid_sorted = [sid for sid, _ in sorted(score_map.items(),
+                                               key=lambda kv: float(kv[1]))]
+        sid_bin = dict(zip(sid_sorted, bins_sorted))
+        MISSING_BIN = -1
+        for sid in missing:
+            sid_bin[sid] = MISSING_BIN
+        if missing:
+            print(f"[split] 分层键 '{stratify_key}' 缺失 {len(missing)} 人 → 进入缺失桶 "
+                  f"({MISSING_BIN})，按确定性顺序分配，**不因人**（预注册规则）。")
 
         bin_to_subjects: Dict[int, List[str]] = defaultdict(list)
-        for sid, bid in zip(subject_ids, bin_list):
-            bin_to_subjects[bid].append(sid)
+        for sid in subject_ids:
+            bin_to_subjects[sid_bin[sid]].append(sid)
 
+        # 每个桶内部按 ID 排序后再用同一 seed 打乱：与 dict 迭代顺序无关，可复现
         for bid in bin_to_subjects:
+            bin_to_subjects[bid] = sorted(bin_to_subjects[bid])
             rng.shuffle(bin_to_subjects[bid])
 
         group_sizes = {bid: len(sids) for bid, sids in bin_to_subjects.items()}
@@ -1115,12 +1912,15 @@ class NeuroTwinDataLoader:
         rng.shuffle(test_subjects)
         return sorted(train_subjects), sorted(val_subjects), sorted(test_subjects)
 
-    def _split_indices_by_subject(self, mode: str, val_ratio: float, test_ratio: float, stratify_bins: int):
+    def _split_indices_by_subject(self, mode: str, val_ratio: float, test_ratio: float,
+                                  stratify_bins: int,
+                                  stratify_key: Optional[str] = None):
         train_subjects, val_subjects, test_subjects = self._split_subject_ids(
             mode=mode,
             val_ratio=val_ratio,
             test_ratio=test_ratio,
             stratify_bins=stratify_bins,
+            stratify_key=stratify_key,
         )
         train_indices = self._expand_subjects_to_sample_indices(train_subjects)
         val_indices = self._expand_subjects_to_sample_indices(val_subjects)
@@ -1184,6 +1984,12 @@ class NeuroTwinDataLoader:
         """
         if self.base_dataset.mode != 'finetune':
             return None
+        if self.base_dataset.condition_enabled:
+            # 条件通路使用 ConditionStats（train-only）；旧接口显式拒绝，
+            # 避免两条条件链路在同一实验里同时生效
+            raise RuntimeError(
+                '条件注入已开启（condition_group），旧 get_train_pathology_scores '
+                '接口不适用；请使用 get_condition_stats() / condition_matrix_for()。')
         rows = [
             vec for vec in (
                 self.base_dataset.get_pathology_vector_by_subject(sid)
@@ -1194,3 +2000,38 @@ class NeuroTwinDataLoader:
         if not rows:
             return None
         return np.stack(rows, axis=0).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # 条件注入访问器（train-only 统计量 / merged 审计 / 逐被试矩阵）
+    # ------------------------------------------------------------------
+    def get_condition_stats(self):
+        """返回 train-only 拟合的 :class:`ConditionStats`（未开启条件时为 None）。"""
+        return self.condition_stats
+
+    def get_condition_meta(self) -> dict:
+        """checkpoint 需要持久化的条件协议元数据（哈希、来源列、审计）。"""
+        ds = self.base_dataset
+        if not ds.condition_enabled:
+            return {'condition_enabled': False}
+        from utils.condition_schema import layout_hash
+        table = ds.condition_table
+        return {
+            'condition_enabled': True,
+            'condition_group': ds.condition_group,
+            'condition_file': table.file_name,
+            'merged_sha256': table.merged_sha256,
+            'fields': [s.name for s in table.specs],
+            'source_map': table.audit.alias_sources,
+            # 结构哈希（字段/顺序/类型/注册来源/词表）；解析到的实际列与文件哈希
+            # 属于溯源信息，单独记录并独立校验，避免两处哈希口径不一致
+            'layout_hash': layout_hash(table.specs, stats=self.condition_stats),
+            'resolved_source_map': table.audit.alias_sources,
+            'condition_audit': table.audit.to_dict(),
+            'n_missing_row_subjects': len(table.missing_row_subjects),
+            'split_file': self.split_file,
+            'stratify_key': self.stratify_key,
+        }
+
+    def condition_matrix_for(self, subject_ids: Sequence[str]) -> Dict[str, np.ndarray]:
+        """逐被试条件矩阵（z/code/mask/raw/subject_index），供评估与置换诊断用。"""
+        return self.base_dataset.condition_matrix_for(subject_ids)

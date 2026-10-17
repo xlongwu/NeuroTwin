@@ -63,6 +63,33 @@ def load_train_args(ckpt_path):
     return Namespace(**saved)
 
 
+def load_condition_bundle(ckpt_path):
+    """读取 checkpoint 的条件协议块（config / train-only 统计量 / 元数据）。
+
+    ``condition_config`` 与 ``condition_stats_payload`` 都**不是** argparse 参数，
+    而是训练期由数据拟合得到的结构输入；重建模型必须从这里取回，否则条件模块不会
+    存在、strict 加载会把条件键判为 unexpected（方案 §8：不靠运行时默认值猜测
+    mask/schema 语义）。
+    """
+    raw = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    cfg = raw.get('config') if isinstance(raw, dict) else None
+    cond = (cfg or {}).get('condition') if isinstance(cfg, dict) else None
+    if not isinstance(cond, dict) or not cond.get('config'):
+        return None
+    return {'config': cond['config'], 'stats': cond.get('stats'),
+            'meta': cond.get('meta') or {}, 'split_hash': cond.get('split_hash')}
+
+
+def condition_stats_from_bundle(bundle, group):
+    """把 checkpoint 的统计量快照还原成 ConditionStats（供 inherit 模式复用）。"""
+    from utils.condition_schema import ConditionStats, schema_for
+    if bundle is None or not bundle.get('stats'):
+        raise ValueError(
+            'checkpoint 未携带 config.condition.stats：无法按训练期的 train-only 统计量'
+            '重建条件编码。请用当前代码重新训练/保存。')
+    return ConditionStats.from_dict(schema_for(group), bundle['stats'])
+
+
 # NeuroTwinTFM 构造参数 → 训练快照键的别名（其余同名参数直接取自快照）
 _KWARG_ALIAS_TFM = {
     'features': 'num_rois',
@@ -76,8 +103,13 @@ _KWARG_ALIAS_TFM = {
 }
 
 
-def build_model_from_args(args, device):
-    """按 inspect.signature 自省从参数快照重建与训练一致的 NeuroTwinTFM。"""
+def build_model_from_args(args, device, condition_bundle=None):
+    """按 inspect.signature 自省从参数快照重建与训练一致的 NeuroTwinTFM。
+
+    条件注入的结构参数（``condition_config`` / ``condition_stats_payload``）不在
+    ``config.args`` 快照里，必须由 ``condition_bundle``（checkpoint 的
+    ``config.condition``）提供；缺一都会让 strict 加载立即失败而不是静默降级。
+    """
     model_arch = str(getattr(args, 'model_arch', 'tfm'))
     if model_arch != 'tfm':
         raise ValueError(
@@ -99,9 +131,28 @@ def build_model_from_args(args, device):
                 kwargs[name] = getattr(args, alias)
             elif param.default is inspect.Parameter.empty:
                 raise ValueError(f'参数快照缺少必填构造参数：{name}')
-    # 训练阶段的 mode 决定模型是否带病理条件模块（FiLM / 归一化器）：
-    # finetune 权重 → pretrain_mode=False，HC 预训练权重 → True
+    # 训练阶段的 mode 决定模型是否带 legacy 病理模块（FiLM / 归一化器）；
+    # 字段级条件注入在 HC 预训练同样允许，由快照的 condition_arm + bundle 决定
     kwargs['pretrain_mode'] = (str(getattr(args, 'mode', 'finetune')) == 'pretrain')
+    arm = str(getattr(args, 'condition_arm', 'none') or 'none')
+    if arm != 'none':
+        if condition_bundle is None:
+            raise ValueError(
+                f'训练快照 condition_arm={arm}，但 checkpoint 无 config.condition：'
+                '无法重建条件编码器。请用当前代码重新训练，或显式提供带条件元数据的权重。')
+        kwargs['condition_config'] = condition_bundle['config']
+        kwargs['condition_stats_payload'] = condition_bundle['stats']
+        for name in ('cond_inject', 'cond_backbone_scope', 'cond_norm_generator',
+                     'cond_norm_ident_dim', 'cond_lambda_os', 'cond_lambda_cpm',
+                     'cond_gate_residual', 'cond_gate_hidden'):
+            if hasattr(args, name):
+                kwargs[name] = getattr(args, name)
+    # ARCH_VERSION 6 溯源：旧 v5 checkpoint 的快照不含动态路线字段，按
+    # discrete / personalized=False / legacy_mask 默认重建（参数集合与 v5 一致，
+    # strict 加载可过；绝不把旧 one-step 头权重迁移到 ODE 头）
+    if any(not hasattr(args, n) for n in ('dynamics_mode', 'graph_source', 'personalized')):
+        log.info('[arch] 快照缺少动态路线字段（arch_version<6 旧 checkpoint），'
+                 '按 discrete/personalized=False/legacy_mask 重建')
     return NeuroTwinTFM(**kwargs).to(device)
 
 
@@ -146,6 +197,11 @@ def build_eval_loader(args, eval_split, refresh_split_manifest=False):
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
         eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
+        # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
+        num_rois=int(getattr(args, 'num_rois', 116)),
+        graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
+        calibration_length=int(getattr(args, 'calibration_length', 0) or 0),
+        control_manifest=(getattr(args, 'control_manifest', '') or None),
     )
     if eval_split == 'test':
         return loader.get_test(), loader.get_test_subjects()
@@ -243,11 +299,23 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
     spectral_tr = (getattr(args, 'eval_spectral_tr', 2.0) if spectral_tr is None
                    else spectral_tr)
 
-    model = build_model_from_args(args, device)
+    condition_bundle = load_condition_bundle(ckpt_path)
+    model = build_model_from_args(args, device, condition_bundle=condition_bundle)
     model, compat = load_checkpoint_compat(model, ckpt_path, device, strict=True)
     if compat.get('missing') or compat.get('unexpected'):
         raise RuntimeError(f'权重加载不完整：{compat}')
     n_params = int(sum(p.numel() for p in model.parameters()))
+    if getattr(model, 'conditioner', None) is not None:
+        # strict 重建后必须逐位复现训练期的条件编码：核对布局哈希，
+        # 同宽度但字段顺序变化也会在这里被拦下（验收 K/M）
+        saved_hash = (condition_bundle or {}).get('meta', {}).get('layout_hash')
+        now_hash = model.conditioner.layout()['layout_hash']
+        if saved_hash and saved_hash != now_hash:
+            raise RuntimeError(
+                f'条件布局不一致：checkpoint={saved_hash}，重建后={now_hash}。'
+                '字段顺序/来源列/类别词表任一变化都禁止复用旧权重。')
+        log.info('[condition] strict 重建完成 | arm=%s layout_hash=%s',
+                 model.conditioner.cfg.arm, now_hash)
 
     extra = {
         'conformal_calibration': {'available': False,
@@ -256,7 +324,22 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
     summary = {'n_params': n_params}
     for split in eval_splits:
         data_loader, subjects, loader = npe.build_next_point_loader(
-            args, split, refresh_split_manifest=refresh_split_manifest)
+            args, split, refresh_split_manifest=refresh_split_manifest,
+            condition_bundle=condition_bundle)
+        if condition_bundle is not None and loader.base_dataset.condition_enabled:
+            # 溯源校验：本次运行在 merged 中解析到的**实际列**必须与训练时一致，
+            # 否则说明表结构变化或来源被静默切换（禁止用其他列/文件补齐）
+            saved_src = (condition_bundle.get('meta') or {}).get('resolved_source_map')
+            now_src = loader.base_dataset.condition_table.audit.alias_sources
+            if saved_src and saved_src != now_src:
+                raise RuntimeError(
+                    f'条件来源列不一致：checkpoint={saved_src}，当前解析={now_src}。')
+            saved_sha = (condition_bundle.get('meta') or {}).get('merged_sha256')
+            now_sha = loader.base_dataset.condition_table.merged_sha256
+            if saved_sha and saved_sha != now_sha:
+                log.warning('[condition] merged 文件内容已变化（训练 %s… → 当前 %s…）；'
+                            '条件值可能与训练期不同，结果需按当前表重新解读',
+                            str(saved_sha)[:12], str(now_sha)[:12])
         log.info('[next_timepoint] split=%s | 被试数=%d | 任务数=%d',
                  split, len(subjects), len(data_loader.dataset))
         # AR(1) 只用 **train subjects** 拟合（禁止 val/test leakage）
@@ -323,6 +406,9 @@ def main():
     ap.add_argument('--splits', default='test',
                     help='评估划分（逗号分隔）；默认只评 test，需要 val 时显式传入')
     ap.add_argument('--seed', type=int, default=2024)
+    ap.add_argument('--device', default='',
+                    help='评估设备（如 cuda:1）。留空则自动选择可用 GPU/CPU。'
+                         '多卡并行搜索时由运行器显式传入，不依赖默认值。')
     ap.add_argument('--save_arrays', action='store_true',
                     help='保存预测数组 predictions_<split>.npz')
     ap.add_argument('--refresh_split_manifest', action='store_true',
@@ -351,8 +437,9 @@ def main():
     ap.add_argument('--feature_importance_fdr_alpha', type=float, default=0.05,
                     help='BH-FDR 显著脑区阈值（默认 0.05）')
     ns = ap.parse_args()
+    device = torch.device(ns.device) if ns.device else None
     summary = evaluate(ns.ckpt, ns.out_dir, tuple(ns.splits.split(',')),
-                       seed=ns.seed,
+                       seed=ns.seed, device=device,
                        save_arrays=ns.save_arrays,
                        refresh_split_manifest=ns.refresh_split_manifest,
                        eval_rollout=ns.rollout, eval_fc=ns.fc,

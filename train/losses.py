@@ -1,5 +1,7 @@
 # coding=utf-8
 """TFM 双目标损失与 SC 软先验图正则。"""
+import math
+
 import torch
 import torch.nn as nn
 
@@ -111,6 +113,23 @@ def _huber_elementwise(pred: torch.Tensor, target: torch.Tensor,
     return torch.where(e <= delta, 0.5 * e ** 2, delta * (e - 0.5 * delta))
 
 
+def compute_cpm_mask(controls: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
+    """从首次非零未来控制开始屏蔽 CPM 监督（方案 §9）。
+
+    controls:    [B, H, F] 新布局逐区间控制（u[t+h] 到达区间 (t+h-1, t+h]）
+    future_mask: [B, H]    各 horizon 是否有真值
+
+    active_h = 区间内存在任何非零驱动；cpm_mask = future_mask 且尚未遇到首个
+    受控区间。该 mask 只用于 CPM（无控制辅助预测），不能用于屏蔽受控动态监督
+    （动态监督仍用完整 future_mask）。
+    """
+    if controls.ndim != 3:
+        raise ValueError(f"controls 期望 [B,H,F]，收到 {tuple(controls.shape)}")
+    active_h = controls.abs().sum(-1) > 0                       # [B, H]
+    unseen = (active_h.cumsum(-1) == 0).to(controls.dtype)
+    return future_mask.to(controls.dtype) * unseen
+
+
 class TFMDualLoss(nn.Module):
     """One-Step + CPM 双目标损失（方案 §9 Dual Dynamics Objective / §20）。
 
@@ -118,7 +137,22 @@ class TFMDualLoss(nn.Module):
 
         L_one = Huber(x̂_(t+1), x_(t+1)) + λ_pcc·(1 − corr_ROI(x̂_(t+1), x_(t+1)))
         L_cpm = Σ_h w_h·Huber(x̂_(t+h), x_(t+h)) / Σ_h w_h,   w_h = γ^(h−1)·mask_h
-        L     = λ_one·L_one + λ_cpm·L_cpm
+        L     = λ_one·L_one + λ_cpm·L_cpm                     （weighting='fixed'）
+
+    weighting='uncertainty'（同方差不确定性加权，Kendall et al., CVPR 2018）：
+    每个启用（λ>0）的任务项 i ∈ {one, cpm, dynamics, variance} 配一个可学习
+    log 方差参数 s_i（ParameterDict ``log_s``；经 build_optimizer 进入
+    weight_decay=0 的 'loss_weight' 参数组），聚合改为::
+
+        L = Σ_i [ exp(−s_i)·L_i + s_i·valid_i ]
+
+    初始 s_i = −log λ_i，即**初始有效权重 exp(−s_i) 与固定权重方案完全一致**
+    （warm start：训练起点梯度平衡与历史配置相同，随后由不确定性机制自适应）。
+    valid_i 是该任务本 batch 的有效性指示（CPM=has_valid、dynamics=has_valid_dyn、
+    variance=var_w.sum()>0；one-step 恒有效）：任务整批被 mask 时整项为零、
+    **不加常数 s_i**（与「全 CPM mask 时损失项必须为零、不引入常数项」的约束
+    一致，也避免 s_i 在无监督信号时无界漂移）。各任务损失的内部结构
+    （Huber/PCC/γ 加权/mask 语义）不变，只替换跨任务聚合权重。
 
     设计说明（§20.1）：不使用数学等价的 ``L_abs + L_delta`` 双计项
     （prediction_target=delta 时二者数值重合），改为单一 Huber + spatial PCC；
@@ -128,7 +162,9 @@ class TFMDualLoss(nn.Module):
 
     def __init__(self, lambda_one: float = 1.0, lambda_cpm: float = 1.0,
                  lambda_pcc: float = 0.1, cpm_gamma: float = 1.0,
-                 huber_delta: float = 1.0, eps: float = 1e-8):
+                 huber_delta: float = 1.0, eps: float = 1e-8,
+                 lambda_dynamics: float = 0.5, lambda_variance: float = 0.05,
+                 weighting: str = 'fixed'):
         super().__init__()
         if lambda_one < 0 or lambda_cpm < 0 or lambda_pcc < 0:
             raise ValueError(
@@ -141,22 +177,86 @@ class TFMDualLoss(nn.Module):
                 f"cpm_gamma 应在 (0, 1]（1=均匀权重），收到 {cpm_gamma}")
         if huber_delta <= 0:
             raise ValueError(f"huber_delta 必须 > 0，收到 {huber_delta}")
+        if lambda_dynamics < 0 or lambda_variance < 0:
+            raise ValueError(
+                f"lambda_dynamics/lambda_variance 不允许负数："
+                f"{lambda_dynamics}/{lambda_variance}")
         self.lambda_one = float(lambda_one)
         self.lambda_cpm = float(lambda_cpm)
         self.lambda_pcc = float(lambda_pcc)
         self.cpm_gamma = float(cpm_gamma)
         self.huber_delta = float(huber_delta)
         self.eps = float(eps)
+        self.lambda_dynamics = float(lambda_dynamics)
+        self.lambda_variance = float(lambda_variance)
+        if weighting not in ('fixed', 'uncertainty'):
+            raise ValueError(
+                f"weighting 只支持 'fixed' / 'uncertainty'，收到 {weighting!r}")
+        self.weighting = str(weighting)
+        # 同方差不确定性加权的可学习 log 方差（公式见类 docstring）。s_i =
+        # -log λ_i 使初始有效权重 exp(-s_i) 精确等于原固定权重；λ=0 的任务项
+        # 整体禁用（不建参数，前向也不进总和），避免 -log(0) 与无意义漂移。
+        self.log_s = nn.ParameterDict()
+        if weighting == 'uncertainty':
+            for name, lam in (('one', self.lambda_one),
+                              ('cpm', self.lambda_cpm),
+                              ('dynamics', self.lambda_dynamics),
+                              ('variance', self.lambda_variance)):
+                if lam > 0:
+                    self.log_s[name] = nn.Parameter(
+                        torch.tensor(-math.log(lam), dtype=torch.float32))
+
+    def _unc_weighted(self, name: str, task_loss: torch.Tensor,
+                      valid: torch.Tensor = None) -> torch.Tensor:
+        """同方差不确定性加权：exp(-s_i)·L_i + s_i（valid 给出时乘有效性指示，
+        任务整批无效时整项为零、不引入常数项）。"""
+        s = self.log_s[name]
+        weighted = torch.exp(-s) * task_loss + s
+        if valid is None:
+            return weighted
+        return valid.to(weighted.dtype) * weighted
+
+    def get_loss_weights(self) -> dict:
+        """当前各任务项的有效权重（日志 / checkpoint 元数据用）。
+
+        返回 ``{'mode': ..., '<task>': {'weight': float, 'log_s': float|None}}``，
+        只包含启用（λ>0）的任务项；'uncertainty' 模式下 weight=exp(-log_s)。
+        """
+        out = {'mode': self.weighting}
+        for name in ('one', 'cpm', 'dynamics', 'variance'):
+            lam = float(getattr(self, f'lambda_{name}'))
+            if lam <= 0:
+                continue
+            if self.weighting == 'uncertainty':
+                s = self.log_s[name]
+                out[name] = {'weight': float(torch.exp(-s.detach())),
+                             'log_s': float(s.detach())}
+            else:
+                out[name] = {'weight': lam, 'log_s': None}
+        return out
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 cpm_pred: torch.Tensor, cpm_target: torch.Tensor,
-                cpm_mask: torch.Tensor = None) -> tuple:
+                cpm_mask: torch.Tensor = None,
+                dynamics_pred: torch.Tensor = None,
+                dynamics_target: torch.Tensor = None,
+                dynamics_mask: torch.Tensor = None,
+                dynamics_mean_norm: torch.Tensor = None,
+                dynamics_logvar_norm: torch.Tensor = None,
+                dynamics_target_norm: torch.Tensor = None) -> tuple:
         """
         Args:
             pred/target: [B, F, 1, 1] one-step 预测与真值（原始空间）
             cpm_pred:    [B, F, H]   CPM 全 horizon 预测（原始空间）
             cpm_target:  [B, F, H]   t+1..t+H 真值（原始空间，序列末尾截断补零）
-            cpm_mask:    [B, H]      各 horizon 是否有真值（None = 全有效）
+            cpm_mask:    [B, H]      各 horizon 是否有真值（None = 全有效）；
+                                     graph_ode 路线传入 compute_cpm_mask 的结果
+            ---- 以下为 graph_ode 动态可选输入（discrete 路线不传，行为不变）----
+            dynamics_pred/target:  [B, F, H] 动态轨迹预测与真值（数据尺度）
+            dynamics_mask:         [B, H]    future_mask（**不是** cpm_mask）
+            dynamics_mean_norm:    [B, F, H] 归一化空间动态均值（方差损失用，内部 detach）
+            dynamics_logvar_norm:  [B, F, H] 归一化空间 logvar（仅更新 VarianceHead）
+            dynamics_target_norm:  [B, F, H] 用当前历史 norm_stats 归一化的未来真值
         Returns:
             (total, stats dict)
         """
@@ -182,7 +282,11 @@ class TFMDualLoss(nn.Module):
                                       self.huber_delta).mean()
         corr_one = spatial_pcc(pred, target, self.eps).mean()      # [1] → 标量
         loss_one_pcc = 1.0 - corr_one
-        total = self.lambda_one * (loss_one + self.lambda_pcc * loss_one_pcc)
+        L_one_comb = loss_one + self.lambda_pcc * loss_one_pcc
+        if self.weighting == 'uncertainty' and 'one' in self.log_s:
+            total = self._unc_weighted('one', L_one_comb)
+        else:
+            total = self.lambda_one * L_one_comb
         stats['loss_one'] = loss_one.detach()
         stats['loss_one_pcc'] = loss_one_pcc.detach()
         stats['pcc_one'] = corr_one.detach()
@@ -206,6 +310,9 @@ class TFMDualLoss(nn.Module):
             # 逐元素 Huber [B,F,H] × 逐 (样本,horizon) 权重
             hub = _huber_elementwise(cpm_pred, cpm_target, self.huber_delta)
             w3 = w.view(w.shape[0], 1, h)
+            # CPM 有效权重全零时（受控区间从首个 horizon 起全部屏蔽），Huber 和
+            # PCC **整项**都为零：不能留下 1-corr 常数项把梯度推向退化解。
+            has_valid = (w.sum() > 0).to(cpm_pred.dtype)
             loss_cpm = (hub * w3).sum() / (w3.sum().clamp_min(self.eps)
                                            * cpm_pred.shape[1])
             # 逐 horizon 明细 + spatial PCC（远期 horizon 的不确定性来源之一）
@@ -220,12 +327,115 @@ class TFMDualLoss(nn.Module):
                     / (n_h * cpm_pred.shape[1])).detach()
                 stats[f'pcc_cpm_h{hi + 1}'] = (
                     (corr_cpm[:, hi] * w[:, hi]).sum() / n_h).detach()
-            loss_cpm_pcc = 1.0 - (corr_cpm * w).sum() / w.sum().clamp_min(self.eps)
-            total = total + self.lambda_cpm * (loss_cpm + self.lambda_pcc * loss_cpm_pcc)
-            stats['loss_cpm'] = loss_cpm.detach()
+            loss_cpm_pcc = has_valid * (
+                1.0 - (corr_cpm * w).sum() / w.sum().clamp_min(self.eps))
+            L_cpm_comb = loss_cpm + self.lambda_pcc * loss_cpm_pcc
+            if self.weighting == 'uncertainty' and 'cpm' in self.log_s:
+                # has_valid 同时门控 exp(-s)·L 与 s：整批被 mask 时不加常数项
+                total = total + self._unc_weighted('cpm', L_cpm_comb,
+                                                   valid=has_valid)
+            else:
+                total = total + self.lambda_cpm * has_valid * L_cpm_comb
+            stats['loss_cpm'] = (has_valid * loss_cpm).detach()
             stats['loss_cpm_pcc'] = loss_cpm_pcc.detach()
         else:
             stats['loss_cpm'] = torch.zeros((), device=pred.device)
             stats['loss_cpm_pcc'] = torch.zeros((), device=pred.device)
+
+        # ---- 动态多步损失（graph_ode；h=2..H 的 masked Huber + PCC）----
+        # 第一帧已有 one-step 主监督，不重复加入多步项；没有有效 h2..H 时为零。
+        if dynamics_pred is not None:
+            if dynamics_pred.shape != dynamics_target.shape:
+                raise ValueError(
+                    f"动态 pred/target 形状不一致：{tuple(dynamics_pred.shape)} vs "
+                    f"{tuple(dynamics_target.shape)}")
+            if dynamics_pred.ndim != 3:
+                raise ValueError(
+                    f"动态 pred 期望 [B,F,H]，收到 {tuple(dynamics_pred.shape)}")
+            if dynamics_mean_norm is not None and dynamics_mean_norm.shape[:3] != dynamics_pred.shape[:3]:
+                raise ValueError(
+                    f"动态均值归一化形状 {tuple(dynamics_mean_norm.shape)} 与 "
+                    f"[B,F,{dynamics_pred.shape[2]}] 不一致")
+            f_dim = dynamics_pred.shape[1]
+            h_dyn = dynamics_pred.shape[2]
+            dyn_w = dynamics_mask.to(dynamics_pred.dtype) \
+                if dynamics_mask is not None \
+                else torch.ones(dynamics_pred.shape[0], h_dyn,
+                                device=dynamics_pred.device,
+                                dtype=dynamics_pred.dtype)
+            if tuple(dyn_w.shape) != (dynamics_pred.shape[0], h_dyn):
+                raise ValueError(
+                    f"dynamics_mask 形状 {tuple(dyn_w.shape)} 与 "
+                    f"[B,{h_dyn}] 不一致")
+            if h_dyn > 1:
+                mask2 = dyn_w[:, 1:]                                   # [B, H-1]
+                w2 = mask2.view(dynamics_pred.shape[0], 1, h_dyn - 1)
+                hub_dyn = _huber_elementwise(dynamics_pred[:, :, 1:],
+                                             dynamics_target[:, :, 1:],
+                                             self.huber_delta)
+                loss_dyn = (hub_dyn * w2).sum() / (
+                    w2.sum().clamp_min(self.eps) * f_dim)
+                corr_dyn = spatial_pcc(dynamics_pred[:, :, 1:].unsqueeze(-1),
+                                       dynamics_target[:, :, 1:].unsqueeze(-1),
+                                       self.eps)                       # [B, H-1]
+                has_valid_dyn = (w2.sum() > 0).to(dynamics_pred.dtype)
+                loss_dyn_pcc = has_valid_dyn * (
+                    1.0 - (corr_dyn * mask2).sum()
+                    / mask2.sum().clamp_min(self.eps))
+                L_dyn_comb = loss_dyn + self.lambda_pcc * loss_dyn_pcc
+                loss_dynamics = has_valid_dyn * L_dyn_comb
+            else:
+                has_valid_dyn = dynamics_pred.new_zeros(())
+                loss_dynamics = has_valid_dyn
+                loss_dyn_pcc = has_valid_dyn
+                L_dyn_comb = None
+            if (self.weighting == 'uncertainty' and 'dynamics' in self.log_s
+                    and L_dyn_comb is not None):
+                # has_valid_dyn 同时门控 exp(-s)·L 与 s（无常数项泄漏）
+                total = total + self._unc_weighted('dynamics', L_dyn_comb,
+                                                   valid=has_valid_dyn)
+            else:
+                total = total + self.lambda_dynamics * loss_dynamics
+            stats['loss_dynamics'] = loss_dynamics.detach()
+            stats['loss_dynamics_pcc'] = loss_dyn_pcc.detach()
+        else:
+            stats['loss_dynamics'] = torch.zeros((), device=pred.device)
+            stats['loss_dynamics_pcc'] = torch.zeros((), device=pred.device)
+
+        # ---- 方差损失（h=1..H 对角高斯 NLL；只更新 VarianceHead）----
+        # 均值与归一化目标 detach；logvar 保留梯度（VarianceHead 输入 z 轨迹已在
+        # 模型侧 detach，本项不会影响共享动力学参数）。
+        if dynamics_logvar_norm is not None:
+            if dynamics_mean_norm is None or dynamics_target_norm is None:
+                raise ValueError(
+                    "传入 dynamics_logvar_norm 时必须同时提供 dynamics_mean_norm "
+                    "与 dynamics_target_norm（归一化空间）")
+            mu = dynamics_mean_norm.detach()
+            tgt = dynamics_target_norm.detach()
+            logvar = dynamics_logvar_norm
+            if logvar.shape != mu.shape or tgt.shape != mu.shape:
+                raise ValueError(
+                    f"方差损失输入形状不一致：logvar {tuple(logvar.shape)}, "
+                    f"mu {tuple(mu.shape)}, target {tuple(tgt.shape)}")
+            var_w = dynamics_mask.to(logvar.dtype) \
+                if dynamics_mask is not None \
+                else torch.ones_like(logvar[:, 0, :])
+            if tuple(var_w.shape) != logvar.shape[:1] + logvar.shape[2:]:
+                raise ValueError(
+                    f"dynamics_mask 形状 {tuple(var_w.shape)} 与 logvar "
+                    f"[B,F,{logvar.shape[2]}] 的 [B,H] 不一致")
+            nll = 0.5 * (logvar + (-logvar).exp() * (mu - tgt) ** 2)   # [B,F,H]
+            loss_var = (nll * var_w.unsqueeze(1)).sum() / (
+                var_w.sum().clamp_min(self.eps) * logvar.shape[1])
+            if self.weighting == 'uncertainty' and 'variance' in self.log_s:
+                # 全 mask 时 loss_var 恒为 0，valid 指示同时压掉 s 常数项
+                valid_var = (var_w.sum() > 0).to(logvar.dtype)
+                total = total + self._unc_weighted('variance', loss_var,
+                                                   valid=valid_var)
+            else:
+                total = total + self.lambda_variance * loss_var
+            stats['loss_variance'] = loss_var.detach()
+        else:
+            stats['loss_variance'] = torch.zeros((), device=pred.device)
         stats['loss_total'] = total.detach()
         return total, stats

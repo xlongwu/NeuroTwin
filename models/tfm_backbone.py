@@ -242,7 +242,15 @@ class TFMEncoderBlock(nn.Module):
         h ← h + Dropout(FFN(RMSNorm(h)))
 
     FFN 为 ``dim → ff_dim → dim`` 的 GELU 两层 MLP（ff_dim 默认 4×dim）。
+
+    条件注入（v1 revised §7）：可选地对本 block 的三个**已有 RMSNorm** 输出做
+    :math:`(1+\\gamma(c))\\odot\\operatorname{RMSNorm}(h)+\\beta(c)` 调制
+    （条件 RMSNorm / AdaRMSNorm）。``cond_mods`` 为 ``None`` 时行为与无条件完全
+    一致；调制生成器由模型层的 :class:`models.conditioning.ConditionNormGenerator`
+    持有，本模块只消费 ``(scale, shift)``，因此不改变归一化类型（不做 LayerNorm）。
     """
+
+    NORM_SLOTS = ('temporal', 'roi', 'ffn')
 
     def __init__(self, dim: int, num_heads: int = 4, ff_ratio: int = 4,
                  dropout: float = 0.1):
@@ -258,11 +266,41 @@ class TFMEncoderBlock(nn.Module):
             nn.Linear(ff_dim, dim))
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        """x: [B,F,P,D]，adj: [B,F,F] A_eff → [B,F,P,D]。"""
-        h = x + self.dropout(self.attn_temporal(self.norm_temporal(x)))
-        h = h + self.dropout(self.attn_roi(self.norm_roi(h), adj))
-        h = h + self.dropout(self.ffn(self.norm_ffn(h)))
+    @staticmethod
+    def _modulate(normed: torch.Tensor, mod) -> torch.Tensor:
+        """``mod=(scale, shift)``，各为 ``[B, 1, 1, D]``（token/ROI 维广播）。"""
+        scale, shift = mod
+        return normed * (1.0 + scale) + shift
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor,
+                cond_mods: Optional[Tuple[Optional[tuple], ...]] = None) -> torch.Tensor:
+        """x: [B,F,P,D]，adj: [B,F,F] A_eff → [B,F,P,D]。
+
+        Args:
+            cond_mods: 长度为 3 的元组，依次对应 temporal / roi / ffn 三个 norm
+                位置；每项为 ``(scale, shift)`` 或 ``None``（该位置不调制）。
+                ``None`` 表示整个 block 无条件注入（与历史行为逐位一致）。
+        """
+        if cond_mods is None:
+            m_t = m_r = m_f = None
+        else:
+            if len(cond_mods) != len(self.NORM_SLOTS):
+                raise ValueError(
+                    f'cond_mods 长度 {len(cond_mods)} 与 norm 槽位数 '
+                    f'{len(self.NORM_SLOTS)} 不一致')
+            m_t, m_r, m_f = cond_mods
+        n_t = self.norm_temporal(x)
+        if m_t is not None:
+            n_t = self._modulate(n_t, m_t)
+        h = x + self.dropout(self.attn_temporal(n_t))
+        n_r = self.norm_roi(h)
+        if m_r is not None:
+            n_r = self._modulate(n_r, m_r)
+        h = h + self.dropout(self.attn_roi(n_r, adj))
+        n_f = self.norm_ffn(h)
+        if m_f is not None:
+            n_f = self._modulate(n_f, m_f)
+        h = h + self.dropout(self.ffn(n_f))
         return h
 
 

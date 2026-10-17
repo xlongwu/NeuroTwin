@@ -118,3 +118,132 @@ def test_gradient_flow():
     total.backward()
     assert one_pred.grad is not None and cpm_pred.grad is not None
     assert torch.isfinite(one_pred.grad).all() and torch.isfinite(cpm_pred.grad).all()
+
+
+# ═══════════════ 同方差不确定性加权（weighting='uncertainty'） ═══════════════
+
+def _dyn_inputs(b=2, f=3, h=4, seed=7):
+    """构造 dynamics/variance 项的全部输入（mask 末步无效，覆盖部分有效路径）。"""
+    torch.manual_seed(seed)
+    dyn_pred = torch.randn(b, f, h)
+    dyn_tgt = torch.randn(b, f, h)
+    mask = torch.ones(b, h)
+    mask[:, -1] = 0.0
+    mean_norm = torch.randn(b, f, h)
+    logvar_norm = torch.randn(b, f, h) * 0.1
+    tgt_norm = torch.randn(b, f, h)
+    return dyn_pred, dyn_tgt, mask, mean_norm, logvar_norm, tgt_norm
+
+
+def test_uncertainty_init_weights_equal_lambdas():
+    """warm start：初始有效权重 exp(-log_s) 必须精确等于对应 λ。"""
+    crit = TFMDualLoss(lambda_dynamics=0.5, lambda_variance=0.05,
+                       weighting='uncertainty')
+    lw = crit.get_loss_weights()
+    assert lw['mode'] == 'uncertainty'
+    assert lw['one']['weight'] == pytest.approx(1.0)
+    assert lw['dynamics']['weight'] == pytest.approx(0.5)
+    assert lw['dynamics']['log_s'] == pytest.approx(-math.log(0.5))
+    assert lw['variance']['log_s'] == pytest.approx(-math.log(0.05))
+    # log 方差是可学习参数（进 named_parameters，可被优化器收集）
+    assert any('log_s' in n for n in dict(crit.named_parameters()))
+    assert all(p.requires_grad for p in crit.parameters())
+
+
+def test_uncertainty_total_equals_fixed_plus_log_s_constants():
+    """总损失 = Σ exp(-log_s_i)·L_i + log_s_i；初始权重=λ → 与 fixed 差=Σ s_i。"""
+    torch.manual_seed(8)
+    b, f, h = 2, 3, 4
+    pred, target = torch.randn(b, f, 1, 1), torch.randn(b, f, 1, 1)
+    cpm_pred, cpm_tgt = torch.randn(b, f, h), torch.randn(b, f, h)
+    (dyn_pred, dyn_tgt, mask, mean_norm,
+     logvar_norm, tgt_norm) = _dyn_inputs(b, f, h)
+    kw = dict(lambda_one=1.0, lambda_cpm=1.0, lambda_pcc=0.0,
+              lambda_dynamics=0.5, lambda_variance=0.05)
+    dyn_kwargs = dict(dynamics_pred=dyn_pred, dynamics_target=dyn_tgt,
+                      dynamics_mask=mask, dynamics_mean_norm=mean_norm,
+                      dynamics_logvar_norm=logvar_norm,
+                      dynamics_target_norm=tgt_norm)
+    fixed_total, _ = TFMDualLoss(weighting='fixed', **kw)(
+        pred, target, cpm_pred, cpm_tgt, **dyn_kwargs)
+    unc_total, _ = TFMDualLoss(weighting='uncertainty', **kw)(
+        pred, target, cpm_pred, cpm_tgt, **dyn_kwargs)
+    s_dyn, s_var = -math.log(0.5), -math.log(0.05)
+    assert float(unc_total) == pytest.approx(
+        float(fixed_total) + s_dyn + s_var, rel=1e-5)
+
+
+def test_uncertainty_log_s_receives_gradient_and_steps():
+    """log_s 必须可训练：有有限梯度，且优化器步进后取值变化。"""
+    torch.manual_seed(9)
+    b, f = 2, 3
+    # 只启用 one/cpm 两项，保证 forward 覆盖全部已建参数
+    crit = TFMDualLoss(lambda_pcc=0.0, lambda_dynamics=0.0,
+                       lambda_variance=0.0, weighting='uncertainty')
+    opt = torch.optim.AdamW(crit.parameters(), lr=0.1, weight_decay=0.0)
+    s_before = {k: float(v) for k, v in crit.log_s.items()}
+    for _ in range(3):
+        opt.zero_grad()
+        total, _ = crit(torch.randn(b, f, 1, 1), torch.randn(b, f, 1, 1),
+                        torch.randn(b, f, 2), torch.randn(b, f, 2))
+        total.backward()
+        assert all(p.grad is not None and torch.isfinite(p.grad).all()
+                   for p in crit.log_s.parameters())
+        opt.step()
+    assert any(float(crit.log_s[k]) != s_before[k] for k in s_before)
+
+
+def test_uncertainty_disabled_task_excluded():
+    """λ=0 的任务项不建参数、不产生常数项（与 fixed 的禁用语义一致）。"""
+    crit = TFMDualLoss(lambda_one=0.0, lambda_cpm=1.0, lambda_pcc=0.0,
+                       lambda_dynamics=0.0, lambda_variance=0.0,
+                       weighting='uncertainty')
+    assert 'one' not in crit.log_s and 'cpm' in crit.log_s
+    assert 'dynamics' not in crit.log_s and 'variance' not in crit.log_s
+    total, _ = crit(torch.zeros(2, 3, 1, 1), torch.zeros(2, 3, 1, 1),
+                    torch.zeros(2, 3, 2), torch.zeros(2, 3, 2))
+    # 完美预测且 s_cpm=-log(1)=0 → 总损失为 0（无常数偏移）
+    assert float(total) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_uncertainty_all_masked_cpm_adds_no_constant():
+    """CPM 整批被 mask 时整项为零（含 log_s 常数项），与「无常数项」约束一致。"""
+    b, f, h = 2, 3, 3
+    zero_pred = torch.zeros(b, f, 1, 1)
+    y = torch.randn(b, f, 1, 1)
+    cpm_pred, cpm_tgt = torch.zeros(b, f, h), torch.randn(b, f, h)
+    kw = dict(lambda_one=0.0, lambda_cpm=1.0, lambda_pcc=0.0)
+    fixed_total, _ = TFMDualLoss(weighting='fixed', **kw)(
+        zero_pred, y, cpm_pred, cpm_tgt, cpm_mask=torch.zeros(b, h))
+    unc_total, _ = TFMDualLoss(weighting='uncertainty', **kw)(
+        zero_pred, y, cpm_pred, cpm_tgt, cpm_mask=torch.zeros(b, h))
+    assert float(fixed_total) == pytest.approx(0.0, abs=1e-7)
+    assert float(unc_total) == pytest.approx(float(fixed_total), abs=1e-7)
+
+
+def test_uncertainty_invalid_weighting_raises():
+    with pytest.raises(ValueError):
+        TFMDualLoss(weighting='naive')
+
+
+def test_optimizer_collects_log_s_into_loss_weight_group():
+    """build_optimizer 必须把 log_s 收进 loss_weight 组（wd=0、独立 lr 比例）。"""
+    from types import SimpleNamespace
+
+    from train.optim import build_optimizer
+    tiny = torch.nn.Linear(2, 2)
+    args = SimpleNamespace(mode='pretrain', lr_peak=1e-4, loss_lr_scale=0.5,
+                           weight_decay=0.01)
+    crit = TFMDualLoss(weighting='uncertainty')
+    opt = build_optimizer(tiny, crit, args)
+    groups = [g for g in opt.param_groups if g.get('name') == 'loss_weight']
+    assert len(groups) == 1
+    g = groups[0]
+    assert g['weight_decay'] == 0.0
+    assert g['lr'] == pytest.approx(1e-4 * 0.5)
+    assert len(g['params']) == len(list(crit.log_s.parameters()))
+    # fixed 模式无参数 → 不应产生空的 loss_weight 组
+    crit_fixed = TFMDualLoss(weighting='fixed')
+    opt_fixed = build_optimizer(tiny, crit_fixed, args)
+    assert not [g for g in opt_fixed.param_groups
+                if g.get('name') == 'loss_weight']
