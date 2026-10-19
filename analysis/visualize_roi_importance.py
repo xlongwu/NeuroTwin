@@ -8,10 +8,12 @@ ROI 重要性可视化（next_timepoint 口径）
 """
 import argparse
 import json
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+
 import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 matplotlib.use('Agg')
 from pathlib import Path
 
@@ -118,10 +120,9 @@ def plot_roi_importance_bar(df_sorted, output_path, top_n=30):
     colors = [NETWORK_COLORS.get(net, '#999999') for net in top_df['Network']]
     hatches = ['///' if sig else '' for sig in top_df['Significant']]
 
-    bars = ax.barh(range(top_n), top_df['Importance'].values, color=colors,
+    ax.barh(range(top_n), top_df['Importance'].values, color=colors,
                    edgecolor='black', linewidth=0.5, hatch=hatches)
     
-    # 设置y轴标签
     y_labels = [f"{row['AAL_Name'][:30]}" for _, row in top_df.iterrows()]
     ax.set_yticks(range(top_n))
     ax.set_yticklabels(y_labels, fontsize=9)
@@ -164,7 +165,7 @@ def plot_network_importance(df, output_path):
     
     # 左图：平均重要性
     colors = [NETWORK_COLORS.get(net, '#999999') for net in network_stats['Network']]
-    bars1 = ax1.bar(range(len(network_stats)), network_stats['Mean_Importance'], 
+    ax1.bar(range(len(network_stats)), network_stats['Mean_Importance'],
                     color=colors, edgecolor='black', linewidth=0.5, yerr=network_stats['Std_Importance'],
                     capsize=5, alpha=0.8)
     
@@ -175,13 +176,12 @@ def plot_network_importance(df, output_path):
     ax1.set_title('Mean ROI Importance by Brain Network', fontsize=13, fontweight='bold')
     ax1.grid(axis='y', alpha=0.3)
     
-    # 添加数值标签
     for i, (idx, row) in enumerate(network_stats.iterrows()):
         ax1.text(i, row['Mean_Importance'] + row['Std_Importance'] + 0.0001, 
                 f'{row["Mean_Importance"]:.4f}', ha='center', fontsize=9)
     
     # 右图：ROI数量分布
-    bars2 = ax2.bar(range(len(network_stats)), network_stats['Count'], 
+    ax2.bar(range(len(network_stats)), network_stats['Count'],
                     color=colors, edgecolor='black', linewidth=0.5, alpha=0.8)
     
     ax2.set_xticks(range(len(network_stats)))
@@ -190,7 +190,6 @@ def plot_network_importance(df, output_path):
     ax2.set_title('ROI Count by Brain Network', fontsize=13, fontweight='bold')
     ax2.grid(axis='y', alpha=0.3)
     
-    # 添加数值标签
     for i, (idx, row) in enumerate(network_stats.iterrows()):
         ax2.text(i, row['Count'] + 0.5, str(int(row['Count'])), ha='center', fontsize=10)
     
@@ -208,12 +207,10 @@ def plot_importance_heatmap(df, output_path):
     
     fig, ax = plt.subplots(figsize=(12, 14))
     
-    # 创建热力图数据
     importance_values = df_sorted_by_network['Importance'].values.reshape(-1, 1)
     
     im = ax.imshow(importance_values, cmap='YlOrRd', aspect='auto')
     
-    # 设置y轴标签
     y_labels = [f"{row['AAL_Name'][:25]} ({row['Network']})" 
                 for _, row in df_sorted_by_network.iterrows()]
     ax.set_yticks(range(len(df_sorted_by_network)))
@@ -230,11 +227,9 @@ def plot_importance_heatmap(df, output_path):
     ax.set_xticks([])
     ax.set_title('ROI Importance Heatmap (Grouped by Network)', fontsize=14, fontweight='bold', pad=20)
     
-    # 添加colorbar
     cbar = plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.02, aspect=50)
     cbar.set_label('Importance Score', fontsize=11)
     
-    # 添加网络标签
     network_positions = df_sorted_by_network.groupby('Network').apply(lambda x: x.index[0] + len(x)/2 - 0.5)
     for network, pos in network_positions.items():
         ax.text(1.02, pos, network, transform=ax.get_yaxis_transform(),
@@ -348,11 +343,9 @@ def main(args):
     print("ROI重要性可视化")
     print("="*60)
 
-    # 加载数据
     print("\n1. 加载数据...")
     importance_data, aal_df = load_data(args)
 
-    # 准备数据
     print("2. 准备数据...")
     df, df_sorted = prepare_data(importance_data, aal_df)
 
@@ -360,7 +353,6 @@ def main(args):
     output_dir = args.output_dir or str(Path(args.input_json).parent / 'visualizations')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
-    # 生成可视化
     print("\n3. 生成可视化...")
     
     print("   - Top 30 ROI重要性条形图...")
@@ -383,16 +375,16 @@ def main(args):
     print("关键发现")
     print("="*60)
     
-    print(f"\n总体统计:")
+    print("\n总体统计:")
     print(f"  - 平均重要性: {summary['overall_stats']['mean_importance']:.4f}")
     print(f"  - 重要性标准差: {summary['overall_stats']['std_importance']:.4f}")
     print(f"  - 重要性范围: [{summary['overall_stats']['min_importance']:.4f}, {summary['overall_stats']['max_importance']:.4f}]")
     
-    print(f"\nTop 5 最重要ROI:")
+    print("\nTop 5 最重要ROI:")
     for i, roi in enumerate(summary['top_20_roi'][:5], 1):
         print(f"  {i}. {roi['AAL_Name']} ({roi['Network']}): {roi['Importance']:.4f}")
     
-    print(f"\n脑网络重要性排名:")
+    print("\n脑网络重要性排名:")
     for net in summary['network_summary']:
         print(f"  - {net['Network']}: {net['Mean_Importance']:.4f} (±{net['Std_Importance']:.4f}, n={int(net['Count'])})")
     

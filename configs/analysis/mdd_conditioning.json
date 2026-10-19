@@ -1,0 +1,9 @@
+{
+  "run_name": "mdd_conditioning_study",
+  "source": "native",
+  "checkpoint": "checkpoints/neurotwin_tfm_finetune/finetuned_best.pt",
+  "data_root": "data",
+  "cohorts": ["MDD"],
+  "max_subjects": {"train": 24, "val": 6, "test": 24},
+  "explain_mode": "ode_integration"
+}

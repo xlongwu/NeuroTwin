@@ -84,7 +84,6 @@ def test_cpm_mask_excludes_horizon():
 
 def test_config_validation():
     y = torch.zeros(2, 4)
-    yt = torch.zeros(2, 4, 2)
     with pytest.raises(ValueError):
         TFMDualLoss(lambda_one=0.0, lambda_cpm=0.0)
     with pytest.raises(ValueError):

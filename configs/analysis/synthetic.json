@@ -1,0 +1,9 @@
+{
+  "run_name": "synthetic_smoke",
+  "source": "synthetic",
+  "prediction_modes": ["autoregressive"],
+  "bootstrap_repeats": 40,
+  "dynamics_horizon": 64,
+  "ig_steps": 0,
+  "parameter_randomization": false
+}

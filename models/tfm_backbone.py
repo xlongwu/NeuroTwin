@@ -1,44 +1,43 @@
-# coding=utf-8
 """NeuroTwin-TFM 主干模块（借鉴 TimesFM-3 的多变量时序设计，方案 §4–§7 / §30 V1）。
 
-核心思想（方案 §3）：TimesFM 的 Variate ⟺ 脑 ROI，Temporal Attention ⟺ ROI 内时间
+核心思想：TimesFM 的 Variate ⟺ 脑 ROI，Temporal Attention ⟺ ROI 内时间
 动力学，Variate Attention ⟺ ROI 间脑网络交互。本文件实现四个构件：
 
 - :class:`TemporalPatchEmbed`      [B,F,K] → [B,F,P,D]：时间轴 patch 化 + ROI / 时间
   位置嵌入（§4.2，patch 长度 p∈{1,4,8} 消融，不使用 TimesFM 的 p=32——K≤64 下
   temporal token 数会退化到 2，见方案 §4.3 / §26.2）；
 - :class:`CausalTemporalAttention` 逐 ROI 沿 patch 轴的 causal multi-head attention
-  （§5：当前 patch 只能访问 ≤ 当前 patch，与 forecasting 语义一致）；
+  ；
 - :class:`SCGuidedROIAttention`    沿 ROI 轴的 attention，加性结构先验偏置
-  ``β·log(ε + A_eff_ij)``（§6.2：用 SC 偏置 attention，而不是用 SC 禁止 attention）；
+  ``β·log(ε + A_eff_ij)``；
 - :class:`TFMEncoderBlock`         RMSNorm → Causal Temporal Attention → Residual →
-  RMSNorm → SC-guided ROI Attention → Residual → RMSNorm → FFN → Residual（§6.4），
+  RMSNorm → SC-guided ROI Attention → Residual → RMSNorm → FFN → Residual，
   堆叠 N=4~6 层。
 
-SC 注入约定（§7）：``A_eff`` 由模型级 SoftAnatomicalPrior **一次计算、全层共享**，
+SC 注入约定：``A_eff`` 由模型级 SoftAnatomicalPrior **一次计算、全层共享**，
 层内只有轻量可学习偏置标量 β，不再每层重建完整 SC pipeline。
 
 变长 context 约定：同一 batch 内 context 长度 K 一致（按 K 分桶）；K 不是 p 的整数
 倍时在**序列开头**补零（归一化空间中 0 ≈ 均值，属中性填充），``P = ceil(K/p)``；
 位置嵌入按前缀切片（第 i 个 patch 恒对应嵌入表的第 i 个位置）。
 """
+
 import math
 from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
-    """Root-Mean-Square 归一化（方案 §6.4 的 Block 使用 RMSNorm 而非 LayerNorm）。
+    """Root-Mean-Square 归一化。
 
     ``y = x / sqrt(mean(x²) + eps) * weight``（无 bias）。输入最后一维宽度可小于
     ``weight`` 的建模宽度（变长场景不需要——RMSNorm 按最后一维统计，与宽度无关，
     但 affine 参数按宽度建模时仍走前缀切片以保持一致性）。
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-06):
         super().__init__()
         self.dim = int(dim)
         self.eps = float(eps)
@@ -47,14 +46,13 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = int(x.shape[-1])
         if d > self.dim:
-            raise ValueError(
-                f"输入宽度 {d} 超过 RMSNorm 建模宽度 {self.dim}")
+            raise ValueError(f"输入宽度 {d} 超过 RMSNorm 建模宽度 {self.dim}")
         w = self.weight[:d] if d != self.dim else self.weight
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * w
 
 
 class TemporalPatchEmbed(nn.Module):
-    """时间 patch 化嵌入（§4.2）：[B,F,K] → [B,F,P,D]。
+    """时间 patch 化嵌入：[B,F,K] → [B,F,P,D]。
 
     每个连续 p 个 TR 的 patch 经共享线性层映射为一个 token（token 表示局部时间
     模式而非单点观测，缩短 temporal 序列、降低 attention 计算量）；随后加上
@@ -63,14 +61,21 @@ class TemporalPatchEmbed(nn.Module):
     变长 K：``P = ceil(K/p)``，开头补零对齐到 ``P*p``（归一化空间 0 ≈ 均值）。
     """
 
-    def __init__(self, features: int, context_max: int, patch_len: int, dim: int,
-                 dropout: float = 0.1):
+    def __init__(
+        self,
+        features: int,
+        context_max: int,
+        patch_len: int,
+        dim: int,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         if patch_len < 1:
             raise ValueError(f"patch_len 必须 >= 1，收到 {patch_len}")
         if context_max < patch_len:
             raise ValueError(
-                f"context_max({context_max}) 必须 >= patch_len({patch_len})")
+                f"context_max({context_max}) 必须 >= patch_len({patch_len})"
+            )
         self.features = int(features)
         self.context_max = int(context_max)
         self.patch_len = int(patch_len)
@@ -89,8 +94,7 @@ class TemporalPatchEmbed(nn.Module):
     def num_patches(self, context_len: int) -> int:
         """给定 context 长度 K 的 patch 数（含开头补零对齐）。"""
         if not 1 <= context_len <= self.context_max:
-            raise ValueError(
-                f"context_len={context_len} 超出 [1, {self.context_max}]")
+            raise ValueError(f"context_len={context_len} 超出 [1, {self.context_max}]")
         return math.ceil(context_len / self.patch_len)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -98,7 +102,7 @@ class TemporalPatchEmbed(nn.Module):
         Args:
             x: [B, F, K] 归一化后的 context（K 同 batch 内一致）
         Returns:
-            [B, F, P, D] patch token 网格（§2.2 的二维 token grid）
+            [B, F, P, D] patch token 网格
         """
         if x.ndim != 3:
             raise ValueError(f"TemporalPatchEmbed 期望 [B,F,K]，收到 {tuple(x.shape)}")
@@ -108,10 +112,7 @@ class TemporalPatchEmbed(nn.Module):
         n_patch = self.num_patches(k)
         if k % self.patch_len != 0:
             pad = n_patch * self.patch_len - k
-            x = F.pad(x, (pad, 0))                    # 开头补零（归一化空间 ≈ 均值）
-        # [B,F,P,p] → 共享线性 → RMSNorm → 加 ROI / 时间位置嵌入 → [B,F,P,D]
-        # （先归一化 patch 投影、嵌入作加性残差：第 i 个 patch 的输出恒含
-        #   pos_embed[i]，变长 K 的位置语义因此逐位可对齐）
+            x = F.pad(x, (pad, 0))
         tokens = x.reshape(b, f, n_patch, self.patch_len)
         h = self.norm(self.patch_proj(tokens))
         h = h + self.roi_embed.view(1, f, 1, self.dim)
@@ -120,7 +121,7 @@ class TemporalPatchEmbed(nn.Module):
 
 
 class CausalTemporalAttention(nn.Module):
-    """逐 ROI 的 causal temporal attention（§5）。
+    """逐 ROI 的 causal temporal attention。
 
     对每个 ROI 独立执行沿 patch 轴的多头注意力，严格 causal mask
     （``p_k ← p_{≤k}``），建模“单个 ROI 自身如何随时间演化”。实现为
@@ -130,8 +131,7 @@ class CausalTemporalAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         if dim % num_heads != 0:
-            raise ValueError(
-                f"dim({dim}) 必须能被 num_heads({num_heads}) 整除")
+            raise ValueError(f"dim({dim}) 必须能被 num_heads({num_heads}) 整除")
         self.dim = int(dim)
         self.num_heads = int(num_heads)
         self.head_dim = self.dim // self.num_heads
@@ -143,8 +143,11 @@ class CausalTemporalAttention(nn.Module):
 
     def _causal(self, n: int, device, dtype) -> torch.Tensor:
         """缓存 [n,n] 布尔 causal mask（True = 允许注意）。"""
-        if self._mask_len < n or self._causal_mask is None \
-                or self._causal_mask.device != device:
+        if (
+            self._mask_len < n
+            or self._causal_mask is None
+            or self._causal_mask.device != device
+        ):
             m = torch.ones(n, n, dtype=torch.bool, device=device).tril(0)
             self._causal_mask = m
             self._mask_len = n
@@ -159,42 +162,44 @@ class CausalTemporalAttention(nn.Module):
         """
         b, f, p, d = x.shape
         qkv = self.qkv(x).reshape(b * f, p, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)   # 各 [B*F, h, P, d]
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=self._causal(p, x.device, x.dtype),
-            dropout_p=(self.dropout if self.training else 0.0))
+            q,
+            k,
+            v,
+            attn_mask=self._causal(p, x.device, x.dtype),
+            dropout_p=self.dropout if self.training else 0.0,
+        )
         out = out.transpose(1, 2).reshape(b * f, p, self.dim)
         out = self.out_proj(out)
         return out.view(b, f, p, d)
 
 
 class SCGuidedROIAttention(nn.Module):
-    """SC-guided ROI（variate）attention（§6）。
+    """SC-guided ROI（variate）attention。
 
     对每个 patch 位置独立执行沿 ROI 轴的多头注意力，并在 attention 打分上加性
-    注入结构先验（§6.2）::
+    注入结构先验::
 
         S^brain_ij = q_i·k_j / √d_head + β · log(ε + A_eff_ij)
 
-    ``A_eff`` 由模型级先验一次计算、全层共享（§7）；β 为逐头可学习标量
+    ``A_eff`` 由模型级先验一次计算、全层共享；β 为逐头可学习标量
     （初始 1.0）。A_eff 取值 [0,1] 量级、双随机（行和 1），log 偏置把高结构
     连接的 ROI 对的打分系统性抬高，但不禁止低连接边（DTI 假阴性可在数据
     支持下被 attention“复活”）。
     """
 
-    LOG_EPS = 1e-6
+    LOG_EPS = 1e-06
 
     def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         if dim % num_heads != 0:
-            raise ValueError(
-                f"dim({dim}) 必须能被 num_heads({num_heads}) 整除")
+            raise ValueError(f"dim({dim}) 必须能被 num_heads({num_heads}) 整除")
         self.dim = int(dim)
         self.num_heads = int(num_heads)
         self.head_dim = self.dim // self.num_heads
         self.qkv = nn.Linear(self.dim, self.dim * 3)
         self.out_proj = nn.Linear(self.dim, self.dim)
-        # 逐头结构偏置标量 β（初始 1.0，方案 §6.2 的显式系数）
         self.beta = nn.Parameter(torch.ones(self.num_heads))
         self.attn_drop = float(dropout)
 
@@ -208,34 +213,33 @@ class SCGuidedROIAttention(nn.Module):
         """
         if adj is None:
             raise ValueError(
-                "SCGuidedROIAttention 需要结构先验 A_eff；如需关闭 SC 先验，"
-                "请通过先验模块的 adaptive_only 模式提供纯功能图，而非传 None")
+                "SCGuidedROIAttention 需要结构先验 A_eff；如需关闭 SC 先验，请通过先验模块的 adaptive_only 模式提供纯功能图，而非传 None"
+            )
         b, f, p, d = x.shape
         if tuple(adj.shape) != (b, f, f):
-            raise ValueError(
-                f"A_eff 形状 {tuple(adj.shape)} 与输入 {(b, f, f)} 不一致")
-        # [B,F,P,D] → [B*P,F,D]：先把 patch 维换到 batch 位再折叠，
-        # 直接 reshape 会把 (B,F) 与 P 交错，令 ROI 轴混合串扰不同 patch
-        qkv = self.qkv(x).permute(0, 2, 1, 3).reshape(
-            b * p, f, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)   # 各 [B*P, h, F, d]
+            raise ValueError(f"A_eff 形状 {tuple(adj.shape)} 与输入 {(b, f, f)} 不一致")
+        qkv = (
+            self.qkv(x)
+            .permute(0, 2, 1, 3)
+            .reshape(b * p, f, 3, self.num_heads, self.head_dim)
+        )
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        # [B*P,h,F,F] ← [B,1,1,F,F] 广播加性结构偏置（逐头独立 β）
         bias = torch.log((adj + self.LOG_EPS).clamp_min(0.0))
-        scores = scores.view(b, p, self.num_heads, f, f) \
-            + bias.view(b, 1, 1, f, f) \
-            * self.beta.view(1, 1, self.num_heads, 1, 1)
-        attn = F.softmax(scores.flatten(0, 1), dim=-1)   # [(B*P), h, F, F]
+        scores = scores.view(b, p, self.num_heads, f, f) + bias.view(
+            b, 1, 1, f, f
+        ) * self.beta.view(1, 1, self.num_heads, 1, 1)
+        attn = F.softmax(scores.flatten(0, 1), dim=-1)
         if self.attn_drop > 0 and self.training:
             attn = F.dropout(attn, p=self.attn_drop)
-        out = torch.matmul(attn, v)                      # [B*P, h, F, d]
+        out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(b * p, f, self.dim)
-        out = self.out_proj(out)                         # [B*P, F, D]
+        out = self.out_proj(out)
         return out.view(b, p, f, self.dim).permute(0, 2, 1, 3)
 
 
 class TFMEncoderBlock(nn.Module):
-    """SC-guided Temporal–Variate Block（方案 §6.4）::
+    """SC-guided Temporal–Variate Block::
 
         h ← h + Dropout(CausalTemporalAttention(RMSNorm(h)))
         h ← h + Dropout(SCGuidedROIAttention(RMSNorm(h), A_eff))
@@ -243,17 +247,11 @@ class TFMEncoderBlock(nn.Module):
 
     FFN 为 ``dim → ff_dim → dim`` 的 GELU 两层 MLP（ff_dim 默认 4×dim）。
 
-    条件注入（v1 revised §7）：可选地对本 block 的三个**已有 RMSNorm** 输出做
-    :math:`(1+\\gamma(c))\\odot\\operatorname{RMSNorm}(h)+\\beta(c)` 调制
-    （条件 RMSNorm / AdaRMSNorm）。``cond_mods`` 为 ``None`` 时行为与无条件完全
-    一致；调制生成器由模型层的 :class:`models.conditioning.ConditionNormGenerator`
-    持有，本模块只消费 ``(scale, shift)``，因此不改变归一化类型（不做 LayerNorm）。
     """
 
-    NORM_SLOTS = ('temporal', 'roi', 'ffn')
-
-    def __init__(self, dim: int, num_heads: int = 4, ff_ratio: int = 4,
-                 dropout: float = 0.1):
+    def __init__(
+        self, dim: int, num_heads: int = 4, ff_ratio: int = 4, dropout: float = 0.1
+    ):
         super().__init__()
         self.norm_temporal = RMSNorm(dim)
         self.attn_temporal = CausalTemporalAttention(dim, num_heads, dropout)
@@ -262,46 +260,18 @@ class TFMEncoderBlock(nn.Module):
         self.norm_ffn = RMSNorm(dim)
         ff_dim = int(ff_ratio) * dim
         self.ffn = nn.Sequential(
-            nn.Linear(dim, ff_dim), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(ff_dim, dim))
+            nn.Linear(dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, dim),
+        )
         self.dropout = nn.Dropout(dropout)
 
-    @staticmethod
-    def _modulate(normed: torch.Tensor, mod) -> torch.Tensor:
-        """``mod=(scale, shift)``，各为 ``[B, 1, 1, D]``（token/ROI 维广播）。"""
-        scale, shift = mod
-        return normed * (1.0 + scale) + shift
-
-    def forward(self, x: torch.Tensor, adj: torch.Tensor,
-                cond_mods: Optional[Tuple[Optional[tuple], ...]] = None) -> torch.Tensor:
-        """x: [B,F,P,D]，adj: [B,F,F] A_eff → [B,F,P,D]。
-
-        Args:
-            cond_mods: 长度为 3 的元组，依次对应 temporal / roi / ffn 三个 norm
-                位置；每项为 ``(scale, shift)`` 或 ``None``（该位置不调制）。
-                ``None`` 表示整个 block 无条件注入（与历史行为逐位一致）。
-        """
-        if cond_mods is None:
-            m_t = m_r = m_f = None
-        else:
-            if len(cond_mods) != len(self.NORM_SLOTS):
-                raise ValueError(
-                    f'cond_mods 长度 {len(cond_mods)} 与 norm 槽位数 '
-                    f'{len(self.NORM_SLOTS)} 不一致')
-            m_t, m_r, m_f = cond_mods
-        n_t = self.norm_temporal(x)
-        if m_t is not None:
-            n_t = self._modulate(n_t, m_t)
-        h = x + self.dropout(self.attn_temporal(n_t))
-        n_r = self.norm_roi(h)
-        if m_r is not None:
-            n_r = self._modulate(n_r, m_r)
-        h = h + self.dropout(self.attn_roi(n_r, adj))
-        n_f = self.norm_ffn(h)
-        if m_f is not None:
-            n_f = self._modulate(n_f, m_f)
-        h = h + self.dropout(self.ffn(n_f))
-        return h
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """Tokens [B,F,P,D] and adjacency [B,F,F] to encoded tokens."""
+        h = x + self.dropout(self.attn_temporal(self.norm_temporal(x)))
+        h = h + self.dropout(self.attn_roi(self.norm_roi(h), adj))
+        return h + self.dropout(self.ffn(self.norm_ffn(h)))
 
 
 def build_context_grid(x_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -315,6 +285,6 @@ def build_context_grid(x_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
         raise ValueError(f"期望 [B,F,W,S]，收到 {tuple(x_norm.shape)}")
     if x_norm.shape[2] != 1:
         raise ValueError(
-            f"TFM 仅支持单窗口输入（W=1），收到 W={x_norm.shape[2]}；"
-            "window-axis 结构已按方案 §4.1 删除。")
-    return x_norm[:, :, 0, :], x_norm
+            f"TFM 仅支持单窗口输入（W=1），收到 W={x_norm.shape[2]}；window-axis 结构已按方案 §4.1 删除。"
+        )
+    return (x_norm[:, :, 0, :], x_norm)

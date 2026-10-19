@@ -1,5 +1,5 @@
 # coding=utf-8
-"""独立临床结局读出（方案 §8）：HAMD/HAMA 随访变化 MLP 头。
+"""独立临床结局读出：HAMD/HAMA 随访变化 MLP 头。
 
 一个患者/访视对是一个样本；83 维特征全部来自**基线**信息与基线模拟
 （profile 32 + 临床编码 c 32 + 动态描述量摘要 6 + 健康偏离摘要 6 +
@@ -10,7 +10,7 @@ standardized delta 均值，后两列为 logvar（clamp [-6,4]）。
 本模块只包含头、损失与标准化统计量；特征提取（冻结动态模型 + 参照）与训练
 循环在 :mod:`train.twin_outcome`。未拟合的读出不输出疗效评分。
 """
-from typing import Dict, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -66,7 +66,7 @@ class ClinicalOutcomeHead(nn.Module):
 def masked_gaussian_nll(delta_mean: torch.Tensor, logvar: torch.Tensor,
                         target: torch.Tensor,
                         mask: torch.Tensor) -> torch.Tensor:
-    """ masked Gaussian NLL（方案 §8.1）::
+    """ masked Gaussian NLL::
 
         L = Σ_{n,j} m_nj [ ½ exp(-ℓ_nj)(δ̂_nj-δ_nj)² + ½ ℓ_nj ] / max(1, Σ m)
 

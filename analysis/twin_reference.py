@@ -260,10 +260,6 @@ def fit_reference(dataset, train_subjects: Sequence[str],
     if not subjects:
         raise ValueError('train_subjects 为空，无法拟合健康参照。')
 
-    values, mask = table.align(subjects)
-    if stats is None:
-        stats = fit_demo_stats(values, mask, idx)
-
     # 每个训练被试只取最早 64 个观测的一份描述量（避免扫描窗口数决定权重）
     descs, kept = [], []
     skipped = []
@@ -284,6 +280,11 @@ def fit_reference(dataset, train_subjects: Sequence[str],
             '不足 64 个真实观测时不执行参照分析（普通预测不受影响）。')
 
     d = np.stack(descs, axis=0)                           # [N, F, 6]
+    # Align after filtering: every design row must describe the same retained
+    # subject as its target row. Short scans must not influence demo statistics.
+    values, mask = table.align(kept)
+    if stats is None:
+        stats = fit_demo_stats(values, mask, idx)
     n, n_feat, n_comp = d.shape
     y = d.reshape(n, n_feat * n_comp)                     # 行主序展开 (F,6)
 

@@ -1,5 +1,6 @@
 # coding=utf-8
 """优化器、调度器、EMA 与预训练权重加载等训练基础设施。"""
+
 import os
 from copy import deepcopy
 from typing import List
@@ -11,14 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from models import ARCH_VERSION
 from models.tfm import NeuroTwinTFM
 
-#: 无 arch_version 元数据的旧检查点按此版本处理
-LEGACY_ARCH_VERSION = 1
-ARCH_POLICIES = ('require_match', 'warn', 'ignore')
-
-#: 主干参数键前缀（--load_backbone_only 使用）：不含 one-step / CPM 预测头与条件模块
-BACKBONE_KEY_PREFIXES = (
-    'rev_norm.', 'sc_prior.', 'patch_embed.', 'blocks.', 'final_norm.',
-)
+ARCH_POLICIES = ("require_match",)
 
 
 class ModelEMA:
@@ -33,7 +27,7 @@ class ModelEMA:
     @torch.no_grad()
     def update(self, model):
         # torch.compile 包装后 state_dict 键带 '_orig_mod.' 前缀，取内层原模型对齐 EMA 键
-        inner = getattr(model, '_orig_mod', model)
+        inner = getattr(model, "_orig_mod", model)
         msd = inner.state_dict()
         ema_sd = self.ema.state_dict()
         # _foreach_ 批量融合：避免逐键 mul_/add_ 产生数百次小 kernel launch
@@ -54,16 +48,20 @@ class ModelEMA:
 
 
 def unwrap_state_dict(obj):
-    """兼容新旧两种检查点格式，返回 (state_dict, arch_version, config)。
-
-    新格式：{'state_dict': ..., 'arch_version': int, 'config': dict}
-    旧格式：裸 state_dict（无元数据，arch_version 记为 None）
-    """
-    if isinstance(obj, dict) and isinstance(obj.get('state_dict', None), dict):
-        return obj['state_dict'], obj.get('arch_version', None), obj.get('config', None)
-    if isinstance(obj, dict):
-        return obj, None, None
-    raise TypeError(f"无法识别的检查点类型: {type(obj)}")
+    """Read the versioned current Graph-ODE checkpoint and its argument snapshot."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("state_dict"), dict):
+        raise ValueError("A versioned Graph-ODE checkpoint is required")
+    if obj.get("arch_version") != ARCH_VERSION:
+        raise ValueError(f"Checkpoint arch_version must be {ARCH_VERSION}")
+    config = obj.get("config")
+    saved = config.get("args") if isinstance(config, dict) else None
+    if (
+        not isinstance(saved, dict)
+        or saved.get("dynamics_mode") != "graph_ode"
+        or saved.get("graph_source") != "history_fc"
+    ):
+        raise ValueError("Checkpoint must declare graph_ode dynamics and history_fc")
+    return obj["state_dict"], obj["arch_version"], config
 
 
 def save_backbone_weights(path, model, meta=None):
@@ -72,11 +70,11 @@ def save_backbone_weights(path, model, meta=None):
     结构改动后 reload 时可按 arch_version 拦截“同 shape 不同语义”的权重，
     这是裸 state_dict 下唯一可靠的兼容性闸门。
     """
-    inner = getattr(model, '_orig_mod', model)   # 解包 torch.compile
+    inner = getattr(model, "_orig_mod", model)  # 解包 torch.compile
     payload = {
-        'state_dict': deepcopy(inner.state_dict()),
-        'arch_version': ARCH_VERSION,
-        'config': dict(meta) if meta else {},
+        "state_dict": deepcopy(inner.state_dict()),
+        "arch_version": ARCH_VERSION,
+        "config": dict(meta) if meta else {},
     }
     torch.save(payload, path)
     return path
@@ -92,215 +90,103 @@ def pretrain_config_signature(saved_args: dict) -> dict:
     patch_len / cpm_horizon（决定 patch 网格与 CPM 头的输出 shape）。
     """
     saved = dict(saved_args or {})
-    if 'task_mode' not in saved:
+    if "task_mode" not in saved:
         raise RuntimeError(
             "检查点缺少 task_mode 字段（旧任务检查点），无法校验任务口径；"
-            "请用当前 next_timepoint 口径重新预训练。")
-    sig = {'task_mode': str(saved['task_mode']),
-           'model_arch': str(saved.get('model_arch', 'tfm')),
-           'in_window': 1,
-           'pred_window': len(saved_forecast_offsets(saved)),
-           'seq_len': int(saved.get('context_max'))}
-    if sig['model_arch'] == 'tfm':
-        sig['patch_len'] = int(saved.get('tfm_patch_len'))
-        sig['cpm_horizon'] = int(saved.get('cpm_horizon'))
+            "请用当前 next_timepoint 口径重新预训练。"
+        )
+    sig = {
+        "task_mode": str(saved["task_mode"]),
+        "model_arch": str(saved.get("model_arch", "tfm")),
+        "in_window": 1,
+        "pred_window": len(saved_forecast_offsets(saved)),
+        "seq_len": int(saved.get("context_max")),
+    }
+    if sig["model_arch"] == "tfm":
+        sig["patch_len"] = int(saved.get("tfm_patch_len"))
+        sig["cpm_horizon"] = int(saved.get("cpm_horizon"))
     return sig
 
 
 def saved_forecast_offsets(saved_args: dict) -> list:
     """从检查点参数快照解析 next_timepoint 的预测偏移列表。"""
     saved = dict(saved_args or {})
-    raw = saved.get('forecast_offsets', None)
+    raw = saved.get("forecast_offsets", None)
     vals = []
     if raw:
-        vals = [int(v) for v in str(raw).replace(',', ' ').split() if v.strip()]
+        vals = [int(v) for v in str(raw).replace(",", " ").split() if v.strip()]
     if not vals:
         vals = [1]
     return sorted(vals)
 
 
-def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
-                                 arch_policy: str = 'require_match') -> None:
+def check_pretrain_config_compat(
+    pretrained_path, expected_dims: dict, arch_policy: str = "require_match"
+) -> None:
     """校验预训练权重与当前运行的任务口径是否一致。
 
     不同 context_max / 预测偏移数对应的输入/输出 shape 不同；若直接交给
     :func:`load_backbone_weights` 的 shape 过滤，只会打印“跳过 N 个键”而不报错，
-    存在静默错误加载风险。这里显式拦截（``--pretrained_arch_policy warn`` 可强制跳过）。
+    存在静默错误加载风险。这里显式拦截。
     """
     if arch_policy not in ARCH_POLICIES:
-        raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
-    ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+        raise ValueError(
+            f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}"
+        )
+    ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
     _, _, config = unwrap_state_dict(ckpt)
-    saved_args = (config or {}).get('args', None) if isinstance(config, dict) else None
-    if not isinstance(saved_args, dict):
-        print(f"提示: {os.path.basename(str(pretrained_path))} 无 config.args 快照，"
-              "跳过任务口径校验（仅按 shape 过滤加载权重）。")
-        return
+    saved_args = (config or {}).get("args", None) if isinstance(config, dict) else None
     saved = pretrain_config_signature(saved_args)
-    expected = {'task_mode': expected_dims['task_mode'],
-                'model_arch': str(expected_dims.get('model_arch', 'tfm')),
-                'in_window': int(expected_dims['in_window']),
-                'pred_window': int(expected_dims['pred_window']),
-                'seq_len': int(expected_dims['seq_len'])}
-    if expected['model_arch'] == 'tfm':
-        expected['patch_len'] = int(expected_dims['patch_len'])
-        expected['cpm_horizon'] = int(expected_dims['cpm_horizon'])
-    mismatch = {k: (saved.get(k), expected[k]) for k in expected
-                if saved.get(k) != expected[k]}
+    expected = {
+        "task_mode": expected_dims["task_mode"],
+        "model_arch": str(expected_dims.get("model_arch", "tfm")),
+        "in_window": int(expected_dims["in_window"]),
+        "pred_window": int(expected_dims["pred_window"]),
+        "seq_len": int(expected_dims["seq_len"]),
+    }
+    if expected["model_arch"] == "tfm":
+        expected["patch_len"] = int(expected_dims["patch_len"])
+        expected["cpm_horizon"] = int(expected_dims["cpm_horizon"])
+    mismatch = {
+        k: (saved.get(k), expected[k]) for k in expected if saved.get(k) != expected[k]
+    }
     if not mismatch:
         print(f"[pretrain 兼容性] 任务口径一致: {expected}")
         return
-    msg = (f"预训练权重任务口径与当前运行不一致：{mismatch}\n"
-           f"    权重: {saved}\n    当前: {expected}\n"
-           "    next_timepoint 任务（连续 BOLD context → 下一 TR 全脑状态）在不同 "
-           "context_max / 预测偏移数下输入输出 shape 语义不同，权重不可混用，"
-           "否则大量键会因 shape 不匹配被静默跳过。")
-    if arch_policy == 'require_match':
+    msg = (
+        f"预训练权重任务口径与当前运行不一致：{mismatch}\n"
+        f"    权重: {saved}\n    当前: {expected}\n"
+        "    next_timepoint 任务（连续 BOLD context → 下一 TR 全脑状态）在不同 "
+        "context_max / 预测偏移数下输入输出 shape 语义不同，权重不可混用，"
+        "否则大量键会因 shape 不匹配被静默跳过。"
+    )
+    if arch_policy == "require_match":
         raise RuntimeError(
-            msg + "\n请用当前任务口径重新预训练（scripts/Pretrain_HC_tfm.sh），"
-                  "或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
-    print("警告: " + msg + f"（arch_policy={arch_policy}：继续按 shape 过滤加载）")
+            msg + "\n请用当前任务口径重新预训练（scripts/pretrain_hc_tfm.sh），"
+        )
 
 
-def load_backbone_weights(model, pretrained_path, device, arch_policy='require_match',
-                          skip_pattern=''):
-    """按形状兼容过滤加载预训练权重（新增模块自动跳过）。
-
-    Args:
-        arch_policy: 架构版本不匹配时的策略
-            - 'require_match'（默认）：直接报错并提示重新预训练
-            - 'warn'：打印警告后按 shape 过滤加载（逃生舱）
-            - 'ignore'：跳过权重加载
-        skip_pattern: fnmatch 模式（如 ``'one_step_head.*'``），命中的预训练键
-            不加载、保留随机初始化。用于受控消融：量化「某分支未经预训练」
-            对 finetune 结果的独立影响。
-    Returns:
-        dict，含 loaded / skipped / missing / arch_version / skipped_load
-    """
+def load_backbone_weights(model, pretrained_path, device, arch_policy="require_match"):
+    """Strictly load matching current Graph-ODE weights; field expansion uses migration."""
     if arch_policy not in ARCH_POLICIES:
-        raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
-    if skip_pattern:
-        import fnmatch
-
-    ckpt = torch.load(pretrained_path, map_location=device)
-    state, arch_version, _ = unwrap_state_dict(ckpt)
-    fname = os.path.basename(str(pretrained_path))
-
-    if arch_version is None:
-        print(f"提示: {fname} 未包含 arch_version 元数据，按 arch_version={LEGACY_ARCH_VERSION} 处理。")
-        arch_version = LEGACY_ARCH_VERSION
-
-    if arch_version != ARCH_VERSION:
-        msg = (f"预训练权重架构版本不匹配: 权重 arch_version={arch_version}, "
-               f"当前代码 ARCH_VERSION={ARCH_VERSION}。"
-               f"结构改动会使部分同名参数语义发生变化，按 shape 加载可能得到错误结果。")
-        if arch_policy == 'require_match':
-            raise RuntimeError(
-                msg + f"\n请用当前代码重新预训练（scripts/Pretrain_HC_tfm.sh），"
-                      f"或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
-        if arch_policy == 'ignore':
-            print(msg + " arch_policy=ignore: 跳过预训练权重加载。")
-            return {'loaded': 0, 'skipped': sorted(state.keys()), 'missing': [],
-                    'arch_version': arch_version, 'skipped_load': True}
-        print(msg + " arch_policy=warn: 继续按 shape 过滤加载。")
-
-    model_dict = model.state_dict()
-    filtered = {k: v for k, v in state.items()
-                if k in model_dict and model_dict[k].shape == v.shape}
-    if skip_pattern:
-        # 受控跳过：命中模式的键不加载（保留随机初始化），计入 skipped 以便核对
-        force_skipped = sorted(k for k in filtered if fnmatch.fnmatch(k, skip_pattern))
-        for k in force_skipped:
-            filtered.pop(k)
-        if force_skipped:
-            print(f"受控跳过预训练加载（--pretrained_skip_pattern '{skip_pattern}'）: "
-                  f"{len(force_skipped)} 个键，例如 {force_skipped[:5]}")
-    skipped  = sorted(k for k in state if k not in filtered)
-    model_dict.update(filtered)
-    model.load_state_dict(model_dict)
-
-    missing = sorted(k for k in model_dict if k not in filtered)
-    print(f"成功加载预训练参数: {len(filtered)} 个匹配键")
-    if skipped:
-        print(f"提示: {len(skipped)} 个预训练键因名称/形状不匹配被跳过，例如 {skipped[:5]}")
-    if missing:
-        print(f"提示: {len(missing)} 个键未从预训练文件加载（如新增的条件模块）")
-
-    return {'loaded': len(filtered), 'skipped': skipped, 'missing': missing,
-            'arch_version': arch_version, 'skipped_load': False}
-
-
-def load_backbone_only(model, pretrained_path, device):
-    """只加载主干权重，预测头 / 条件模块保持随机初始化（prompt §三十六）。
-
-    用途：跨任务口径复用主干（例如已经用同一 context_max 口径预训练过主干、
-    仅想换预测头）做受控的「主干预训练 + 头部重训」实验。
-
-    与 :func:`load_backbone_weights`（按 shape 过滤、静默跳过不匹配键）不同，
-    这里**显式打印四类清单**：loaded（成功加载）、missing（主干中不存在该键）、
-    incompatible（键存在但形状不匹配）、reinitialized
-    （被有意重新初始化的头部/条件模块），避免 strict=False 的静默忽略。
-    """
-    prefixes = BACKBONE_KEY_PREFIXES
-    ckpt = torch.load(pretrained_path, map_location=device)
-    state, arch_version, _ = unwrap_state_dict(ckpt)
-    fname = os.path.basename(str(pretrained_path))
-    model_sd = model.state_dict()
-
-    loaded, missing, incompatible, reinitialized = [], [], [], []
-    for k, v in model_sd.items():
-        if k.startswith(prefixes):
-            src = state.get(k, None)
-            if src is None:
-                missing.append(k)
-            elif tuple(src.shape) != tuple(v.shape):
-                incompatible.append((k, tuple(src.shape), tuple(v.shape)))
-            else:
-                model_sd[k] = src
-                loaded.append(k)
-        else:
-            reinitialized.append(k)
-    model.load_state_dict(model_sd)
-
-    print(f"[load_backbone_only] {fname}（arch_version={arch_version}）| "
-          f"loaded={len(loaded)} | missing={len(missing)} | "
-          f"incompatible={len(incompatible)} | "
-          f"reinitialized(头部/条件模块)={len(reinitialized)}")
-    print(f"[load_backbone_only] reinitialized 模块前缀: "
-          f"{sorted({k.split('.')[0] for k in reinitialized})}")
-    if missing:
-        print(f"[load_backbone_only] 主干中缺失的键（{len(missing)} 个，例如 "
-              f"{missing[:5]}）：checkpoint 中不存在，已保留随机初始化。")
-    if incompatible:
-        detail = ', '.join(f"{k} {src}→{dst}"
-                           for k, src, dst in incompatible[:5])
-        print(f"[load_backbone_only] 形状不兼容的键（{len(incompatible)} 个，例如 "
-              f"{detail}）：已显式重新初始化（不静默忽略）。")
-    return {'loaded': len(loaded), 'missing': missing,
-            'incompatible': incompatible, 'reinitialized': reinitialized,
-            'arch_version': arch_version}
+        raise ValueError(f"Unsupported arch_policy {arch_policy!r}")
+    checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
+    state, arch_version, _ = unwrap_state_dict(checkpoint)
+    model.load_state_dict(state, strict=True)
+    return {
+        "loaded": len(state),
+        "skipped": [],
+        "missing": [],
+        "arch_version": arch_version,
+        "skipped_load": False,
+    }
 
 
 def _iter_conditioning_modules(model):
-    """发现带 `is_conditioning_adapter` 标记的条件模块（AdaLN/LoRA/MoE 等）。
-
-    冻结/参数分组基于显式标记而非名字子串匹配，避免重命名导致行为漂移。
-    TFMPathologyMoE（TFM 病理残差专家）携带该标记：冻结 backbone 阶段
-    Router 与 Expert 仍参与训练（RECC 方案 §44/§46 Stage 1）。
-    """
+    """发现字段编码器与临床/个体 FiLM 条件模块。"""
     seen = set()
     for _, module in model.named_modules():
-        if getattr(module, 'is_conditioning_adapter', False) and id(module) not in seen:
-            seen.add(id(module))
-            yield module
-
-
-def _iter_tfm_pathology_moe_modules(model):
-    """发现 TFMPathologyMoE 模块（RECC 方案 §45：独立参数组 tfm_moe）。"""
-    from models.tfm_experts import TFMPathologyMoE
-    seen = set()
-    for _, module in model.named_modules():
-        if isinstance(module, TFMPathologyMoE) and id(module) not in seen:
+        if getattr(module, "is_conditioning_adapter", False) and id(module) not in seen:
             seen.add(id(module))
             yield module
 
@@ -308,6 +194,7 @@ def _iter_tfm_pathology_moe_modules(model):
 # ══════════════════════════════════════════════════════════════════════════
 #  条件参数登记、冻结校验与显式迁移（v1 revised §8 / §11）
 # ══════════════════════════════════════════════════════════════════════════
+
 
 def conditioning_param_names(model) -> List[str]:
     """列出所有条件适配器参数名（顶层模块携带 ``is_conditioning_adapter``）。
@@ -318,9 +205,9 @@ def conditioning_param_names(model) -> List[str]:
     prefixes = conditioning_module_prefixes(model)
     names = []
     for pname, _ in model.named_parameters():
-        parts = pname.split('.')
+        parts = pname.split(".")
         for i in range(len(parts) - 1, 0, -1):
-            if '.'.join(parts[:i]) + '.' in prefixes:
+            if ".".join(parts[:i]) + "." in prefixes:
                 names.append(pname)
                 break
     return sorted(names)
@@ -336,31 +223,40 @@ def conditioning_module_prefixes(model) -> set:
     """
     out = set()
     for mod_name, module in model.named_modules():
-        if getattr(module, 'is_conditioning_adapter', False) and mod_name:
-            out.add(mod_name + '.')
+        if getattr(module, "is_conditioning_adapter", False) and mod_name:
+            out.add(mod_name + ".")
     return out
 
 
 def param_report(model, optimizer=None) -> dict:
-    """登记实际参数量（方案 §11：不硬套旧方案的 35040/36388 等数字）。"""
+    """登记实际参数量。"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     cond_names = set(conditioning_param_names(model))
     cond_total = sum(p.numel() for n, p in model.named_parameters() if n in cond_names)
-    cond_trainable = sum(p.numel() for n, p in model.named_parameters()
-                         if n in cond_names and p.requires_grad)
-    opt_total = (sum(p.numel() for g in optimizer.param_groups for p in g['params'])
-                 if optimizer is not None else None)
-    opt_distinct = (len({id(p) for g in optimizer.param_groups for p in g['params']})
-                    if optimizer is not None else None)
+    cond_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if n in cond_names and p.requires_grad
+    )
+    opt_total = (
+        sum(p.numel() for g in optimizer.param_groups for p in g["params"])
+        if optimizer is not None
+        else None
+    )
+    opt_distinct = (
+        len({id(p) for g in optimizer.param_groups for p in g["params"]})
+        if optimizer is not None
+        else None
+    )
     return {
-        'total': int(total),
-        'trainable': int(trainable),
-        'conditioning': int(cond_total),
-        'conditioning_trainable': int(cond_trainable),
-        'rho_conditioning': float(cond_total / total) if total else 0.0,
-        'optimizer_numel': opt_total,
-        'optimizer_distinct_tensors': opt_distinct,
+        "total": int(total),
+        "trainable": int(trainable),
+        "conditioning": int(cond_total),
+        "conditioning_trainable": int(cond_trainable),
+        "rho_conditioning": float(cond_total / total) if total else 0.0,
+        "optimizer_numel": opt_total,
+        "optimizer_distinct_tensors": opt_distinct,
     }
 
 
@@ -374,7 +270,7 @@ def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=Fa
     named = dict(model.named_parameters())
     in_opt = {}
     for gi, g in enumerate(optimizer.param_groups):
-        for p in g['params']:
+        for p in g["params"]:
             in_opt.setdefault(id(p), []).append(gi)
     dup = {k: v for k, v in in_opt.items() if len(v) > 1}
     problems = []
@@ -386,28 +282,41 @@ def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=Fa
         elif id(p) not in in_opt:
             missing.append(n)
     cond_numel = sum(named[n].numel() for n in cond if named[n].requires_grad)
-    opt_cond_numel = sum(named[n].numel() for n in cond
-                         if named[n].requires_grad and id(named[n]) in in_opt)
+    opt_cond_numel = sum(
+        named[n].numel()
+        for n in cond
+        if named[n].requires_grad and id(named[n]) in in_opt
+    )
     if missing:
-        problems.append(f'条件参数未进入优化器（{len(missing)} 个，例如 {missing[:5]}）')
+        problems.append(
+            f"条件参数未进入优化器（{len(missing)} 个，例如 {missing[:5]}）"
+        )
     if untrainable:
-        problems.append(f'条件参数 requires_grad=False（{len(untrainable)} 个，例如 '
-                        f'{untrainable[:5]}）；冻结期条件模块必须可训练')
+        problems.append(
+            f"条件参数 requires_grad=False（{len(untrainable)} 个，例如 "
+            f"{untrainable[:5]}）；冻结期条件模块必须可训练"
+        )
     if dup:
-        problems.append(f'优化器存在重复参数（{len(dup)} 个张量出现在多个参数组）')
+        problems.append(f"优化器存在重复参数（{len(dup)} 个张量出现在多个参数组）")
     if cond_numel != opt_cond_numel:
-        problems.append(f'条件参数 numel 不一致：应训练 {cond_numel}，实入优化器 '
-                        f'{opt_cond_numel}')
+        problems.append(
+            f"条件参数 numel 不一致：应训练 {cond_numel}，实入优化器 {opt_cond_numel}"
+        )
     if expect_frozen_backbone:
-        backbone_trainable = sum(1 for n, p in named.items()
-                                 if p.requires_grad and n not in set(cond))
+        backbone_trainable = sum(
+            1 for n, p in named.items() if p.requires_grad and n not in set(cond)
+        )
         if backbone_trainable:
-            problems.append(f'冻结期主干仍可训练（{backbone_trainable} 个参数）')
+            problems.append(f"冻结期主干仍可训练（{backbone_trainable} 个参数）")
     if problems:
-        raise RuntimeError('[条件参数校验] 失败：\n  - ' + '\n  - '.join(problems))
-    return {'conditioning_params': len(cond), 'conditioning_numel': int(cond_numel),
-            'optimizer_groups': [g.get('name', f'g{i}')
-                                 for i, g in enumerate(optimizer.param_groups)]}
+        raise RuntimeError("[条件参数校验] 失败：\n  - " + "\n  - ".join(problems))
+    return {
+        "conditioning_params": len(cond),
+        "conditioning_numel": int(cond_numel),
+        "optimizer_groups": [
+            g.get("name", f"g{i}") for i, g in enumerate(optimizer.param_groups)
+        ],
+    }
 
 
 def classify_checkpoint_keys(model_state, ckpt_state, conditioning_prefixes):
@@ -427,19 +336,28 @@ def classify_checkpoint_keys(model_state, ckpt_state, conditioning_prefixes):
                 missing.append(k)
         elif tuple(src.shape) != tuple(v.shape):
             # 同宽度但语义变化也会被 layout_hash 拦下；这里按形状冲突归类
-            missing.append(f'{k} (shape {tuple(src.shape)}→{tuple(v.shape)})')
+            missing.append(f"{k} (shape {tuple(src.shape)}→{tuple(v.shape)})")
         else:
             loaded.append(k)
     skipped = sorted(k for k in ckpt_state if k not in model_state)
-    return {'loaded': loaded, 'new_initialized': new_initialized,
-            'missing': missing, 'skipped': skipped}
+    return {
+        "loaded": loaded,
+        "new_initialized": new_initialized,
+        "missing": missing,
+        "skipped": skipped,
+    }
 
 
-def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
-                                  arch_policy='require_match',
-                                  zero_expanded_keys=(), layout_expect=None,
-                                  layout_saved=None):
-    r"""显式迁移器：旧 checkpoint → 新结构，逐键归类并汇报（方案 §8）。
+def migrate_pretrained_checkpoint(
+    model,
+    pretrained_path,
+    device="cpu",
+    arch_policy="require_match",
+    zero_expanded_keys=(),
+    layout_expect=None,
+    layout_saved=None,
+):
+    r"""HC 到 MDD 条件字段扩展：逐键归类并汇报。
 
     与「``strict=False`` + shape 过滤」不同，本函数把每个键归入
     ``loaded / copied / new_initialized / zero_expanded / skipped / missing``
@@ -460,66 +378,59 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
         raise ValueError(f"Unsupported arch_policy '{arch_policy}'")
     if layout_expect and layout_saved and str(layout_expect) != str(layout_saved):
         raise RuntimeError(
-            f'条件布局冲突：checkpoint layout_hash={layout_saved} 与当前运行 '
-            f'{layout_expect} 不一致。字段名称/顺序/来源列/类别词表任一变化都会改变'
-            f'哈希；即使宽度相同也**拒绝加载**（否则同 shape 的列会被静默错位复用）。')
+            f"条件布局冲突：checkpoint layout_hash={layout_saved} 与当前运行 "
+            f"{layout_expect} 不一致。字段名称/顺序/来源列/类别词表任一变化都会改变"
+            f"哈希；即使宽度相同也**拒绝加载**（否则同 shape 的列会被静默错位复用）。"
+        )
 
     ckpt = torch.load(pretrained_path, map_location=device)
     state, arch_version, config = unwrap_state_dict(ckpt)
     fname = os.path.basename(str(pretrained_path))
-    if arch_version is None:
-        print(f'提示: {fname} 无 arch_version，按 {LEGACY_ARCH_VERSION} 处理。')
-        arch_version = LEGACY_ARCH_VERSION
-    if arch_version != ARCH_VERSION:
-        msg = (f'架构版本不匹配: checkpoint arch_version={arch_version}, '
-               f'当前 ARCH_VERSION={ARCH_VERSION}')
-        if arch_policy == 'require_match':
-            raise RuntimeError(
-                msg + '。请使用显式迁移入口或重新预训练；'
-                      '如需按 shape 强制加载（不推荐），传 --pretrained_arch_policy warn。')
-        if arch_policy == 'ignore':
-            print(msg + '：arch_policy=ignore，跳过加载。')
-            return {'loaded': 0, 'copied': 0, 'new_initialized': [],
-                    'zero_expanded': [], 'skipped': sorted(state), 'missing': [],
-                    'arch_version': arch_version}
-        print('警告: ' + msg + '（arch_policy=warn：继续迁移）')
-
     cond_prefixes = tuple(sorted(conditioning_module_prefixes(model)))
     model_state = model.state_dict()
     cls = classify_checkpoint_keys(model_state, state, cond_prefixes)
-    zero_expanded = [k for k in cls['new_initialized'] if k in set(zero_expanded_keys)]
-    plain_new = [k for k in cls['new_initialized'] if k not in set(zero_expanded_keys)]
+    zero_expanded = [k for k in cls["new_initialized"] if k in set(zero_expanded_keys)]
+    plain_new = [k for k in cls["new_initialized"] if k not in set(zero_expanded_keys)]
     # zero_expanded 键允许在 checkpoint 中存在但形状不同（按零填充扩展）
-    shape_conflicts = [k for k in cls['missing'] if ' (shape ' in k]
-    hard_missing = [k for k in cls['missing'] if ' (shape ' not in k]
-    unknown_keys = sorted(set(zero_expanded_keys) - set(cls['new_initialized']))
+    shape_conflicts = [k for k in cls["missing"] if " (shape " in k]
+    hard_missing = [k for k in cls["missing"] if " (shape " not in k]
+    unknown_keys = sorted(set(zero_expanded_keys) - set(cls["new_initialized"]))
     if hard_missing:
         raise RuntimeError(
-            f'迁移失败：{len(hard_missing)} 个非条件键在 checkpoint 中缺失'
-            f'（例如 {hard_missing[:5]}）。这表示主干结构发生了变化，不应静默随机初始化。')
+            f"迁移失败：{len(hard_missing)} 个非条件键在 checkpoint 中缺失"
+            f"（例如 {hard_missing[:5]}）。这表示主干结构发生了变化，不应静默随机初始化。"
+        )
     if shape_conflicts:
         raise RuntimeError(
-            f'迁移失败：{len(shape_conflicts)} 个键形状冲突（例如 {shape_conflicts[:3]}）；'
-            f'同宽度不同语义的权重不可复用，需要显式 --zero_expanded_keys 声明的'
-            f'零扩展迁移。')
+            f"迁移失败：{len(shape_conflicts)} 个键形状冲突（例如 {shape_conflicts[:3]}）；"
+            f"同宽度不同语义的权重不可复用，需要显式 --zero_expanded_keys 声明的"
+            f"零扩展迁移。"
+        )
     if unknown_keys:
         raise RuntimeError(
-            f'--zero_expanded_keys 含未在预期新增集合中的键（{unknown_keys[:5]}）；'
-            f'未分类键必须报错，不能静默处理。')
+            f"--zero_expanded_keys 含未在预期新增集合中的键（{unknown_keys[:5]}）；"
+            f"未分类键必须报错，不能静默处理。"
+        )
 
-    filtered = {k: state[k] for k in cls['loaded']}
+    filtered = {k: state[k] for k in cls["loaded"]}
     model_state.update(filtered)
     model.load_state_dict(model_state)
     report = {
-        'loaded': len(cls['loaded']), 'copied': len(cls['loaded']),
-        'new_initialized': plain_new, 'zero_expanded': zero_expanded,
-        'skipped': cls['skipped'], 'missing': cls['missing'],
-        'arch_version': arch_version, 'file': fname,
+        "loaded": len(cls["loaded"]),
+        "copied": len(cls["loaded"]),
+        "new_initialized": plain_new,
+        "zero_expanded": zero_expanded,
+        "skipped": cls["skipped"],
+        "missing": cls["missing"],
+        "arch_version": arch_version,
+        "file": fname,
     }
-    print(f"[migrate] {fname}（arch_version={arch_version}）| loaded/copied="
-          f"{report['loaded']} | new_initialized={len(plain_new)} | "
-          f"zero_expanded={len(zero_expanded)} | skipped={len(cls['skipped'])} | "
-          f"missing={len(cls['missing'])}")
+    print(
+        f"[migrate] {fname}（arch_version={arch_version}）| loaded/copied="
+        f"{report['loaded']} | new_initialized={len(plain_new)} | "
+        f"zero_expanded={len(zero_expanded)} | skipped={len(cls['skipped'])} | "
+        f"missing={len(cls['missing'])}"
+    )
     if plain_new:
         print(f"[migrate] 新增条件键示例: {plain_new[:5]}")
     return report
@@ -535,26 +446,32 @@ def unfreeze_while_preserving_state(model, optimizer, args):
 
     返回 ``(added_numel, group_names)``，供调用方打印可核对的证据。
     """
-    existing = {id(p) for g in optimizer.param_groups for p in g['params']}
+    existing = {id(p) for g in optimizer.param_groups for p in g["params"]}
     added_groups, added_numel = [], 0
     for group in get_param_groups(model, args):
-        fresh = [p for p in group['params'] if id(p) not in existing]
+        fresh = [p for p in group["params"] if id(p) not in existing]
         if fresh:
             # 沿用组名与 LR：已存在的组不重建，避免任何 Adam 状态被丢弃
-            target = next((g for g in optimizer.param_groups
-                           if g.get('name') == group.get('name')), None)
+            target = next(
+                (
+                    g
+                    for g in optimizer.param_groups
+                    if g.get("name") == group.get("name")
+                ),
+                None,
+            )
             if target is not None:
-                target['params'].extend(fresh)
+                target["params"].extend(fresh)
             else:
                 added_groups.append(group)
             added_numel += sum(p.numel() for p in fresh)
     for group in added_groups:
         optimizer.add_param_group(group)
-    return added_numel, [g.get('name') for g in optimizer.param_groups]
+    return added_numel, [g.get("name") for g in optimizer.param_groups]
 
 
 def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
-    """微调分阶段训练：默认训练条件模块（病理 FiLM / 病理 MoE），backbone_unfrozen 后解冻主干。"""
+    """微调分阶段训练：默认训练条件模块（字段编码器与临床/个体 FiLM），backbone_unfrozen 后解冻主干。"""
     for p in model.parameters():
         p.requires_grad = False
     # 条件模块在冻结阶段即参与训练：它们是“让病理条件真正生效”的唯一路径
@@ -563,15 +480,20 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
             p.requires_grad = True
 
     if backbone_unfrozen:
-        backbone_modules = [model.patch_embed, model.blocks, model.final_norm,
-                            model.one_step_head, model.cpm_head,
-                            model.sc_prior]
+        backbone_modules = [
+            model.patch_embed,
+            model.blocks,
+            model.final_norm,
+            model.one_step_head,
+            model.cpm_head,
+            model.sc_prior,
+        ]
         if model.rev_norm is not None:
             backbone_modules.append(model.rev_norm)
-        # graph_ode 路线（方案 §10）：个体 profile 编码器属于共享主干解冻列表；
+        # graph_ode 路线：个体 profile 编码器属于共享主干解冻列表；
         # VarianceHead 在 GraphODEDynamicsHead 内部，随 one_step_head 一起解冻。
         # 条件 FiLM 等适配器已由上方条件模块循环解冻，不在此重复。
-        if getattr(model, 'profile_encoder', None) is not None:
+        if getattr(model, "profile_encoder", None) is not None:
             backbone_modules.append(model.profile_encoder)
         for module in backbone_modules:
             for p in module.parameters():
@@ -579,48 +501,31 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
 
 
 def get_param_groups(model: NeuroTwinTFM, args):
-    """按模式划分参数组。
-
-    - pretrain: 单组 'all'（HC 预训练允许条件模块，此时条件参数随主干一起训练）
-    - finetune: 'backbone' / 'condition'（条件模块：独立编码器、融合、FiLM、
-      条件 norm、门控残差/低秩）/ 'tfm_moe'，各自独立学习率。
-      条件组 LR 倍率取 ``condition_lr_scale``（方案 §11.2 的搜索维度），
-      未提供时回退历史 ``adapter_lr_scale`` 以保持旧配置可复现。
-    """
+    """Train all parameters for HC; separate backbone and conditions for MDD."""
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    if args.mode == 'pretrain':
-        return [{'params': [p for _, p in named], 'lr': args.lr_peak, 'name': 'all'}]
-
-    moe_ids = set()
-    for module in _iter_tfm_pathology_moe_modules(model):
-        for p in module.parameters():
-            moe_ids.add(id(p))
-
-    adapter_ids = set()
-    for module in _iter_conditioning_modules(model):
-        for p in module.parameters():
-            adapter_ids.add(id(p))
-
-    moe_p     = [p for _, p in named if id(p) in moe_ids]
-    adapter_p = [p for _, p in named
-                 if id(p) in adapter_ids and id(p) not in moe_ids]
-    backbone_p = [p for _, p in named
-                  if id(p) not in adapter_ids and id(p) not in moe_ids]
-
-    cond_scale = getattr(args, 'condition_lr_scale', None)
-    if cond_scale is None:
-        cond_scale = getattr(args, 'adapter_lr_scale', 1.0)
+    if args.mode == "pretrain":
+        return [{"params": [p for _, p in named], "lr": args.lr_peak, "name": "all"}]
+    adapter_ids = {
+        id(p) for m in _iter_conditioning_modules(model) for p in m.parameters()
+    }
     groups = []
-    if backbone_p:
-        groups.append({'params': backbone_p,
-                       'lr': args.lr_peak * args.backbone_lr_scale, 'name': 'backbone'})
-    if adapter_p:
-        groups.append({'params': adapter_p,
-                       'lr': args.lr_peak * float(cond_scale), 'name': 'condition'})
-    if moe_p:
-        groups.append({'params': moe_p,
-                       'lr': args.lr_peak * getattr(args, 'tfm_moe_lr_scale', 1.0),
-                       'name': 'tfm_moe'})
+    backbone = [p for _, p in named if id(p) not in adapter_ids]
+    adapters = [p for _, p in named if id(p) in adapter_ids]
+    if backbone:
+        groups.append(
+            {
+                "params": backbone,
+                "lr": args.lr_peak * args.backbone_lr_scale,
+                "name": "backbone",
+            }
+        )
+    if adapters:
+        scale = getattr(args, "condition_lr_scale", None)
+        if scale is None:
+            scale = getattr(args, "adapter_lr_scale", 1.0)
+        groups.append(
+            {"params": adapters, "lr": args.lr_peak * float(scale), "name": "condition"}
+        )
     return groups
 
 
@@ -629,8 +534,14 @@ def build_optimizer(model, criterion, args):
     groups = get_param_groups(model, args)
     loss_p = [p for p in criterion.parameters() if p.requires_grad]
     if loss_p:
-        groups.append({'params': loss_p, 'lr': args.lr_peak * args.loss_lr_scale,
-                       'name': 'loss_weight', 'weight_decay': 0.0})
+        groups.append(
+            {
+                "params": loss_p,
+                "lr": args.lr_peak * args.loss_lr_scale,
+                "name": "loss_weight",
+                "weight_decay": 0.0,
+            }
+        )
     return AdamW(groups, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
 
@@ -638,14 +549,26 @@ def build_scheduler(optimizer, args):
     """Linear Warmup + CosineAnnealing；无 warmup 时直接余弦。"""
     if args.warmup_epochs > 0:
         start_factor = max(1e-4, args.lr_init / args.lr_peak)
-        return SequentialLR(optimizer, schedulers=[
-            LinearLR(optimizer, start_factor=start_factor, end_factor=1.0,
-                     total_iters=args.warmup_epochs),
-            CosineAnnealingLR(optimizer,
-                              T_max=max(1, args.train_epochs - args.warmup_epochs),
-                              eta_min=args.lr_final),
-        ], milestones=[args.warmup_epochs])
-    return CosineAnnealingLR(optimizer, T_max=max(1, args.train_epochs), eta_min=args.lr_final)
+        return SequentialLR(
+            optimizer,
+            schedulers=[
+                LinearLR(
+                    optimizer,
+                    start_factor=start_factor,
+                    end_factor=1.0,
+                    total_iters=args.warmup_epochs,
+                ),
+                CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, args.train_epochs - args.warmup_epochs),
+                    eta_min=args.lr_final,
+                ),
+            ],
+            milestones=[args.warmup_epochs],
+        )
+    return CosineAnnealingLR(
+        optimizer, T_max=max(1, args.train_epochs), eta_min=args.lr_final
+    )
 
 
 def count_trainable_params(model):

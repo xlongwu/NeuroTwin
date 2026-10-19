@@ -24,8 +24,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from experiments.evaluate_variant import (build_eval_loader, compute_fc_metrics,
-                                          load_train_args)
+from analysis.checkpoint import load_train_args
+from experiments.evaluate_variant import build_eval_loader, compute_fc_metrics
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')

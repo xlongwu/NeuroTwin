@@ -102,7 +102,7 @@ def compute_graph_regularization(aux_info, device,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NeuroTwin-TFM 双目标损失（方案 §19 / §20）
+#  NeuroTwin-TFM 双目标损失
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -114,7 +114,7 @@ def _huber_elementwise(pred: torch.Tensor, target: torch.Tensor,
 
 
 def compute_cpm_mask(controls: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
-    """从首次非零未来控制开始屏蔽 CPM 监督（方案 §9）。
+    """从首次非零未来控制开始屏蔽 CPM 监督。
 
     controls:    [B, H, F] 新布局逐区间控制（u[t+h] 到达区间 (t+h-1, t+h]）
     future_mask: [B, H]    各 horizon 是否有真值
@@ -131,7 +131,7 @@ def compute_cpm_mask(controls: torch.Tensor, future_mask: torch.Tensor) -> torch
 
 
 class TFMDualLoss(nn.Module):
-    """One-Step + CPM 双目标损失（方案 §9 Dual Dynamics Objective / §20）。
+    """One-Step + CPM 双目标损失。
 
     数学定义（pred/target 均为原始空间；``x_t`` 为 context 末位 TR）::
 
@@ -154,9 +154,9 @@ class TFMDualLoss(nn.Module):
     一致，也避免 s_i 在无监督信号时无界漂移）。各任务损失的内部结构
     （Huber/PCC/γ 加权/mask 语义）不变，只替换跨任务聚合权重。
 
-    设计说明（§20.1）：不使用数学等价的 ``L_abs + L_delta`` 双计项
+    设计说明：不使用数学等价的 ``L_abs + L_delta`` 双计项
     （prediction_target=delta 时二者数值重合），改为单一 Huber + spatial PCC；
-    CPM 项逐 horizon 加权（§20.2，γ=1 即均匀，<1 时对远期 horizon 降权）。
+    CPM 项逐 horizon 加权。
     λ_cpm=0 可退化为纯 one-step 的 Stage 0 基线。
     """
 
@@ -251,7 +251,7 @@ class TFMDualLoss(nn.Module):
             cpm_target:  [B, F, H]   t+1..t+H 真值（原始空间，序列末尾截断补零）
             cpm_mask:    [B, H]      各 horizon 是否有真值（None = 全有效）；
                                      graph_ode 路线传入 compute_cpm_mask 的结果
-            ---- 以下为 graph_ode 动态可选输入（discrete 路线不传，行为不变）----
+            ---- Graph-ODE 动态与方差输入 ----
             dynamics_pred/target:  [B, F, H] 动态轨迹预测与真值（数据尺度）
             dynamics_mask:         [B, H]    future_mask（**不是** cpm_mask）
             dynamics_mean_norm:    [B, F, H] 归一化空间动态均值（方差损失用，内部 detach）
@@ -277,7 +277,7 @@ class TFMDualLoss(nn.Module):
                 f"CPM pred 期望 [B,F,H]，收到 {tuple(cpm_pred.shape)}")
 
         stats = {}
-        # ---- L_one（§20.1：Huber + spatial PCC）----
+        # ---- L_one----
         loss_one = _huber_elementwise(pred[:, :, 0, 0], target[:, :, 0, 0],
                                       self.huber_delta).mean()
         corr_one = spatial_pcc(pred, target, self.eps).mean()      # [1] → 标量
@@ -291,7 +291,7 @@ class TFMDualLoss(nn.Module):
         stats['loss_one_pcc'] = loss_one_pcc.detach()
         stats['pcc_one'] = corr_one.detach()
 
-        # ---- L_CPM（§20.2：γ 加权逐 horizon Huber）----
+        # ---- L_CPM----
         n_valid = cpm_pred.shape[0]
         if n_valid > 0 and self.lambda_cpm > 0:
             h = cpm_pred.shape[2]

@@ -71,9 +71,9 @@ def resolve_task_dims(args):
         seq_len = args.context_max（context TR 数上界，= 模型 S 轴建模宽度）
 
     说明：实际 context 长度 K 可以是任意 K <= context_max（S 轴前缀切片支持），
-    参数集合不随 K 变化。TFM 的 one-step 头只建模 +1 偏移（方案 §10），
+    参数集合不随 K 变化。TFM 的 one-step 头只建模 +1 偏移，
     要求 forecast_offsets == [1]，稀疏偏移 {1,2,4,8} 由 CPM 头的 horizon
-    覆盖（§18 Task C）。
+    覆盖。
     """
     task_mode = str(getattr(args, 'task_mode', 'next_timepoint'))
     if task_mode not in TASK_MODES:
@@ -82,7 +82,7 @@ def resolve_task_dims(args):
     dims['model_arch'] = 'tfm'
     if dims['pred_window'] != 1:
         raise ValueError(
-            f"TFM 的 one-step 头只建模 +1 偏移（方案 §10），"
+            f"TFM 的 one-step 头只建模 +1 偏移，"
             f"要求 forecast_offsets == [1]，收到 {dims['pred_window']} 个偏移；"
             "多步预测请用 --cpm_horizon 控制 CPM 头的 horizon。")
     patch_len = int(getattr(args, 'tfm_patch_len', 4))
@@ -136,7 +136,7 @@ def _resolve_next_timepoint_dims(args):
             "（causality 由数据构造保证）。")
     if causal != 'random_context':
         raise ValueError(
-            f"--causal_training 仅支持 random_context（方案 B），收到 '{causal}'")
+            f"--causal_training 仅支持 random_context，收到 '{causal}'")
 
     return {'task_mode': 'next_timepoint', 'in_window': 1,
             'pred_window': len(offsets), 'seq_len': context_max}
@@ -160,3 +160,14 @@ def set_seed(seed: int):
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def parse_pathology_fields(fields):
+    """把逗号分隔的字段字符串解析为列表；空/None 返回 None（由 Dataset 使用默认）。"""
+    if fields is None:
+        return None
+    if isinstance(fields, (list, tuple)):
+        parsed = [str(f).strip() for f in fields if str(f).strip()]
+        return parsed or None
+    parsed = [f.strip() for f in str(fields).split(",") if f.strip()]
+    return parsed or None

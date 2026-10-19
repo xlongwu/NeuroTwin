@@ -54,3 +54,8 @@ Thumbs.db
 # Local datasets and generated experiment results
 /data.zip
 /results/
+
+# Tool caches and generated analysis outputs
+.pytest_cache/
+.ruff_cache/
+/outputs/

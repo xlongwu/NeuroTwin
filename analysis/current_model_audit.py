@@ -5,7 +5,12 @@ import json
 from pathlib import Path
 
 import torch
-from experiments.evaluate_variant import build_model_from_args, load_condition_bundle, load_train_args
+
+from analysis.checkpoint import (
+    build_model_from_args,
+    load_condition_bundle,
+    load_train_args,
+)
 
 
 def digest(path):

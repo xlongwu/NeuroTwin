@@ -1,5 +1,5 @@
 # coding=utf-8
-"""独立临床结局读出训练入口（方案 §8）。
+"""独立临床结局读出训练入口。
 
 一个患者/访视对一个样本；冻结动态模型与健康参照，``no_grad`` 提取 83 维特征
 （全部来自基线信息与基线模拟），训练 :class:`models.twin_outcome.ClinicalOutcomeHead`。
@@ -35,9 +35,14 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from models.twin_outcome import (FEATURE_BLOCKS, FEATURE_DIM,
-                                 ClinicalOutcomeHead, OutcomeStandardizer,
-                                 assemble_features, masked_gaussian_nll)
+from models.twin_outcome import (
+    FEATURE_BLOCKS,
+    FEATURE_DIM,
+    ClinicalOutcomeHead,
+    OutcomeStandardizer,
+    assemble_features,
+    masked_gaussian_nll,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -156,13 +161,15 @@ class OutcomeFeatureExtractor:
 
     def __init__(self, ckpt_path: str, reference_path: str,
                  condition_file: Optional[str] = None, device=None):
-        from experiments.evaluate_variant import (build_model_from_args,
-                                                  load_condition_bundle,
-                                                  load_train_args)
-        from analysis.checkpoint import load_checkpoint_compat
+        from analysis.checkpoint import (
+            build_model_from_args,
+            load_checkpoint_compat,
+            load_condition_bundle,
+            load_train_args,
+        )
         from analysis.twin_reference import load_reference
-        from utils.dataloader import load_condition_table
         from utils.condition_schema import ConditionStats, schema_for
+        from utils.dataloader import load_condition_table
 
         self.device = device or torch.device(
             'cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -221,7 +228,7 @@ class OutcomeFeatureExtractor:
             'cond_code': torch.from_numpy(emb).to(self.device),
             'cond_mask': torch.from_numpy(mask.astype(np.float32)).to(self.device),
         }
-        c = self.model._prepare_condition(None, condition=cond,
+        c = self.model._prepare_condition(condition=cond,
                                           condition_epoch=None)   # [1,C]
         return cond, c
 
@@ -275,7 +282,7 @@ class OutcomeFeatureExtractor:
         u_t = torch.from_numpy(u.astype(np.float32))[None].to(self.device)  # [1,8,F]
         hist_t = torch.from_numpy(hist.T.astype(np.float32))[None].to(self.device)
         sc_eye = torch.eye(f_dim, device=self.device)[None]          # 占位（history_fc）
-        kw = dict(sc_matrix=sc_eye, pathology_score=None, steps=OUTCOME_HORIZON,
+        kw = dict(sc_matrix=sc_eye, steps=OUTCOME_HORIZON,
                   condition=cond_cpu, calibration_bold=cal32)
         traj_u = self.model.rollout_next_states(hist_t, controls=u_t, **kw)
         traj_0 = self.model.rollout_next_states(hist_t, **kw)        # 零控制分支
@@ -326,7 +333,7 @@ def build_pairs_targets(rows: List[dict]) -> tuple:
 
 
 def main():
-    ap = argparse.ArgumentParser(description='独立临床结局读出训练（方案 §8）')
+    ap = argparse.ArgumentParser(description='独立临床结局读出训练')
     ap.add_argument('--pairs', required=True, help='配对 CSV（字段严格见模块 docstring）')
     ap.add_argument('--dynamics_checkpoint', required=True,
                     help='graph_ode + personalized 动态 checkpoint（冻结）')
@@ -378,9 +385,9 @@ def main():
         # mask_j = 基线与随访都存在
         masks[s] = np.stack([
             np.array([1.0 if (r['scores']['hamd'] is not None
-                              and r['scores'][f'followup_hamd'] is not None) else 0.0,
+                              and r['scores']['followup_hamd'] is not None) else 0.0,
                       1.0 if (r['scores']['hama'] is not None
-                              and r['scores'][f'followup_hama'] is not None) else 0.0])
+                              and r['scores']['followup_hama'] is not None) else 0.0])
             for r in srows], axis=0)
         del base_mu
     if 'train' not in feats or len(feats['train']) == 0:
