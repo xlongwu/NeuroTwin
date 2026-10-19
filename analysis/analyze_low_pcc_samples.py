@@ -11,23 +11,20 @@ experiments/evaluate_variant.py 落盘的 next_timepoint 评估产物：
 
 import argparse
 import json
-import logging
-
-import matplotlib
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
 matplotlib.use('Agg')
-import warnings
 from pathlib import Path
-
 from scipy import stats
-
+import warnings
 warnings.filterwarnings('ignore')
 
+# 项目根目录（脚本位于 <root>/analysis/，路径均基于项目内）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# 设置中文字体
 plt.rcParams['font.sans-serif'] = ['Times New Roman']
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -72,6 +69,7 @@ def load_data(args):
         raise ValueError(
             f'{subj_csv} 缺少 subject_id / hamd 列；可用列：{list(subj_df.columns)}')
 
+    # 加载V1和V2 MDD数据
     v1_df = pd.read_excel(args.v1_file)
     v2_df = pd.read_excel(args.v2_file)
 
@@ -103,8 +101,11 @@ def process_sample_metrics(sample_metrics, subj_scores):
 def merge_with_clinical_data(subj_stats, v1_df, v2_df):
     """合并临床数据"""
     
+    # 标准化ID格式
     def normalize_id(subj_id):
         """标准化ID格式"""
+        # IS001-1-0003 -> IS001-1-0003
+        # S1-1-0001 -> S1-1-0001
         return str(subj_id).strip()
     
     subj_stats = subj_stats.copy()
@@ -121,6 +122,7 @@ def merge_with_clinical_data(subj_stats, v1_df, v2_df):
     # 未匹配的尝试V1数据
     unmatched = merged[merged['ID'].isna()].copy()
     if len(unmatched) > 0:
+        # 复制需要合并的列，包括subj_id_norm
         unmatched_cols = ['subj_id', 'subj_id_norm', 'mean_pcc', 'std_pcc', 'min_pcc', 'max_pcc', 'pathology_score', 'is_low_pcc']
         unmatched_subset = unmatched[unmatched_cols].copy()
         
@@ -128,12 +130,14 @@ def merge_with_clinical_data(subj_stats, v1_df, v2_df):
             v1_df, left_on='subj_id_norm', right_on='ID_norm', how='left'
         )
         
+        # 更新已匹配的行
         for idx in matched_v1.index:
             if pd.notna(matched_v1.loc[idx, 'ID']):
                 for col in v1_df.columns:
                     if col in merged.columns:
                         merged.loc[idx, col] = matched_v1.loc[idx, col]
     
+    # 标记数据来源
     merged['data_source'] = merged['ID'].apply(lambda x: 'V2' if pd.notna(x) and str(x).startswith('IS') else ('V1' if pd.notna(x) else 'Unknown'))
     
     return merged
@@ -141,8 +145,8 @@ def merge_with_clinical_data(subj_stats, v1_df, v2_df):
 def analyze_low_pcc_characteristics(merged_df):
     """分析低PCC样本的临床特征"""
     
-    low_pcc = merged_df[merged_df['is_low_pcc'].eq(True)]
-    normal_pcc = merged_df[merged_df['is_low_pcc'].eq(False)]
+    low_pcc = merged_df[merged_df['is_low_pcc'] == True]
+    normal_pcc = merged_df[merged_df['is_low_pcc'] == False]
     
     print(f"\n{'='*60}")
     print("低PCC样本分析")
@@ -175,11 +179,11 @@ def analyze_low_pcc_characteristics(merged_df):
             normal_vals = normal_pcc[var].dropna()
             
             if len(low_vals) > 0 and len(normal_vals) > 0:
+                # 确保数据是数值型
                 try:
                     low_vals_numeric = pd.to_numeric(low_vals, errors='coerce').dropna()
                     normal_vals_numeric = pd.to_numeric(normal_vals, errors='coerce').dropna()
-                except Exception as exc:
-                    logging.warning('无法将临床字段 %s 转为数值: %s', var, exc)
+                except:
                     continue
                 
                 if len(low_vals_numeric) == 0 or len(normal_vals_numeric) == 0:
@@ -263,6 +267,7 @@ def plot_clinical_comparison(low_pcc, normal_pcc, output_path):
         if var in low_pcc.columns and var in normal_pcc.columns:
             ax = axes[i]
             
+            # 转换为数值并去除NaN
             low_vals = pd.to_numeric(low_pcc[var], errors='coerce').dropna()
             normal_vals = pd.to_numeric(normal_pcc[var], errors='coerce').dropna()
             
@@ -279,11 +284,11 @@ def plot_clinical_comparison(low_pcc, normal_pcc, output_path):
                     ax.set_title(f'{var} Distribution', fontsize=12, fontweight='bold')
                     ax.grid(axis='y', alpha=0.3)
                     
+                    # 添加统计信息
                     ax.text(0.5, 0.95, f'Low: {low_vals.mean():.1f}±{low_vals.std():.1f}\nNormal: {normal_vals.mean():.1f}±{normal_vals.std():.1f}',
                            transform=ax.transAxes, verticalalignment='top',
                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5), fontsize=9)
-                except Exception as exc:
-                    logging.warning('临床字段 %s 无法绘制分布: %s', var, exc)
+                except:
                     ax.text(0.5, 0.5, f'{var}\nInsufficient data', 
                            transform=ax.transAxes, ha='center', va='center')
                     ax.set_title(f'{var}', fontsize=12, fontweight='bold')
@@ -336,8 +341,8 @@ def plot_hamd_factors_comparison(low_pcc, normal_pcc, output_path):
     x = np.arange(len(available_items))
     width = 0.35
     
-    ax.bar(x - width/2, low_means, width, label='Low PCC', color='#C55A11', alpha=0.8)
-    ax.bar(x + width/2, normal_means, width, label='Normal PCC', color='#5B9BD5', alpha=0.8)
+    bars1 = ax.bar(x - width/2, low_means, width, label='Low PCC', color='#C55A11', alpha=0.8)
+    bars2 = ax.bar(x + width/2, normal_means, width, label='Normal PCC', color='#5B9BD5', alpha=0.8)
     
     # 标记显著差异
     for i, pval in enumerate(p_values):
@@ -513,9 +518,9 @@ def main(args):
     print("分析完成！")
     print(f"{'='*60}")
     print(f"\n结果保存至: {out_dir}")
-    print("  - low_pcc_analysis_results.json (详细统计)")
-    print("  - low_pcc_samples.xlsx (低PCC样本列表)")
-    print("  - *.png (可视化图表)")
+    print(f"  - low_pcc_analysis_results.json (详细统计)")
+    print(f"  - low_pcc_samples.xlsx (低PCC样本列表)")
+    print(f"  - *.png (可视化图表)")
 
 if __name__ == '__main__':
     main(parse_args())

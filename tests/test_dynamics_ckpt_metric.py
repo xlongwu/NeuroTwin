@@ -187,7 +187,7 @@ class _StubModel(torch.nn.Module):
 
     cpm_horizon = STUB_H
 
-    def forward(self, bx, bs, **kwargs):
+    def forward(self, bx, bs, bp, **kwargs):
         b, f = bx.shape[0], bx.shape[1]
         outputs = torch.zeros(b, f, 1, 1)
         aux = {'dynamics_pred': torch.zeros(b, f, STUB_H),
@@ -202,6 +202,7 @@ class _StubCriterion:
 
 def _stub_args():
     return SimpleNamespace(cpm_horizon=STUB_H, cpm_huber_delta=1.0,
+                           tfm_competence_temperature=1.0,
                            sc_sparsity_weight=0.0, sc_entropy_weight=0.0,
                            sc_temporal_weight=0.0,
                            dynamics_metric_horizon=STUB_H)

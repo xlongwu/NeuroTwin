@@ -1,11 +1,11 @@
 # coding=utf-8
-"""个人基线 profile 与 PersonalFiLM。
+"""个人基线 profile 与 PersonalFiLM（方案 §5 / §6.1.2）。
 
 ProfileEncoder 从同一扫描最早 ``calibration_length``（默认 32）TR 的
 ``calibration_bold`` 出发，经**共享** TFM 编码器得到基线 tokens 后，沿 ROI 和
 patch 双均值池化，经两层 MLP + tanh 得到固定维（默认 32）的个体校准码 p。
 
-- 基线编码不注入当前临床 FiLM（cond_mods=None 路径），临床影响
+- 基线编码不注入当前临床 FiLM / AdaRMSNorm（cond_mods=None 路径），临床影响
   留给向量场的 c，避免把同一份当前评分再编码进 profile；
 - 不创建 ID embedding 或逐人训练参数；
 - 训练时前向保留梯度，不跨 optimizer step 缓存 detached tokens；
@@ -70,7 +70,7 @@ class PersonalFiLM(nn.Module):
     """个体 profile 的 FiLM 调制：``h' = h·(1+γ_p(p)) + β_p(p)``。
 
     与 :class:`models.tfm.ConditionFiLM` 同风格：零初始化 → 初始不改基准动力学
-    。标记
+    （方案 §6.1.4：FiLM 零初始化使个体码初始不改变基准向量场）。标记
     ``is_conditioning_adapter=True``，冻结主干阶段随条件模块一起训练。
     """
 

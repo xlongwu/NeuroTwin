@@ -20,7 +20,8 @@ import matplotlib as mpl
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap, to_rgb
 from matplotlib.patches import Patch
-from nilearn import datasets, image, plotting
+
+from nilearn import datasets, plotting, image
 
 mpl.rcParams.update({
     "font.family": "sans-serif",
@@ -257,7 +258,7 @@ def main():
 
     groups = group_by_network(region_indexes, importance, networks,
                               int(args.max_regions_per_figure))
-    print("网络分组: " + ", ".join(f"{k}({len(v)})" for k, v in groups.items()))
+    print(f"网络分组: " + ", ".join(f"{k}({len(v)})" for k, v in groups.items()))
 
     atlas_img, regions = load_aal_atlas()
     atlas_nii = image.load_img(atlas_img)

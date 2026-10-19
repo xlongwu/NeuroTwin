@@ -1,7 +1,8 @@
 # coding=utf-8
-"""受控条件图 ODE 动力学头与逐 ROI 方差读出。
+"""受控条件图 ODE 动力学头与逐 ROI 方差读出（方案 §6）。
 
-GraphODEDynamicsHead 是当前动力学头：
+GraphODEDynamicsHead 在 ``dynamics_mode='graph_ode'`` 时**替换**
+``OneStepDynamicsHead``（不包装旧头 residual、不构建第二套闲置参数）：
 
 - 组合 Laplacian 图扩散 ``L = diag(deg) - A``（不显式构造 L，按
   ``degree.unsqueeze(-1) * z - bmm(adj, z)`` 计算）；
@@ -29,7 +30,7 @@ import torch.nn.functional as F
 
 from models.tfm_personal import PersonalFiLM
 
-#: logvar 的数值边界
+#: logvar 的数值边界（方案 §6.4 / §8.1）
 LOGVAR_MIN = -6.0
 LOGVAR_MAX = 4.0
 
@@ -63,7 +64,7 @@ class VarianceHead(nn.Module):
 
 
 class GraphODEDynamicsHead(nn.Module):
-    """受控条件图 ODE 头：向量场 + 固定 Heun RK2。
+    """受控条件图 ODE 头（方案 §6.1）：向量场 + 固定 Heun RK2。
 
     Args:
         dim: latent 宽度 D。
@@ -74,7 +75,7 @@ class GraphODEDynamicsHead(nn.Module):
         residual_strength: 神经残差系数（默认 0.1，固定不可学习）。
         diffusion_init: 扩散率初值（默认 0.05；``kappa_raw = log(expm1(κ_init))``）。
 
-    初始化：W1 Xavier、W2 正态 std=0.01、各 bias 零；两类 FiLM
+    初始化（方案 §6.1.4）：W1 Xavier、W2 正态 std=0.01、各 bias 零；两类 FiLM
     与 w_c/w_p 零初始化；G 正态 std=0.01 无 bias；控制门正常随机、b_s=0；
     W_y/b_y 零初始化（初始 BOLD 为 persistence）。W2、G 与控制门**不**一起清零。
     """
@@ -113,7 +114,7 @@ class GraphODEDynamicsHead(nn.Module):
         self.film = None
         self.kappa_cond = None
         if self.cond_dim:
-            self.film = ConditionFiLM(self.cond_dim, self.hidden_dim)
+            self.film = ConditionFiLM(self.cond_dim, self.hidden_dim, lam=1.0)
             self.kappa_cond = nn.Linear(self.cond_dim, 1, bias=False)
             nn.init.zeros_(self.kappa_cond.weight)
         self.personal_film = None
@@ -143,7 +144,7 @@ class GraphODEDynamicsHead(nn.Module):
         self.variance_head = VarianceHead(self.dim)
 
     # ------------------------------------------------------------------
-    # 向量场
+    # 向量场（方案 §6.1.1–§6.1.3）
     # ------------------------------------------------------------------
     def _field(self, z: torch.Tensor, adj: torch.Tensor,
                cond: Optional[torch.Tensor] = None,
@@ -205,7 +206,7 @@ class GraphODEDynamicsHead(nn.Module):
         return self.decode_rate(z).squeeze(-1)
 
     # ------------------------------------------------------------------
-    # 固定 Heun RK2
+    # 固定 Heun RK2（方案 §6.2）
     # ------------------------------------------------------------------
     def integrate_interval(self, z: torch.Tensor, q: torch.Tensor,
                            adj: torch.Tensor, dt: torch.Tensor,
@@ -250,7 +251,7 @@ class GraphODEDynamicsHead(nn.Module):
         return z32, q32
 
     # ------------------------------------------------------------------
-    # 多区间推进
+    # 多区间推进（方案 §6.2 末）
     # ------------------------------------------------------------------
     def forward(self, z0: torch.Tensor, q0: torch.Tensor, adj: torch.Tensor,
                 cond: Optional[torch.Tensor] = None,

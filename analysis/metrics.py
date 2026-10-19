@@ -147,8 +147,9 @@ def compute_advanced_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, 
     metrics['RMSE'] = float(np.sqrt(metrics['MSE']))
     metrics['PCC'] = pearson_global(pred, target)
     
-    # R²
+    # R² 和调整后 R²
     y = target.reshape(-1).astype(np.float64)
+    n = len(y)
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     ss_res = float(np.sum((pred.reshape(-1).astype(np.float64) - y) ** 2))
     metrics['R2'] = 1.0 - ss_res / (ss_tot + 1e-12)
@@ -467,7 +468,7 @@ def export_significance_to_xlsx(importance: Dict[str, np.ndarray],
     """
     try:
         import openpyxl
-        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
     except ImportError:
         log.warning("openpyxl not available, falling back to pandas for xlsx export")

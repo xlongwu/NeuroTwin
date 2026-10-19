@@ -6,7 +6,7 @@
 语义、连续/类别分组切片与 ``layout_hash`` 全部在这里生成，其他模块只消费
 本模块的输出，不允许各自猜列序。
 
-字段与缺失处理规则：
+协议要点（docs/Version3_docs_1003/NeuroTwin_条件注入实验方案.md）：
 
 - 条件数据**只**读取 merged 文件（``Rest-meta-MDD-V1V2-Merged-{HC,MDD}.xlsx``），
   禁止回读单独的 V1/V2 源表补齐、覆盖或恢复编码；
@@ -832,12 +832,3 @@ def file_sha256(path) -> str:
         for block in iter(lambda: f.read(1 << 20), b''):
             h.update(block)
     return h.hexdigest()
-
-
-def condition_stats_from_bundle(bundle, group):
-    """把 checkpoint 的统计量快照还原成 ConditionStats（供 inherit 模式复用）。"""
-    if bundle is None or not bundle.get("stats"):
-        raise ValueError(
-            "checkpoint 未携带 config.condition.stats：无法按训练期的 train-only 统计量重建条件编码。请用当前代码重新训练/保存。"
-        )
-    return ConditionStats.from_dict(schema_for(group), bundle["stats"])
