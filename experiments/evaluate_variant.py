@@ -6,7 +6,7 @@ analysis/next_point_eval.py：next-state 主指标 + persistence/trend/AR(1) bas
 free rollout + FC/频谱。
 
 关键点（模型重建口径）：
-  构造 NeuroTwin 若只传部分参数，结构性变体（head_shape_mode/moe_experts_mode/
+  构造 NeuroTwinTFM 若只传部分参数，结构性变体（tfm_patch_len/cpm_horizon/
   sc_prior_mode 等）会按默认结构建模导致权重错配。训练结束时
   save_backbone_weights 已把完整 vars(args) 存进 ckpt['config']['args']
   （train/optim.py），因此这里从该快照 + inspect.signature 自省重建与训练
@@ -26,37 +26,29 @@ import numpy as np
 import torch
 
 from analysis.metrics import NETWORK_GROUPS
-from models.neurotwin import NeuroTwin
-from utils.common import parse_pred_quantiles, set_seed
+from models.tfm import NeuroTwinTFM
+from utils.common import set_seed
 from utils.dataloader import NeuroTwinDataLoader
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
-# next_timepoint 任务（task_mode=next_timepoint）的模型维度来自 context/offset 配置，
-# 见 utils.common.resolve_task_dims 与 main.py 的同名解析逻辑
-_KWARG_ALIAS_NEXT_POINT = {
-    'features': 'num_rois',
-    'adapter_alpha': 'alpha',
-    # 评估期路由温度：训练结束时已退火到 temp_end（与 analysis/checkpoint.py 一致）
-    'moe_gate_temperature': 'moe_gate_temp_end',
-}
-# 由本函数显式控制的参数（不从 args 取）；pretrain_mode 由 args.mode 推导，
-# 保证 HC 预训练检查点也能按结构重建（旧的 pretrain 权重此前无法被评估）
-_KWARG_FIXED = {'pred_quantiles', 'refiner_return_rounds', 'pred_logvar_init'}
-
 
 def _next_point_model_dims(args) -> dict:
     """next_timepoint 的模型维度（与 main.py 的生效值一致）。
 
-    in_window=1（整段 context 作为单窗口）、pred_window=len(forecast_offsets)、
-    in_seq_len=context_max（S 轴建模宽度）、pred_seq_len=1（每个偏移 1 个时间点）。
+    in_window=1（整段 context 作为单窗口）、pred_window=1（one-step 头只建模
+    +1 偏移）、in_seq_len=context_max（S 轴建模宽度）、pred_seq_len=1（每个偏移
+    1 个时间点）；另附 patch_len / cpm_horizon（结构签名分量）。
     """
-    from utils.common import resolve_forecast_offsets
-    return {'in_window': 1,
-            'pred_window': len(resolve_forecast_offsets(args)),
+    dims = {'in_window': 1,
+            'pred_window': 1,
             'in_seq_len': int(getattr(args, 'context_max')),
-            'pred_seq_len': 1}
+            'pred_seq_len': 1,
+            'model_arch': 'tfm',
+            'patch_len': int(args.tfm_patch_len),
+            'cpm_horizon': int(args.cpm_horizon)}
+    return dims
 
 
 def load_train_args(ckpt_path):
@@ -71,32 +63,97 @@ def load_train_args(ckpt_path):
     return Namespace(**saved)
 
 
-def build_model_from_args(args, device):
-    """按 inspect.signature 自省从参数快照重建与训练一致的 NeuroTwin。"""
-    sig = inspect.signature(NeuroTwin.__init__).parameters
-    alias, dims_override = _KWARG_ALIAS_NEXT_POINT, _next_point_model_dims(args)
+def load_condition_bundle(ckpt_path):
+    """读取 checkpoint 的条件协议块（config / train-only 统计量 / 元数据）。
+
+    ``condition_config`` 与 ``condition_stats_payload`` 都**不是** argparse 参数，
+    而是训练期由数据拟合得到的结构输入；重建模型必须从这里取回，否则条件模块不会
+    存在、strict 加载会把条件键判为 unexpected（方案 §8：不靠运行时默认值猜测
+    mask/schema 语义）。
+    """
+    raw = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    cfg = raw.get('config') if isinstance(raw, dict) else None
+    cond = (cfg or {}).get('condition') if isinstance(cfg, dict) else None
+    if not isinstance(cond, dict) or not cond.get('config'):
+        return None
+    return {'config': cond['config'], 'stats': cond.get('stats'),
+            'meta': cond.get('meta') or {}, 'split_hash': cond.get('split_hash')}
+
+
+def condition_stats_from_bundle(bundle, group):
+    """把 checkpoint 的统计量快照还原成 ConditionStats（供 inherit 模式复用）。"""
+    from utils.condition_schema import ConditionStats, schema_for
+    if bundle is None or not bundle.get('stats'):
+        raise ValueError(
+            'checkpoint 未携带 config.condition.stats：无法按训练期的 train-only 统计量'
+            '重建条件编码。请用当前代码重新训练/保存。')
+    return ConditionStats.from_dict(schema_for(group), bundle['stats'])
+
+
+# NeuroTwinTFM 构造参数 → 训练快照键的别名（其余同名参数直接取自快照）
+_KWARG_ALIAS_TFM = {
+    'features': 'num_rois',
+    'patch_len': 'tfm_patch_len',
+    'dim': 'tfm_dim',
+    'num_layers': 'tfm_layers',
+    'num_heads': 'tfm_heads',
+    'ff_ratio': 'tfm_ff_ratio',
+    'one_step_hidden_dim': 'tfm_one_step_hidden_dim',
+    'use_revin': 'norm',
+}
+
+
+def build_model_from_args(args, device, condition_bundle=None):
+    """按 inspect.signature 自省从参数快照重建与训练一致的 NeuroTwinTFM。
+
+    条件注入的结构参数（``condition_config`` / ``condition_stats_payload``）不在
+    ``config.args`` 快照里，必须由 ``condition_bundle``（checkpoint 的
+    ``config.condition``）提供；缺一都会让 strict 加载立即失败而不是静默降级。
+    """
+    model_arch = str(getattr(args, 'model_arch', 'tfm'))
+    if model_arch != 'tfm':
+        raise ValueError(
+            f"checkpoint 的 model_arch='{model_arch}'：legacy NeuroTwin 架构已移除，"
+            "无法重建该模型。请改用 NeuroTwinTFM（model_arch=tfm）的 checkpoint。")
+    sig = inspect.signature(NeuroTwinTFM.__init__).parameters
     kwargs = {}
     for name, param in sig.items():
         if name == 'self':
             continue
-        if name in _KWARG_FIXED:
-            continue
-        if name in dims_override:
-            # 任务维度由 context/offset 配置推导，优先于快照中的同名键
-            kwargs[name] = dims_override[name]
-        elif name in alias and hasattr(args, alias[name]):
-            kwargs[name] = getattr(args, alias[name])
-        elif hasattr(args, name):
-            kwargs[name] = getattr(args, name)
+        if name == 'features':
+            kwargs[name] = int(args.num_rois)
+        elif name == 'context_max':
+            # 任务维度由配置推导，优先于快照中的同名键
+            kwargs[name] = int(getattr(args, 'context_max'))
         else:
-            # 快照中缺失的参数（旧 checkpoint）回落模型默认值
-            if param.default is inspect.Parameter.empty:
+            alias = _KWARG_ALIAS_TFM.get(name, name)
+            if hasattr(args, alias):
+                kwargs[name] = getattr(args, alias)
+            elif param.default is inspect.Parameter.empty:
                 raise ValueError(f'参数快照缺少必填构造参数：{name}')
-    # 训练阶段的 mode 决定模型是否带病理条件模块（MoE / AdaLN / 归一化器）：
-    # finetune 权重 → pretrain_mode=False（与旧行为一致），HC 预训练权重 → True
+    # 训练阶段的 mode 决定模型是否带 legacy 病理模块（FiLM / 归一化器）；
+    # 字段级条件注入在 HC 预训练同样允许，由快照的 condition_arm + bundle 决定
     kwargs['pretrain_mode'] = (str(getattr(args, 'mode', 'finetune')) == 'pretrain')
-    kwargs['pred_quantiles'] = parse_pred_quantiles(args.pred_quantiles)
-    return NeuroTwin(**kwargs).to(device)
+    arm = str(getattr(args, 'condition_arm', 'none') or 'none')
+    if arm != 'none':
+        if condition_bundle is None:
+            raise ValueError(
+                f'训练快照 condition_arm={arm}，但 checkpoint 无 config.condition：'
+                '无法重建条件编码器。请用当前代码重新训练，或显式提供带条件元数据的权重。')
+        kwargs['condition_config'] = condition_bundle['config']
+        kwargs['condition_stats_payload'] = condition_bundle['stats']
+        for name in ('cond_inject', 'cond_backbone_scope', 'cond_norm_generator',
+                     'cond_norm_ident_dim', 'cond_lambda_os', 'cond_lambda_cpm',
+                     'cond_gate_residual', 'cond_gate_hidden'):
+            if hasattr(args, name):
+                kwargs[name] = getattr(args, name)
+    # ARCH_VERSION 6 溯源：旧 v5 checkpoint 的快照不含动态路线字段，按
+    # discrete / personalized=False / legacy_mask 默认重建（参数集合与 v5 一致，
+    # strict 加载可过；绝不把旧 one-step 头权重迁移到 ODE 头）
+    if any(not hasattr(args, n) for n in ('dynamics_mode', 'graph_source', 'personalized')):
+        log.info('[arch] 快照缺少动态路线字段（arch_version<6 旧 checkpoint），'
+                 '按 discrete/personalized=False/legacy_mask 重建')
+    return NeuroTwinTFM(**kwargs).to(device)
 
 
 def build_eval_loader(args, eval_split, refresh_split_manifest=False):
@@ -139,6 +196,12 @@ def build_eval_loader(args, eval_split, refresh_split_manifest=False):
             getattr(args, 'eval_rollout_tasks_per_subject', 2)),
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
+        eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
+        # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
+        num_rois=int(getattr(args, 'num_rois', 116)),
+        graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
+        calibration_length=int(getattr(args, 'calibration_length', 0) or 0),
+        control_manifest=(getattr(args, 'control_manifest', '') or None),
     )
     if eval_split == 'test':
         return loader.get_test(), loader.get_test_subjects()
@@ -208,11 +271,12 @@ def compute_fc_metrics(pred, target, eps=1e-6):
 
 
 def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=2024,
-                        device=None, run_shuffled=True, save_arrays=False,
+                        device=None, save_arrays=False,
                         eval_rollout=None, eval_fc=None, eval_spectral=None,
                         spectral_tr=None, refresh_split_manifest=False,
                         compute_importance=False, importance_max_tasks=256,
-                        importance_permutations=0, importance_fdr_alpha=0.05):
+                        importance_permutations=0, importance_fdr_alpha=0.05,
+                        direction_deadzone=None):
     """Next-Timepoint（Next Brain-State Prediction）评估入口。
 
     主指标是**单时间点全脑状态**的 MAE/RMSE/spatial PCC，baselines 为
@@ -236,24 +300,47 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
     spectral_tr = (getattr(args, 'eval_spectral_tr', 2.0) if spectral_tr is None
                    else spectral_tr)
 
-    model = build_model_from_args(args, device)
+    condition_bundle = load_condition_bundle(ckpt_path)
+    model = build_model_from_args(args, device, condition_bundle=condition_bundle)
     model, compat = load_checkpoint_compat(model, ckpt_path, device, strict=True)
     if compat.get('missing') or compat.get('unexpected'):
         raise RuntimeError(f'权重加载不完整：{compat}')
     n_params = int(sum(p.numel() for p in model.parameters()))
+    if getattr(model, 'conditioner', None) is not None:
+        # strict 重建后必须逐位复现训练期的条件编码：核对布局哈希，
+        # 同宽度但字段顺序变化也会在这里被拦下（验收 K/M）
+        saved_hash = (condition_bundle or {}).get('meta', {}).get('layout_hash')
+        now_hash = model.conditioner.layout()['layout_hash']
+        if saved_hash and saved_hash != now_hash:
+            raise RuntimeError(
+                f'条件布局不一致：checkpoint={saved_hash}，重建后={now_hash}。'
+                '字段顺序/来源列/类别词表任一变化都禁止复用旧权重。')
+        log.info('[condition] strict 重建完成 | arm=%s layout_hash=%s',
+                 model.conditioner.cfg.arm, now_hash)
 
     extra = {
-        'shuffled_hamd': ({'available': False,
-                           'reason': 'next_timepoint 协议尚未接入 shuffled-HAMD 负对照'
-                                     '（见文档未完成事项）'} if run_shuffled
-                          else {'available': False, 'reason': '未请求'}),
         'conformal_calibration': {'available': False,
                                   'reason': 'next_timepoint 协议未接入 conformal 校准（P3）'},
     }
     summary = {'n_params': n_params}
     for split in eval_splits:
         data_loader, subjects, loader = npe.build_next_point_loader(
-            args, split, refresh_split_manifest=refresh_split_manifest)
+            args, split, refresh_split_manifest=refresh_split_manifest,
+            condition_bundle=condition_bundle)
+        if condition_bundle is not None and loader.base_dataset.condition_enabled:
+            # 溯源校验：本次运行在 merged 中解析到的**实际列**必须与训练时一致，
+            # 否则说明表结构变化或来源被静默切换（禁止用其他列/文件补齐）
+            saved_src = (condition_bundle.get('meta') or {}).get('resolved_source_map')
+            now_src = loader.base_dataset.condition_table.audit.alias_sources
+            if saved_src and saved_src != now_src:
+                raise RuntimeError(
+                    f'条件来源列不一致：checkpoint={saved_src}，当前解析={now_src}。')
+            saved_sha = (condition_bundle.get('meta') or {}).get('merged_sha256')
+            now_sha = loader.base_dataset.condition_table.merged_sha256
+            if saved_sha and saved_sha != now_sha:
+                log.warning('[condition] merged 文件内容已变化（训练 %s… → 当前 %s…）；'
+                            '条件值可能与训练期不同，结果需按当前表重新解读',
+                            str(saved_sha)[:12], str(now_sha)[:12])
         log.info('[next_timepoint] split=%s | 被试数=%d | 任务数=%d',
                  split, len(subjects), len(data_loader.dataset))
         # AR(1) 只用 **train subjects** 拟合（禁止 val/test leakage）
@@ -267,7 +354,8 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
             extra_report=extra, ar1=ar1, compute_importance=compute_importance,
             importance_max_tasks=importance_max_tasks,
             importance_permutations=importance_permutations,
-            importance_fdr_alpha=importance_fdr_alpha)
+            importance_fdr_alpha=importance_fdr_alpha,
+            direction_deadzone=direction_deadzone)
         summary.update(npe.summarize(report))
         if split == 'test':
             first = f"t+{report['protocol']['forecast_offsets'][0]}"
@@ -280,18 +368,20 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
 
 
 def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
-             run_shuffled=True, device=None, visualize=False,
+             device=None, visualize=False,
              compute_feature_importance=False, save_arrays=False,
              refresh_split_manifest=False, eval_rollout=None, eval_fc=None,
              eval_spectral=None, spectral_tr=None,
              importance_max_tasks=256, importance_permutations=0,
-             importance_fdr_alpha=0.05):
+             importance_fdr_alpha=0.05, direction_deadzone=None,
+             s4_samples=None):
     """评估单个 checkpoint 的对外入口（唯一口径 next_timepoint）。
 
     从 checkpoint 的 config.args 快照自省重建模型，转发到 evaluate_next_point。
     ``compute_feature_importance=True`` 时额外产 ``feature_importance_<split>.json``
-    （ROI 置换重要性 + BH-FDR 显著脑区）；``visualize`` 依赖旧单窗口 [B,F,W,S] 口径
-    的 visualizer，暂不支持，传入 True 时显式报错。
+    （ROI 置换重要性 + BH-FDR 显著脑区）；``visualize`` 已随旧版可视化组件移除，
+    传入 True 时显式报错。``s4_samples`` 覆盖测试期轨迹条数 K（MC 稳定性复核用），
+    不影响训练期设置。
     """
     _args = load_train_args(ckpt_path)
     task_mode = str(getattr(_args, 'task_mode', 'next_timepoint'))
@@ -300,17 +390,27 @@ def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
             f"仅支持 task_mode=next_timepoint 的 checkpoint，收到 '{task_mode}'")
     if visualize:
         raise ValueError(
-            'next_timepoint 任务暂不支持 --visualize（旧可视化基于 [B,F,W,S] 单窗口径）；'
+            '--visualize 已随旧可视化组件移除；'
             '请用 analysis/visualize_roi_importance.py 与 analysis/visualize_sig_region.py。')
+    if s4_samples is not None:
+        if str(getattr(_args, 's4_variant', 'off') or 'off') == 'off':
+            raise ValueError(
+                '--s4_samples 只对 S4 概率 checkpoint（s4_variant!=off）有效，'
+                f"当前快照 s4_variant={getattr(_args, 's4_variant', 'off')!r}")
+        if int(s4_samples) < 2:
+            raise ValueError(f'--s4_samples 必须 >= 2（经验分布至少两条轨迹），'
+                             f'收到 {s4_samples}')
+        _args.s4_train_samples = int(s4_samples)
     return evaluate_next_point(
         ckpt_path, out_dir, _args, eval_splits=eval_splits, seed=seed, device=device,
-        run_shuffled=run_shuffled, save_arrays=save_arrays,
+        save_arrays=save_arrays,
         eval_rollout=eval_rollout, eval_fc=eval_fc, eval_spectral=eval_spectral,
         spectral_tr=spectral_tr, refresh_split_manifest=refresh_split_manifest,
         compute_importance=compute_feature_importance,
         importance_max_tasks=importance_max_tasks,
         importance_permutations=importance_permutations,
-        importance_fdr_alpha=importance_fdr_alpha)
+        importance_fdr_alpha=importance_fdr_alpha,
+        direction_deadzone=direction_deadzone)
 
 
 def main():
@@ -320,7 +420,9 @@ def main():
     ap.add_argument('--splits', default='test',
                     help='评估划分（逗号分隔）；默认只评 test，需要 val 时显式传入')
     ap.add_argument('--seed', type=int, default=2024)
-    ap.add_argument('--no_shuffled', action='store_true')
+    ap.add_argument('--device', default='',
+                    help='评估设备（如 cuda:1）。留空则自动选择可用 GPU/CPU。'
+                         '多卡并行搜索时由运行器显式传入，不依赖默认值。')
     ap.add_argument('--save_arrays', action='store_true',
                     help='保存预测数组 predictions_<split>.npz')
     ap.add_argument('--refresh_split_manifest', action='store_true',
@@ -338,6 +440,9 @@ def main():
                     help='额外输出 Welch PSD 低频段一致性指标')
     ap.add_argument('--spectral_tr', type=float, default=None,
                     help='频谱评估使用的 TR（秒）；默认沿用 checkpoint 配置')
+    ap.add_argument('--direction_deadzone', type=float, default=None,
+                    help='方向准确率死区：|真实一阶差分| <= 该值的 ROI 不计入 '
+                         'sign 一致率；默认 0.05（BOLD 已逐 ROI z-score）')
     # ---- ROI 置换重要性（产出 feature_importance_<split>.json） ----
     ap.add_argument('--feature_importance', action='store_true',
                     help='额外计算 ROI 置换重要性并落盘 feature_importance_<split>.json')
@@ -348,9 +453,14 @@ def main():
                          '>0 时用经验零分布（代价随该值线性增长）')
     ap.add_argument('--feature_importance_fdr_alpha', type=float, default=0.05,
                     help='BH-FDR 显著脑区阈值（默认 0.05）')
+    ap.add_argument('--s4_samples', type=int, default=None,
+                    help='S4 概率 checkpoint 的测试期轨迹条数 K，覆盖训练期的 '
+                         '--s4_train_samples（如 64 复核 Monte Carlo 稳定性）；'
+                         '需配合 --save_arrays 才会落盘 dynamics_samples')
     ns = ap.parse_args()
+    device = torch.device(ns.device) if ns.device else None
     summary = evaluate(ns.ckpt, ns.out_dir, tuple(ns.splits.split(',')),
-                       seed=ns.seed, run_shuffled=not ns.no_shuffled,
+                       seed=ns.seed, device=device,
                        save_arrays=ns.save_arrays,
                        refresh_split_manifest=ns.refresh_split_manifest,
                        eval_rollout=ns.rollout, eval_fc=ns.fc,
@@ -358,7 +468,9 @@ def main():
                        compute_feature_importance=ns.feature_importance,
                        importance_max_tasks=ns.feature_importance_max_tasks,
                        importance_permutations=ns.feature_importance_permutations,
-                       importance_fdr_alpha=ns.feature_importance_fdr_alpha)
+                       importance_fdr_alpha=ns.feature_importance_fdr_alpha,
+                       direction_deadzone=ns.direction_deadzone,
+                       s4_samples=ns.s4_samples)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

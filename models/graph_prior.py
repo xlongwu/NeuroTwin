@@ -140,16 +140,21 @@ class SoftAnatomicalPrior(nn.Module):
                 nn.init.zeros_(self.lambda_proj.weight)
                 nn.init.constant_(self.lambda_proj.bias, prob_to_logit(self.lambda_init))
 
-        # ── 低秩邻接残差 ΔA（零初始化 → 初始恒为 0）────────────────────
+        # ── 低秩邻接残差 ΔA（dp Xavier、dq 零 → 初始输出恒为 0）────────
+        # 方案 §4.2：dp/dq 同时零初始化时乘积残差 ΔA = dp(dq(z))·scale 无法启动
+        # 学习（乘积梯度恒零）；dp Xavier 非零让 dq 首步获得梯度，而 dq 零保证
+        # 初始输出仍为零（残差起点不变）。state_dict 键不变，只影响新实例初始化，
+        # 不重置从 checkpoint 加载的实际权重。
         self.delta_scale = None
         self.delta_rank = 0
         if delta_a:
             self.delta_rank = int(delta_rank) if delta_rank else max(4, self.rank // 2)
             self.dp = nn.Linear(self.seq_len, self.delta_rank)
             self.dq = nn.Linear(self.seq_len, self.delta_rank)
-            for lin in (self.dp, self.dq):
-                nn.init.zeros_(lin.weight)
-                nn.init.zeros_(lin.bias)
+            nn.init.xavier_uniform_(self.dp.weight)
+            nn.init.zeros_(self.dp.bias)
+            nn.init.zeros_(self.dq.weight)
+            nn.init.zeros_(self.dq.bias)
             self.delta_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
         # ── 可学习概率掩码（straight-through，初始化保留约 95% 边）──────

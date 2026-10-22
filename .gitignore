@@ -37,6 +37,10 @@ analysis_results/
 interpretability/
 low_pcc_analysis/
 
+# ===== 本地工具 / 分析虚拟环境 =====
+.codegraph/
+.venv-analysis/
+
 # ===== IDE / 编辑器 =====
 .trae/
 .vscode/
