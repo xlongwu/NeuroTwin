@@ -51,3 +51,6 @@ data/
 # ===== 操作系统 =====
 .DS_Store
 Thumbs.db
+
+# ===== 长任务运行时临时目录（multiprocessing/resource_sharer socket）=====
+.runtime_tmp/

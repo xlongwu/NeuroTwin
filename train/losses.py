@@ -1,5 +1,7 @@
 # coding=utf-8
 """TFM 双目标损失与 SC 软先验图正则。"""
+import math
+
 import torch
 import torch.nn as nn
 
@@ -128,6 +130,94 @@ def compute_cpm_mask(controls: torch.Tensor, future_mask: torch.Tensor) -> torch
     return future_mask.to(controls.dtype) * unseen
 
 
+def temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
+                              mask: torch.Tensor = None,
+                              context_last: torch.Tensor = None,
+                              huber_delta: float = 1.0,
+                              eps: float = 1e-8) -> torch.Tensor:
+    """一阶时间差分 Huber（P0「时间动力学」约束）。
+
+    Args:
+        pred/target: [B, F, H] 预测与真值（同一空间，H 为预测步数）。
+        mask:        [B, H] 各 horizon 是否有真值；None = 全有效。
+        context_last:[B, F] context 末位 ``x_t``（真值）；None 时第一步差分不可得，
+                     仅从 h=2 起监督（用于轨迹头，其 h=1 已由 one-step 项监督）。
+
+    差分定义（第一步用真实历史末帧，其后用预测轨迹自身的前一帧）::
+
+        Δŷ_1 = ŷ_1 − x_t ；Δŷ_h = ŷ_h − ŷ_(h−1)（h ≥ 2）
+        Δy_1 = y_1 − x_t ；Δy_h = y_h − y_(h−1)（h ≥ 2）
+
+    相邻有效性：horizon h 与其前一帧的真值须同时存在才计入（h=1 只需自身有效）。
+    所有真值缺失时整项为零（按元素数归一，不引入常数项）。
+    """
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"时间差分 pred/target 形状不一致：{tuple(pred.shape)} vs "
+            f"{tuple(target.shape)}")
+    if pred.ndim != 3:
+        raise ValueError(f"时间差分 pred 期望 [B,F,H]，收到 {tuple(pred.shape)}")
+    b, f, h = pred.shape
+    if context_last is not None and tuple(context_last.shape) != (b, f):
+        raise ValueError(
+            f"context_last 期望 [B,{f}]，收到 {tuple(context_last.shape)}")
+
+    # 前一帧参考（预测与真值各一份）：有 x_t 时 h=1 用真值末帧，否则补零占位
+    if context_last is not None:
+        prev_p = torch.cat([context_last.unsqueeze(-1), pred[:, :, :-1]], dim=-1)
+        prev_t = torch.cat([context_last.unsqueeze(-1), target[:, :, :-1]], dim=-1)
+    else:
+        zero_col = pred.new_zeros(b, f, 1)
+        prev_p = torch.cat([zero_col, pred[:, :, :-1]], dim=-1)
+        prev_t = torch.cat([zero_col, target[:, :, :-1]], dim=-1)
+
+    if mask is None:
+        m = pred.new_ones(b, h)
+    else:
+        if tuple(mask.shape) != (b, h):
+            raise ValueError(
+                f"时间差分 mask 形状 {tuple(mask.shape)} 与 [B,{h}] 不一致")
+        m = mask.to(pred.dtype)
+    # 前一帧有效性：h≥2 取决于 h−1；h=1 取决于是否提供 x_t
+    prev_valid = torch.zeros_like(m)
+    prev_valid[:, 1:] = m[:, :-1]
+    if context_last is not None:
+        prev_valid[:, 0] = 1.0
+    w3 = (m * prev_valid).view(b, 1, h)
+
+    hub = _huber_elementwise(pred - prev_p, target - prev_t, huber_delta)
+    return (hub * w3).sum() / (w3.sum().clamp_min(eps) * f)
+
+
+def cross_head_consistency(cpm_pred: torch.Tensor, dynamics_pred: torch.Tensor,
+                           mask: torch.Tensor = None,
+                           eps: float = 1e-8) -> torch.Tensor:
+    """双预测头一致性：CPM（学生）向 Graph-ODE 轨迹（教师，stop-gradient）靠近。
+
+    L_cons = mean_{有效 (B,F,H)} | ŷ_CPM − sg(ŷ_ODE) |（L1）。
+
+    梯度只流回 CPM 头，不反向把辅助头的误差灌进动力学主头（方案：ODE 作 Teacher、
+    CPM 作 Student）。mask（[B,H]）通常取 ``cpm_mask ∩ future_mask``：**仅在 CPM 与
+    ODE 表示同一无控制预测区间时**计算；当前脚本无控制序列时两者一致。
+    """
+    if cpm_pred.shape != dynamics_pred.shape:
+        raise ValueError(
+            f"双头一致性要求同形状（[B,F,H]），收到 CPM {tuple(cpm_pred.shape)} vs "
+            f"ODE {tuple(dynamics_pred.shape)}")
+    if cpm_pred.ndim != 3:
+        raise ValueError(f"双头一致性 pred 期望 [B,F,H]，收到 {tuple(cpm_pred.shape)}")
+    b, f, h = cpm_pred.shape
+    d = (cpm_pred - dynamics_pred.detach()).abs()
+    if mask is None:
+        w3 = cpm_pred.new_ones(b, 1, h)
+    else:
+        if tuple(mask.shape) != (b, h):
+            raise ValueError(
+                f"双头一致性 mask 形状 {tuple(mask.shape)} 与 [B,{h}] 不一致")
+        w3 = mask.to(cpm_pred.dtype).view(b, 1, h)
+    return (d * w3).sum() / (w3.sum().clamp_min(eps) * f)
+
+
 class TFMDualLoss(nn.Module):
     """One-Step + CPM 双目标损失（方案 §9 Dual Dynamics Objective / §20）。
 
@@ -135,18 +225,47 @@ class TFMDualLoss(nn.Module):
 
         L_one = Huber(x̂_(t+1), x_(t+1)) + λ_pcc·(1 − corr_ROI(x̂_(t+1), x_(t+1)))
         L_cpm = Σ_h w_h·Huber(x̂_(t+h), x_(t+h)) / Σ_h w_h,   w_h = γ^(h−1)·mask_h
-        L     = λ_one·L_one + λ_cpm·L_cpm
+        L     = λ_one·L_one + λ_cpm·L_cpm                     （weighting='fixed'）
+
+    weighting='uncertainty'（同方差不确定性加权，Kendall et al., CVPR 2018）：
+    每个启用（λ>0）的任务项 i ∈ {one, cpm, dynamics, variance} 配一个可学习
+    log 方差参数 s_i（ParameterDict ``log_s``；经 build_optimizer 进入
+    weight_decay=0 的 'loss_weight' 参数组），聚合改为::
+
+        L = Σ_i [ exp(−s_i)·L_i + s_i·valid_i ]
+
+    初始 s_i = −log λ_i，即**初始有效权重 exp(−s_i) 与固定权重方案完全一致**
+    （warm start：训练起点梯度平衡与历史配置相同，随后由不确定性机制自适应）。
+    valid_i 是该任务本 batch 的有效性指示（CPM=has_valid、dynamics=has_valid_dyn、
+    variance=var_w.sum()>0；one-step 恒有效）：任务整批被 mask 时整项为零、
+    **不加常数 s_i**（与「全 CPM mask 时损失项必须为零、不引入常数项」的约束
+    一致，也避免 s_i 在无监督信号时无界漂移）。各任务损失的内部结构
+    （Huber/PCC/γ 加权/mask 语义）不变，只替换跨任务聚合权重。
 
     设计说明（§20.1）：不使用数学等价的 ``L_abs + L_delta`` 双计项
     （prediction_target=delta 时二者数值重合），改为单一 Huber + spatial PCC；
-    CPM 项逐 horizon 加权（§20.2，γ=1 即均匀，<1 时对远期 horizon 降权）。
+    CPM 项逐 horizon 加权（§20.2，γ=1 即均匀，<1 时对远期 horizon 降权；
+    cpm_horizon_weight='increasing' 时改为远期递增 w_h=1+α(h−1)/(H−1)）。
     λ_cpm=0 可退化为纯 one-step 的 Stage 0 基线。
+
+    P0 新增（默认 λ=0，不改变既有行为）：
+      - ``lambda_temporal_diff``：一阶时间差分 Huber（CPM + 动力学轨迹，见
+        ``temporal_difference_huber``）；
+      - ``lambda_cross_head``：双头一致性 L1（CPM 学生 ← sg(Graph-ODE) 教师，
+        见 ``cross_head_consistency``，``cross_head_start_epoch`` 控制预热）。
+    两者以固定权重直接加入总损失，**不**进入 weighting='uncertainty' 聚合。
     """
 
     def __init__(self, lambda_one: float = 1.0, lambda_cpm: float = 1.0,
                  lambda_pcc: float = 0.1, cpm_gamma: float = 1.0,
                  huber_delta: float = 1.0, eps: float = 1e-8,
-                 lambda_dynamics: float = 0.5, lambda_variance: float = 0.05):
+                 lambda_dynamics: float = 0.5, lambda_variance: float = 0.05,
+                 weighting: str = 'fixed',
+                 lambda_temporal_diff: float = 0.0,
+                 lambda_cross_head: float = 0.0,
+                 cpm_horizon_weight: str = 'gamma',
+                 cpm_horizon_alpha: float = 0.5,
+                 cross_head_start_epoch: int = 0):
         super().__init__()
         if lambda_one < 0 or lambda_cpm < 0 or lambda_pcc < 0:
             raise ValueError(
@@ -163,6 +282,20 @@ class TFMDualLoss(nn.Module):
             raise ValueError(
                 f"lambda_dynamics/lambda_variance 不允许负数："
                 f"{lambda_dynamics}/{lambda_variance}")
+        if lambda_temporal_diff < 0 or lambda_cross_head < 0:
+            raise ValueError(
+                f"lambda_temporal_diff/lambda_cross_head 不允许负数："
+                f"{lambda_temporal_diff}/{lambda_cross_head}")
+        if cpm_horizon_weight not in ('gamma', 'increasing'):
+            raise ValueError(
+                f"cpm_horizon_weight 只支持 'gamma' / 'increasing'，"
+                f"收到 {cpm_horizon_weight!r}")
+        if cpm_horizon_alpha < 0:
+            raise ValueError(
+                f"cpm_horizon_alpha 不允许负数，收到 {cpm_horizon_alpha}")
+        if int(cross_head_start_epoch) < 0:
+            raise ValueError(
+                f"cross_head_start_epoch 不允许负数，收到 {cross_head_start_epoch}")
         self.lambda_one = float(lambda_one)
         self.lambda_cpm = float(lambda_cpm)
         self.lambda_pcc = float(lambda_pcc)
@@ -171,6 +304,59 @@ class TFMDualLoss(nn.Module):
         self.eps = float(eps)
         self.lambda_dynamics = float(lambda_dynamics)
         self.lambda_variance = float(lambda_variance)
+        self.lambda_temporal_diff = float(lambda_temporal_diff)
+        self.lambda_cross_head = float(lambda_cross_head)
+        self.cpm_horizon_weight = str(cpm_horizon_weight)
+        self.cpm_horizon_alpha = float(cpm_horizon_alpha)
+        self.cross_head_start_epoch = int(cross_head_start_epoch)
+        if weighting not in ('fixed', 'uncertainty'):
+            raise ValueError(
+                f"weighting 只支持 'fixed' / 'uncertainty'，收到 {weighting!r}")
+        self.weighting = str(weighting)
+        # 同方差不确定性加权的可学习 log 方差（公式见类 docstring）。s_i =
+        # -log λ_i 使初始有效权重 exp(-s_i) 精确等于原固定权重；λ=0 的任务项
+        # 整体禁用（不建参数，前向也不进总和），避免 -log(0) 与无意义漂移。
+        self.log_s = nn.ParameterDict()
+        if weighting == 'uncertainty':
+            for name, lam in (('one', self.lambda_one),
+                              ('cpm', self.lambda_cpm),
+                              ('dynamics', self.lambda_dynamics),
+                              ('variance', self.lambda_variance)):
+                if lam > 0:
+                    self.log_s[name] = nn.Parameter(
+                        torch.tensor(-math.log(lam), dtype=torch.float32))
+
+    def _unc_weighted(self, name: str, task_loss: torch.Tensor,
+                      valid: torch.Tensor = None) -> torch.Tensor:
+        """同方差不确定性加权：exp(-s_i)·L_i + s_i（valid 给出时乘有效性指示，
+        任务整批无效时整项为零、不引入常数项）。"""
+        s = self.log_s[name]
+        weighted = torch.exp(-s) * task_loss + s
+        if valid is None:
+            return weighted
+        return valid.to(weighted.dtype) * weighted
+
+    def get_loss_weights(self) -> dict:
+        """当前各任务项的有效权重（日志 / checkpoint 元数据用）。
+
+        返回 ``{'mode': ..., '<task>': {'weight': float, 'log_s': float|None}}``，
+        只包含启用（λ>0）的任务项；'uncertainty' 模式下 weight=exp(-log_s)。
+        """
+        out = {'mode': self.weighting}
+        for name in ('one', 'cpm', 'dynamics', 'variance',
+                     'temporal_diff', 'cross_head'):
+            lam = float(getattr(self, f'lambda_{name}'))
+            if lam <= 0:
+                continue
+            # 新增的 temporal_diff / cross_head 项不参与不确定性加权：
+            # 永远以固定 λ 报告（与 forward 中的聚合方式一致）。
+            if self.weighting == 'uncertainty' and name in self.log_s:
+                s = self.log_s[name]
+                out[name] = {'weight': float(torch.exp(-s.detach())),
+                             'log_s': float(s.detach())}
+            else:
+                out[name] = {'weight': lam, 'log_s': None}
+        return out
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 cpm_pred: torch.Tensor, cpm_target: torch.Tensor,
@@ -180,7 +366,9 @@ class TFMDualLoss(nn.Module):
                 dynamics_mask: torch.Tensor = None,
                 dynamics_mean_norm: torch.Tensor = None,
                 dynamics_logvar_norm: torch.Tensor = None,
-                dynamics_target_norm: torch.Tensor = None) -> tuple:
+                dynamics_target_norm: torch.Tensor = None,
+                context_last: torch.Tensor = None,
+                epoch: int = None) -> tuple:
         """
         Args:
             pred/target: [B, F, 1, 1] one-step 预测与真值（原始空间）
@@ -194,6 +382,12 @@ class TFMDualLoss(nn.Module):
             dynamics_mean_norm:    [B, F, H] 归一化空间动态均值（方差损失用，内部 detach）
             dynamics_logvar_norm:  [B, F, H] 归一化空间 logvar（仅更新 VarianceHead）
             dynamics_target_norm:  [B, F, H] 用当前历史 norm_stats 归一化的未来真值
+            ---- 以下为 P0 新增项（λ=0 时不参与，行为与旧版一致）----
+            context_last: [B, F] context 末位 x_t（真值，原始空间）；供 CPM 的
+                一阶时间差分第一步使用，None 时 CPM 差分从 h=2 起
+            epoch:        当前 epoch（训练用；为 None 视为不小于 start，验证/测试
+                恒启用）。仅影响 --lambda_cross_head 的 ``cross_head_start_epoch``
+                预热门控
         Returns:
             (total, stats dict)
         """
@@ -219,7 +413,11 @@ class TFMDualLoss(nn.Module):
                                       self.huber_delta).mean()
         corr_one = spatial_pcc(pred, target, self.eps).mean()      # [1] → 标量
         loss_one_pcc = 1.0 - corr_one
-        total = self.lambda_one * (loss_one + self.lambda_pcc * loss_one_pcc)
+        L_one_comb = loss_one + self.lambda_pcc * loss_one_pcc
+        if self.weighting == 'uncertainty' and 'one' in self.log_s:
+            total = self._unc_weighted('one', L_one_comb)
+        else:
+            total = self.lambda_one * L_one_comb
         stats['loss_one'] = loss_one.detach()
         stats['loss_one_pcc'] = loss_one_pcc.detach()
         stats['pcc_one'] = corr_one.detach()
@@ -230,7 +428,13 @@ class TFMDualLoss(nn.Module):
             h = cpm_pred.shape[2]
             w = torch.ones(cpm_pred.shape[0], h, device=cpm_pred.device,
                            dtype=cpm_pred.dtype)
-            if self.cpm_gamma < 1.0:
+            if self.cpm_horizon_weight == 'increasing':
+                # 远期递增：w_h = 1 + α·(h−1)/(H−1)（H=1 时退化为 1）
+                if h > 1:
+                    ramp = torch.arange(h, device=cpm_pred.device,
+                                        dtype=cpm_pred.dtype) / (h - 1)
+                    w = w * (1.0 + self.cpm_horizon_alpha * ramp).view(1, h)
+            elif self.cpm_gamma < 1.0:
                 gamma_pows = self.cpm_gamma ** torch.arange(
                     h, device=cpm_pred.device, dtype=cpm_pred.dtype)
                 w = w * gamma_pows.view(1, h)
@@ -262,8 +466,13 @@ class TFMDualLoss(nn.Module):
                     (corr_cpm[:, hi] * w[:, hi]).sum() / n_h).detach()
             loss_cpm_pcc = has_valid * (
                 1.0 - (corr_cpm * w).sum() / w.sum().clamp_min(self.eps))
-            total = total + self.lambda_cpm * has_valid * (
-                loss_cpm + self.lambda_pcc * loss_cpm_pcc)
+            L_cpm_comb = loss_cpm + self.lambda_pcc * loss_cpm_pcc
+            if self.weighting == 'uncertainty' and 'cpm' in self.log_s:
+                # has_valid 同时门控 exp(-s)·L 与 s：整批被 mask 时不加常数项
+                total = total + self._unc_weighted('cpm', L_cpm_comb,
+                                                   valid=has_valid)
+            else:
+                total = total + self.lambda_cpm * has_valid * L_cpm_comb
             stats['loss_cpm'] = (has_valid * loss_cpm).detach()
             stats['loss_cpm_pcc'] = loss_cpm_pcc.detach()
         else:
@@ -310,13 +519,20 @@ class TFMDualLoss(nn.Module):
                 loss_dyn_pcc = has_valid_dyn * (
                     1.0 - (corr_dyn * mask2).sum()
                     / mask2.sum().clamp_min(self.eps))
-                loss_dynamics = has_valid_dyn * (
-                    loss_dyn + self.lambda_pcc * loss_dyn_pcc)
+                L_dyn_comb = loss_dyn + self.lambda_pcc * loss_dyn_pcc
+                loss_dynamics = has_valid_dyn * L_dyn_comb
             else:
                 has_valid_dyn = dynamics_pred.new_zeros(())
                 loss_dynamics = has_valid_dyn
                 loss_dyn_pcc = has_valid_dyn
-            total = total + self.lambda_dynamics * loss_dynamics
+                L_dyn_comb = None
+            if (self.weighting == 'uncertainty' and 'dynamics' in self.log_s
+                    and L_dyn_comb is not None):
+                # has_valid_dyn 同时门控 exp(-s)·L 与 s（无常数项泄漏）
+                total = total + self._unc_weighted('dynamics', L_dyn_comb,
+                                                   valid=has_valid_dyn)
+            else:
+                total = total + self.lambda_dynamics * loss_dynamics
             stats['loss_dynamics'] = loss_dynamics.detach()
             stats['loss_dynamics_pcc'] = loss_dyn_pcc.detach()
         else:
@@ -348,9 +564,62 @@ class TFMDualLoss(nn.Module):
             nll = 0.5 * (logvar + (-logvar).exp() * (mu - tgt) ** 2)   # [B,F,H]
             loss_var = (nll * var_w.unsqueeze(1)).sum() / (
                 var_w.sum().clamp_min(self.eps) * logvar.shape[1])
-            total = total + self.lambda_variance * loss_var
+            if self.weighting == 'uncertainty' and 'variance' in self.log_s:
+                # 全 mask 时 loss_var 恒为 0，valid 指示同时压掉 s 常数项
+                valid_var = (var_w.sum() > 0).to(logvar.dtype)
+                total = total + self._unc_weighted('variance', loss_var,
+                                                   valid=valid_var)
+            else:
+                total = total + self.lambda_variance * loss_var
             stats['loss_variance'] = loss_var.detach()
         else:
             stats['loss_variance'] = torch.zeros((), device=pred.device)
+
+        # ---- P0：一阶时间差分（时间动力学约束，固定权重项）----
+        # CPM 用自身 cpm_mask，第一步差分参考真实历史末帧 x_t；动力学轨迹用
+        # dynamics_mask，其 h=1 已由 one-step 项监督，差分自 h=2 起（参考预测
+        # 轨迹自身的前一帧）。不受 weighting='uncertainty' 影响。
+        td_cpm = pred.new_zeros(())
+        td_dyn = pred.new_zeros(())
+        if self.lambda_temporal_diff > 0:
+            if cpm_pred.shape[0] > 0:
+                td_cpm = temporal_difference_huber(
+                    cpm_pred, cpm_target, mask=cpm_mask,
+                    context_last=context_last,
+                    huber_delta=self.huber_delta, eps=self.eps)
+            if dynamics_pred is not None and dynamics_pred.shape[0] > 0:
+                td_dyn = temporal_difference_huber(
+                    dynamics_pred, dynamics_target, mask=dynamics_mask,
+                    context_last=None,
+                    huber_delta=self.huber_delta, eps=self.eps)
+            total = total + self.lambda_temporal_diff * (td_cpm + td_dyn)
+        stats['loss_temporal_diff'] = (td_cpm + td_dyn).detach()
+        stats['loss_temporal_diff_cpm'] = td_cpm.detach()
+        stats['loss_temporal_diff_dyn'] = td_dyn.detach()
+
+        # ---- P0：双预测头一致性（CPM ← sg(Graph-ODE)，固定权重项）----
+        # ODE 作 Teacher（stop-gradient）、CPM 作 Student：梯度只回 CPM 头。
+        # 仅在 CPM 与 ODE 表示同一无控制区间（cpm_mask ∩ future_mask）内计算；
+        # epoch 早于 start 时不启用（预热门控，方案 §5「前 5–10 epoch 不启用」）。
+        cross = pred.new_zeros(())
+        if (self.lambda_cross_head > 0
+                and not (epoch is not None
+                         and int(epoch) < self.cross_head_start_epoch)
+                and dynamics_pred is not None and dynamics_pred.shape[0] > 0
+                and cpm_pred.shape[0] > 0):
+            cons_mask = cpm_mask
+            if cons_mask is None:
+                cons_mask = dynamics_mask
+            elif dynamics_mask is not None:
+                if tuple(cons_mask.shape) != tuple(dynamics_mask.shape):
+                    raise ValueError(
+                        f"双头一致性 cpm_mask {tuple(cons_mask.shape)} 与 "
+                        f"dynamics_mask {tuple(dynamics_mask.shape)} 形状不一致")
+                cons_mask = cons_mask.to(dynamics_mask.dtype) * dynamics_mask
+            cross = cross_head_consistency(cpm_pred, dynamics_pred,
+                                           mask=cons_mask, eps=self.eps)
+            total = total + self.lambda_cross_head * cross
+        stats['loss_cross_head'] = cross.detach()
+
         stats['loss_total'] = total.detach()
         return total, stats

@@ -125,7 +125,7 @@ $$
 
 在 `NeuroTwinNextPointDataset/NeuroTwinDataLoader` 增加 `num_rois`、`graph_source`、`calibration_length`、可选 `control_manifest`，并扩展 `bold_source='raw'`。
 
-raw 分支读取 `Raw/HC|MDD/ROISignals_<id>.mat`，键复用 `ROISignals/Data`；按该来源的明确 `[T,F]` 布局选前 150 TR、前 num_rois 列，再转为 `[F,T]`。不使用 `max(shape)` 猜时间轴；raw 缺失直接报告路径，不回退 Normlize 或窗口缓存。
+raw 分支读取 `Raw/HC|MDD/ROISignals_<id>.mat`，键复用 `ROISignals/Data`；按该来源的明确 `[T,F]` 布局取前 num_rois 列（完整时间轴，不截断），再转为 `[F,T]`。不使用 `max(shape)` 猜时间轴；raw 缺失直接报告路径，不回退 Normlize 或窗口缓存。
 
 令 X_raw 为 Raw 中提取的 ROI 序列，K0=32；每个 ROI 的校准统计只使用最早 K0 个观测：
 

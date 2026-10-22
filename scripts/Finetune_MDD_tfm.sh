@@ -40,11 +40,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# DataLoader 共享内存：固定到项目内目录，避免 Qoder 会话切换清理 TMPDIR 后
+# multiprocessing resource_sharer socket 消失（长训练中断的根因）。
+export TMPDIR="$ROOT/.runtime_tmp"
+mkdir -p "$TMPDIR"
+export TORCH_SHARING_STRATEGY="${TORCH_SHARING_STRATEGY:-file_system}"
+
 PYTHON_BIN="${PYTHON:-python}"
 data_root="${DATA_ROOT:-$ROOT/data}"
 checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
 HC_WEIGHT="${HC_WEIGHT:-}"
+# 概率化实验一般从 S2 微调权重继续，而不是同目录的 HC base_best.pt。该覆盖必须发生在
+# 下面的 HC 起点候选检查之前，否则会被"找不到 HC 起点"提前拦停。
+if [[ "${S4_VARIANT:-off}" != "off" && -n "${S4_INIT_WEIGHT:-}" ]]; then
+  HC_WEIGHT="$S4_INIT_WEIGHT"
+fi
 name="neurotwin_tfm_finetune"
 hc_name="neurotwin_tfm_pretrain"   # 与 Pretrain_HC_tfm.sh 的 name 同步（twin 家族）
 
@@ -88,17 +99,51 @@ eval_rollout_horizons="1,2,4,8,16"
 tfm_dim=256
 tfm_layers=4
 tfm_heads=4
-tfm_patch_len=4
+tfm_patch_len=8
 cpm_horizon=8
 
-train_epochs=150
+# ---- P0 损失扩展（默认=E2 正式基线；必须与预训练同口径）----
+# 微调启用时间差分/一致性时，HC 预训练也应使用相同开关，
+# 否则微调起点缺少对应监督。消融覆盖方式同 Pretrain_HC_tfm.sh：
+#   E0: LAMBDA_TEMPORAL_DIFF=0 LAMBDA_CROSS_HEAD=0 bash scripts/Finetune_MDD_tfm.sh
+#   E1: LAMBDA_TEMPORAL_DIFF=0.05 bash scripts/Finetune_MDD_tfm.sh
+lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-0.05}"
+lambda_cross_head="${LAMBDA_CROSS_HEAD:-0.02}"
+cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-5}"
+cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-gamma}"
+cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-0.5}"
+# ---- S2 历史记忆（正式基线默认开启；必须与预训练同口径）----
+dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-True}"
+
+# ---- S4 概率轨迹（默认全部不追加，脚本行为与 S2 逐位一致）----
+#   S4-1 输出端相关残差：S4_VARIANT=s4_1 HC_WEIGHT=<S2 finetuned_best.pt> \
+#          DYNAMICS_HISTORY_MEMORY=True bash scripts/Finetune_MDD_tfm.sh
+#   S4-2 潜状态随机创新：S4_VARIANT=s4_2 ...
+# head 阶段要求 freeze_backbone_epochs>=1（main.py 会校验），且必须与 S2 同口径
+# 打开 DYNAMICS_HISTORY_MEMORY，否则重建的架构与起点权重不一致。
+s4_variant="${S4_VARIANT:-off}"
+s4_stage="${S4_STAGE:-head}"
+s4_crps_weight="${S4_CRPS_WEIGHT:-1.0}"
+s4_lr_scale="${S4_LR_SCALE:-1.0}"
+s4_train_samples="${S4_TRAIN_SAMPLES:-32}"
+s4_residual_rank="${S4_RESIDUAL_RANK:-8}"
+s4_residual_hidden="${S4_RESIDUAL_HIDDEN:-128}"
+s4_residual_init_scale="${S4_RESIDUAL_INIT_SCALE:-0.1}"
+s4_noise_rank="${S4_NOISE_RANK:-8}"
+s4_noise_scale="${S4_NOISE_SCALE:-1e-2}"
+s4_ckpt_metric="${S4_CKPT_METRIC:-point}"
+
+train_epochs="${TRAIN_EPOCHS:-150}"
 warmup_epochs=15
-batch_size=32
+# 数据加载并发（只影响吞吐，不影响训练结果）
+num_workers="${NUM_WORKERS:-6}"
+pin_memory="${PIN_MEMORY:-False}"
+batch_size=256
 patience=20
 lr_init=5e-5
 lr_peak=1e-4
 lr_final=5e-5
-freeze_backbone_epochs=10
+freeze_backbone_epochs="${FREEZE_BACKBONE_EPOCHS:-10}"
 backbone_lr_scale=0.2
 
 # ---- 预检查 ----
@@ -157,6 +202,12 @@ ARGS=(
   --lambda_pcc 0.1
   --cpm_gamma 1.0
   --cpm_huber_delta 1.0
+  # ---- P0 损失扩展（默认关；见文件顶部环境变量说明）----
+  --lambda_temporal_diff "$lambda_temporal_diff"
+  --lambda_cross_head "$lambda_cross_head"
+  --cross_head_start_epoch "$cross_head_start_epoch"
+  --cpm_horizon_weight "$cpm_horizon_weight"
+  --cpm_horizon_alpha "$cpm_horizon_alpha"
   --norm True
   --dropout 0.1
   # ---- 两阶段冻结（前期只训条件模块，后期解冻主干）----
@@ -174,7 +225,10 @@ ARGS=(
   --grad_clip 1.0
   --use_ema True
   --amp True
-  --num_workers 4
+  --num_workers "$num_workers"       # 见文件顶部 PIN_MEMORY/NUM_WORKERS 说明
+  --pin_memory "$pin_memory"
+  --eval_batch_size "${EVAL_BATCH_SIZE:-512}"  # 仅影响验证吞吐；降低 Val 峰值内存
+  --subject_cache_size 4096         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
   --train_samples_per_subject 0
   --sampling_seed "$sampling_seed"
 )
@@ -199,7 +253,24 @@ ARGS+=(
   --dynamics_dt 1.0
   --lambda_dynamics 0.5
   --lambda_variance 0.05
+  --dynamics_history_memory "$dynamics_history_memory"
 )
+# ---- S4 概率轨迹参数（仅 S4_VARIANT!=off 时追加）----
+if [[ "$s4_variant" != "off" ]]; then
+  ARGS+=(
+    --s4_variant "$s4_variant"
+    --s4_stage "$s4_stage"
+    --s4_crps_weight "$s4_crps_weight"
+    --s4_lr_scale "$s4_lr_scale"
+    --s4_train_samples "$s4_train_samples"
+    --s4_residual_rank "$s4_residual_rank"
+    --s4_residual_hidden "$s4_residual_hidden"
+    --s4_residual_init_scale "$s4_residual_init_scale"
+    --s4_noise_rank "$s4_noise_rank"
+    --s4_noise_scale "$s4_noise_scale"
+    --s4_ckpt_metric "$s4_ckpt_metric"
+  )
+fi
 if [[ -n "$DEVICE" ]]; then
   ARGS+=(--device "$DEVICE")
 fi

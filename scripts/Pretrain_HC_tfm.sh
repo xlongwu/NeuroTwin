@@ -35,6 +35,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# DataLoader 共享内存：固定到项目内目录，避免 Qoder 会话切换清理 TMPDIR 后
+# multiprocessing resource_sharer socket 消失（长训练中断的根因）。
+export TMPDIR="$ROOT/.runtime_tmp"
+mkdir -p "$TMPDIR"
+export TORCH_SHARING_STRATEGY="${TORCH_SHARING_STRATEGY:-file_system}"
+
 PYTHON_BIN="${PYTHON:-python}"
 data_root="${DATA_ROOT:-$ROOT/data}"
 checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
@@ -68,12 +74,30 @@ eval_rollout_horizons="1,2,4,8,16"
 tfm_dim=256
 tfm_layers=4
 tfm_heads=4
-tfm_patch_len=4                    # 方案 §4.3：{1,4,8} 消融，不用 TimesFM 的 32
+tfm_patch_len=8                    # 方案 §4.3：{1,4,8} 消融，不用 TimesFM 的 32
 cpm_horizon=8                      # 方案 §8：首选 8，随后测 {4,8,16}
 
-train_epochs=150
+# ---- P0 损失扩展（默认=E2 正式基线：Temporal Diff 0.05 + Cross-Head 0.02）----
+# 消融可经环境变量覆盖：
+#   E0: LAMBDA_TEMPORAL_DIFF=0 LAMBDA_CROSS_HEAD=0 bash scripts/Pretrain_HC_tfm.sh
+#   E1: LAMBDA_TEMPORAL_DIFF=0.05 bash scripts/Pretrain_HC_tfm.sh
+# 说明：temporal_diff / cross_head 为固定权重项，不进入 uncertainty 聚合；
+#       cross_head_start_epoch 仅在 LAMBDA_CROSS_HEAD>0 时生效。
+lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-0.05}"
+lambda_cross_head="${LAMBDA_CROSS_HEAD:-0.02}"
+cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-5}"
+cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-gamma}"
+cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-0.5}"
+# ---- S2 历史记忆（正式基线默认开启）----
+dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-True}"
+
+train_epochs="${TRAIN_EPOCHS:-150}"
 warmup_epochs=15
-batch_size=32
+# 数据加载并发（只影响吞吐，不影响训练结果）：默认关闭 pin_memory 以避免长时
+# 运行中 resource_sharer/pin-memory 线程因临时 socket 消失而中断训练。
+num_workers="${NUM_WORKERS:-6}"
+pin_memory="${PIN_MEMORY:-False}"
+batch_size=256
 patience=20
 lr_init=5e-5
 lr_peak=1e-4
@@ -128,6 +152,12 @@ ARGS=(
   --lambda_pcc 0.1
   --cpm_gamma 1.0                    # 1=逐 horizon 均匀权重
   --cpm_huber_delta 1.0
+  # ---- P0 损失扩展（默认关；见文件顶部环境变量说明）----
+  --lambda_temporal_diff "$lambda_temporal_diff"
+  --lambda_cross_head "$lambda_cross_head"
+  --cross_head_start_epoch "$cross_head_start_epoch"
+  --cpm_horizon_weight "$cpm_horizon_weight"
+  --cpm_horizon_alpha "$cpm_horizon_alpha"
   --norm True                        # Context-only RevIN（方案 §15）
   --dropout 0.1
   # ---- 优化与训练规模 ----
@@ -142,7 +172,10 @@ ARGS=(
   --grad_clip 1.0
   --use_ema True
   --amp True
-  --num_workers 4
+  --num_workers "$num_workers"       # 见文件顶部 PIN_MEMORY/NUM_WORKERS 说明
+  --pin_memory "$pin_memory"
+  --eval_batch_size "${EVAL_BATCH_SIZE:-512}"  # 仅影响验证吞吐；降低 Val 峰值内存
+  --subject_cache_size 4096         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
   --train_samples_per_subject 0    # 0=auto（每被试每 epoch min(合法组合数, 12)）
   --sampling_seed "$sampling_seed"
   # --refresh_split_manifest 是 store_true 开关（不接受取值），默认 False 不刷新
@@ -165,6 +198,7 @@ ARGS+=(
   --dynamics_dt 1.0
   --lambda_dynamics 0.5
   --lambda_variance 0.05
+  --dynamics_history_memory "$dynamics_history_memory"
 )
 # 宽度不在这里重复字面量：main.py 的 argparse 默认就是锚点
 # (d_demo=16, d_new=16, C=32, H_delta=64, delta_style=mlp, dropout_p=0, inject=heads)。

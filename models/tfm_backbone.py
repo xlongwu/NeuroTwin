@@ -138,17 +138,6 @@ class CausalTemporalAttention(nn.Module):
         self.qkv = nn.Linear(self.dim, self.dim * 3)
         self.out_proj = nn.Linear(self.dim, self.dim)
         self.dropout = float(dropout)
-        self._causal_mask: Optional[torch.Tensor] = None
-        self._mask_len = 0
-
-    def _causal(self, n: int, device, dtype) -> torch.Tensor:
-        """缓存 [n,n] 布尔 causal mask（True = 允许注意）。"""
-        if self._mask_len < n or self._causal_mask is None \
-                or self._causal_mask.device != device:
-            m = torch.ones(n, n, dtype=torch.bool, device=device).tril(0)
-            self._causal_mask = m
-            self._mask_len = n
-        return self._causal_mask[:n, :n]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -160,10 +149,21 @@ class CausalTemporalAttention(nn.Module):
         b, f, p, d = x.shape
         qkv = self.qkv(x).reshape(b * f, p, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)   # 各 [B*F, h, P, d]
+        # 把 ROI 折进 head 维：[B*F,h,P,d] → [B,F*h,P,d]。纯等价变形（SDPA 对每个
+        # (batch, head) 对独立计算，逐 ROI 独立注意的语义不变），但 attention 的
+        # batch 维从 B*F 降到 B：验证侧 eval_batch_size=batch*4 时 B*F=1024*116
+        # 超过 CUDA grid 65535 上限，曾触发「invalid configuration argument」。
+        q = q.reshape(b, f * self.num_heads, p, self.head_dim)
+        k = k.reshape(b, f * self.num_heads, p, self.head_dim)
+        v = v.reshape(b, f * self.num_heads, p, self.head_dim)
+        # is_causal=True 与 tril(0) 布尔 mask 逐位等价（query i 仅可见 key j<=i），
+        # 走原生 causal kernel，不构造/广播 mask 张量。
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=self._causal(p, x.device, x.dtype),
+            q, k, v, is_causal=True,
             dropout_p=(self.dropout if self.training else 0.0))
-        out = out.transpose(1, 2).reshape(b * f, p, self.dim)
+        # [B,F*h,P,d] → [B*F,P,D]：还原 (F,h) 维序后做输出投影
+        out = out.reshape(b, f, self.num_heads, p, self.head_dim) \
+                 .permute(0, 1, 3, 2, 4).reshape(b * f, p, self.dim)
         out = self.out_proj(out)
         return out.view(b, f, p, d)
 

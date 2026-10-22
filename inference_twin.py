@@ -30,8 +30,6 @@ import torch
 
 log = logging.getLogger(__name__)
 
-#: Raw 序列与训练 loader 相同的 TR 截取上限（方案 §4.1）
-RAW_MAX_TR = 150
 #: 默认初始历史长度（训练 context_max=64；若 checkpoint 不同则取其值）
 DEFAULT_HISTORY_LEN = 64
 #: 健康参照 / outcome 基线固定的历史长度
@@ -47,7 +45,7 @@ def load_raw_series(path, num_rois: int) -> np.ndarray:
 
     ``.mat``：键 ``ROISignals``/``Data``，按该来源明确的 ``[T,F]`` 布局解释
     （第 0 维 TR、第 1 维 ROI，不用 ``max(shape)`` 猜时间轴），取前
-    ``RAW_MAX_TR`` 个 TR、前 ``num_rois`` 列；``.npz``：键 ``bold``；
+    ``num_rois`` 列（完整时间轴，不截断）；``.npz``：键 ``bold``；
     ``.npy``：直接数组。缺失/形状非法直接报路径，不回退旧缓存。
     """
     p = Path(path)
@@ -78,7 +76,7 @@ def load_raw_series(path, num_rois: int) -> np.ndarray:
     if arr.shape[1] < num_rois:
         raise ValueError(f'{p} 仅 {arr.shape[1]} 列 ROI，少于 num_rois='
                          f'{num_rois}，无法取前 {num_rois} 列')
-    arr = arr[:RAW_MAX_TR, :num_rois]
+    arr = arr[:, :num_rois]
     if not np.isfinite(arr).all():
         raise ValueError(f'{p} 含非有限值')
     return arr
@@ -99,7 +97,7 @@ def load_controls_npz(path, num_rois: int, series_t: Optional[int] = None) -> np
         raise ValueError(f'{p} u 含非有限值')
     if series_t is not None and u.shape[0] != series_t:
         raise ValueError(f'{p} u 长度 {u.shape[0]} 与序列 T={series_t} 不一致'
-                         '（raw 前 150 TR 截取口径，方案 §4.3）')
+                         '（完整时间轴口径，方案 §4.3）')
     return u
 
 

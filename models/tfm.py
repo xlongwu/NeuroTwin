@@ -18,13 +18,6 @@ assimilation、SDE、更复杂的 graph learning。仅预留
 future-known covariate（intervention lookahead，§12.4/§13）的**接口**
 （``cpm_intervention=True`` 时构建嵌入，默认关闭、不参与训练）。
 
-RECC 扩展（方案 docs/Version3_docs_1003/NeuroTwin_TFM_RECC_详细应用方案.md）：
-One-Step 头新增 ``pathology_mode ∈ {none, film, moe}``（§3/§36）。``moe`` 模式把
-共享 HC 动力学转移与病理残差专家解耦（``z_{t+1} = z_t + Δz_shared + Δz_path``，
-§4），病理模块（Router + Experts，models/tfm_experts.py）仅在 finetune 阶段创建，
-HC 预训练结构与 checkpoint 完全不变（§52）。backbone / SC prior / CPM 均保持
-原设计；CPM 的 FiLM 条件化保留（§30/§31）。
-
 对外提供 next_timepoint 标准协议（``forward`` / ``predict_next_state`` /
 ``rollout_next_states``），训练入口与评估链路按同一接口消费。
 """
@@ -48,8 +41,22 @@ from models.tfm_backbone import (
     build_context_grid,
 )
 from models.tfm_dynamics import GraphODEDynamicsHead
-from models.tfm_experts import TFMPathologyMoE, build_pair_indices
 from models.tfm_personal import ProfileEncoder
+from models.tfm_probabilistic import LowRankSpatioTemporalResidualHead
+
+
+def _pool_history_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    """编码 token 在 patch 维取均值并转 fp32（S2 历史记忆）。
+
+    用 ``torch._dynamo.disable`` 强制图外执行：该归约会产生基于 view 的符号，
+    触发 ``torch.compile(dynamic=True)`` 的形状守卫断言；在编译区外算好再作为
+    普通输入张量传入，既稳定又保留正确数值。
+    """
+    return tokens.mean(dim=2).float()
+
+
+if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'disable'):
+    _pool_history_tokens = torch._dynamo.disable(_pool_history_tokens)
 
 
 @contextmanager
@@ -77,19 +84,11 @@ def isolated_global_rng():
 def _rng_scope(isolate: bool):
     """条件构件的 RNG 作用域开关。
 
-    ``isolate=False`` 用于 legacy RECC 线（``condition_config`` 缺席），保持其历史
-    初始化顺序逐位不变；条件注入实验一律 ``True``，使条件模块的构造对后续非条件
-    模块「不可见」。
+    ``isolate=False`` 用于 legacy 数值条件线（``condition_config`` 缺席），保持
+    其历史初始化顺序逐位不变；条件注入实验一律 ``True``，使条件模块的构造对
+    后续非条件模块「不可见」。
     """
     return isolated_global_rng() if isolate else nullcontext()
-
-
-# candidate 预测契约版本（RECC 执行计划 §5.1 / §6.3：复评产物必须能声明口径）。
-# v1（历史运行 2026-10-06/07）：candidate = denorm(decode(z_shared+Δz_i))，
-#   漏加 x_last 锚点，candidate 误差处于 persistence 量级，与 target 的比较跨空间；
-# v2（本版本）：完整 candidate state = denorm(x_last_norm + decode(z_shared+Δz_i))，
-#   与正式 mixture 输出同一残差→状态→反归一化链路。
-TFM_CANDIDATE_SCHEMA = 'state_anchored_v2_20261007'
 
 
 class ConditionFiLM(nn.Module):
@@ -135,7 +134,7 @@ class ConditionFiLM(nn.Module):
 
 
 class OneStepDynamicsHead(nn.Module):
-    """One-Step 状态转移头（§10 / RECC 方案 §3–§5）：``z_(t+1) = F_θ(z_t, A_eff, c)``。
+    """One-Step 状态转移头（§10）：``z_(t+1) = F_θ(z_t, A_eff, c)``。
 
     - ``z_t``：backbone 最后一个 causal token（逐 ROI）``[B, F, D]``；
     - SC 引导的图混合：``z_g = A_eff @ z_t``（跨 ROI 交互被限制在结构先验
@@ -144,22 +143,14 @@ class OneStepDynamicsHead(nn.Module):
       数值稳定，与预测端 ``x̂ = x_t + Δ̂`` 的 persistence 锚点一致）；
     - 解码 ``x̂_(t+1) = x_t + Δ̂``（归一化空间），Δ̂ 由零初始化线性层给出。
 
-    病理条件化三模式（RECC 方案 §3/§5，``pathology_mode``）：
-      - ``none``：无病理条件（HC 预训练）；
-      - ``film``：当前 baseline——条件 FiLM 调制转移隐层；
-      - ``moe``：共享动力学与病理修正解耦——转移隐层不做 FiLM，病理条件只进入
-        :class:`~models.tfm_experts.TFMPathologyMoE`（Router + 专家 FiLM），
-        ``z_{t+1} = z_t + Δz_shared + Δz_path``（方案 §4 的核心结构）。
-    film 与 moe 互斥，避免 HAMD 同时作用两次导致病理效应来源不可区分（§5）。
+    病理条件化（``pathology_mode``）：``none`` = 无病理条件（HC 预训练）；
+    ``film`` = 条件 FiLM 调制转移隐层。仅服务 legacy discrete 路线
+    （graph_ode 路线由 GraphODEDynamicsHead 替换本头）。
     """
 
     def __init__(self, dim: int, hidden_dim: int = 256, dropout: float = 0.1,
                  cond_dim: Optional[int] = None,
                  pathology_mode: str = 'film',
-                 num_experts: int = 4, top_k: int = 2,
-                 expert_hidden_dim: int = 256, router_hidden_dim: int = 128,
-                 router_temperature: float = 1.0,
-                 dense_warmup_epochs: int = 5,
                  cond_lambda: float = 1.0,
                  cond_gate_residual: bool = False,
                  cond_gate_hidden: int = 64,
@@ -167,9 +158,9 @@ class OneStepDynamicsHead(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.pathology_mode = str(pathology_mode)
-        if self.pathology_mode not in ('none', 'film', 'moe'):
+        if self.pathology_mode not in ('none', 'film'):
             raise ValueError(
-                f"pathology_mode 必须是 none/film/moe，收到 {pathology_mode}")
+                f"pathology_mode 必须是 none/film，收到 {pathology_mode}")
         in_dim = 2 * self.dim
         self.transition = nn.Sequential(
             nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
@@ -182,11 +173,9 @@ class OneStepDynamicsHead(nn.Module):
         nn.init.zeros_(self.decode.weight)
         nn.init.zeros_(self.decode.bias)
         self.film = None
-        self.pathology_moe = None
         self.gate_res = None
         # ``cond_rng_isolated`` 由顶层按「是否处于条件注入实验」决定：条件臂下
-        # 条件子模块不得推进全局 RNG（否则后建的头/主干随臂变化，H0 与 H1 不可比）；
-        # legacy RECC 线保持历史构造顺序，逐位不变。
+        # 条件子模块不得推进全局 RNG（否则后建的头/主干随臂变化，H0 与 H1 不可比）。
         if self.pathology_mode == 'film':
             with _rng_scope(cond_rng_isolated):
                 self.film = (ConditionFiLM(cond_dim, self.dim, lam=cond_lambda)
@@ -198,98 +187,30 @@ class OneStepDynamicsHead(nn.Module):
                 with _rng_scope(cond_rng_isolated):
                     self.gate_res = ConditionalGatedResidual(
                         self.dim, cond_dim, hidden=cond_gate_hidden)
-        elif self.pathology_mode == 'moe':
-            if not cond_dim:
-                raise ValueError(
-                    "pathology_mode='moe' 需要病理条件通路（finetune 模式 + "
-                    "pathology_normalizer），HC 预训练请使用 'none'。")
-            # 方案 §5：moe 模式关闭 One-Step 原 FiLM，病理条件只进入 MoE
-            with _rng_scope(cond_rng_isolated):
-                self.pathology_moe = TFMPathologyMoE(
-                    dim=self.dim, cond_dim=cond_dim, num_experts=num_experts,
-                    top_k=top_k, expert_hidden_dim=expert_hidden_dim,
-                    router_hidden_dim=router_hidden_dim,
-                    router_temperature=router_temperature, dropout=dropout,
-                    dense_warmup_epochs=dense_warmup_epochs)
 
     def forward(self, z_t: torch.Tensor, adj: torch.Tensor,
                 cond: Optional[torch.Tensor] = None,
-                pathology_epoch: Optional[int] = None,
-                return_expert_pred: bool = False,
-                return_pair_pred: bool = False):
+                pathology_epoch: Optional[int] = None):
         """
         Args:
             z_t:  [B, F, D] 最后 causal token
             adj:  [B, F, F] A_eff（结构先验）
             cond: [B, C] 或 None（HC 预训练 / 未提供评分）
-            pathology_epoch: 当前训练 epoch（0 基）；None 视为部署态 → Top-K 稀疏
-            return_expert_pred: 是否构造逐专家 candidate（RECC / diagnose 需要）
-            return_pair_pred: 是否构造 Top-2 等权 pair candidate（Pair-RECC 需要）
+            pathology_epoch: 保留的兼容参数（旧 MoE 路线的 epoch 调度已移除）
         Returns:
-            (Δx̂ [B,F], aux dict)
-            Δx̂ 为归一化空间相对 x_t 的变化量；aux 仅在 moe 模式非空：
-              ``tfm_router_probs`` / ``tfm_router_weights`` / ``tfm_router_logits`` /
-              ``tfm_topk_indices``；``return_expert_pred=True`` 时另含
-              ``tfm_expert_delta_z_norm`` [B,E,F,D]（latent 修正）、
-              ``tfm_expert_delta_norm`` [B,E,F]（decode 输出的归一化 residual，
-              尚未加 x_last 锚点；完整 candidate state 由 NeuroTwinTFM.forward
-              统一加锚并反归一化，见 TFM_CANDIDATE_SCHEMA）、
-              ``tfm_shared_delta_norm`` [B,F]（shared-only 的归一化 residual）、
-              ``tfm_router_probs_coupling`` [B,E]（detach 耦合分支）；
-              ``return_pair_pred=True`` 时还有 ``tfm_pair_delta_norm`` [B,P,F]
-              与 ``tfm_pair_indices`` [P,2]。
+            (Δx̂ [B,F], aux dict)，aux 恒为空 dict（保持调用方接口形状）。
+            Δx̂ 为归一化空间相对 x_t 的变化量。
         """
         z_g = torch.bmm(adj.to(dtype=z_t.dtype), z_t)          # [B,F,D]
         h = self.transition(torch.cat([z_t, z_g], dim=-1))     # [B,F,D]
-        aux = {}
-        if self.pathology_mode == 'film':
-            if self.film is not None and cond is not None:
-                scale, shift = self.film(cond)
-                h = h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-            if self.gate_res is not None and cond is not None:
-                # 扩展候选：h' = h + g(h,c) ⊙ R(h,c)，R 末层零初始化
-                h = self.gate_res(h, cond)
-            z_next = z_t + h
-        else:
-            z_shared = z_t + h                                 # 共享 HC 动力学
-            if self.pathology_mode == 'moe':
-                moe_out = self.pathology_moe(
-                    z_t, z_g, cond, epoch=pathology_epoch,
-                    need_expert=return_expert_pred,
-                    need_coupling=return_expert_pred)
-                z_next = z_shared + moe_out.pop('delta_path_z')
-                aux.update(moe_out)
-                if return_expert_pred:
-                    # 逐专家 candidate 的归一化 residual（方案 §38）：decode 输出
-                    # 与正式主输出同为 **相对 x_last 的变化量**，不是完整状态；
-                    # 加锚 x_last 与反归一化统一在 NeuroTwinTFM.forward 完成
-                    # （RECC 执行计划 §5.1 的完整预测契约，candidate_schema 见
-                    # TFM_CANDIDATE_SCHEMA）。每个 candidate 都包含共享动力学，
-                    # 衡量“相同健康动力学上哪个修正最合适”（§16）。
-                    expert_delta_z = aux['tfm_expert_delta_z_norm']
-                    z_cand = z_shared.unsqueeze(1) + expert_delta_z  # [B,E,F,D]
-                    aux['tfm_expert_delta_norm'] = \
-                        self.decode(z_cand).squeeze(-1)        # [B,E,F] residual
-                    # shared-only 对照（执行计划 §6.1 增量收益的分母）
-                    aux['tfm_shared_delta_norm'] = \
-                        self.decode(z_shared).squeeze(-1)      # [B,F] residual
-                    if return_pair_pred:
-                        # Top-2 等权 pair candidate（方案 §27/§29）：
-                        # x̂^(ij) = x_t + Decode(z_shared + (Δz_i+Δz_j)/2)。
-                        # equal weight 避免 competence target 依赖当前 Router
-                        # 形成自反馈（§29）
-                        pair_idx = build_pair_indices(
-                            self.pathology_moe.num_experts).to(z_t.device)
-                        delta_pair = 0.5 * (
-                            expert_delta_z[:, pair_idx[:, 0]]
-                            + expert_delta_z[:, pair_idx[:, 1]])  # [B,P,F,D]
-                        z_pair = z_shared.unsqueeze(1) + delta_pair
-                        aux['tfm_pair_delta_norm'] = \
-                            self.decode(z_pair).squeeze(-1)    # [B,P,F] residual
-                        aux['tfm_pair_indices'] = pair_idx
-            else:
-                z_next = z_shared
-        return self.decode(z_next).squeeze(-1), aux            # [B,F], aux
+        if self.film is not None and cond is not None:
+            scale, shift = self.film(cond)
+            h = h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        if self.gate_res is not None and cond is not None:
+            # 扩展候选：h' = h + g(h,c) ⊙ R(h,c)，R 末层零初始化
+            h = self.gate_res(h, cond)
+        z_next = z_t + h
+        return self.decode(z_next).squeeze(-1), {}               # [B,F], aux
 
 
 class CPMHorizonHead(nn.Module):
@@ -464,14 +385,8 @@ class NeuroTwinTFM(nn.Module):
         sc_sinkhorn_iters: int = 64,
         # ---- One-Step 头（§10）----
         one_step_hidden_dim: int = 256,
-        # ---- One-Step 病理残差专家（RECC 方案 §6/§36；仅 finetune 生效）----
+        # ---- One-Step 病理条件模式（none/film；legacy discrete 路线）----
         tfm_patho_mode: str = 'film',
-        tfm_num_experts: int = 4,
-        tfm_top_k: int = 2,
-        tfm_expert_hidden_dim: int = 256,
-        tfm_router_hidden_dim: int = 128,
-        tfm_router_temperature: float = 1.0,
-        tfm_moe_dense_warmup_epochs: int = 5,
         # ---- CPM 头（§8/§11）----
         cpm_horizon: int = 8,
         cpm_layers: int = 2,
@@ -503,6 +418,15 @@ class NeuroTwinTFM(nn.Module):
         graph_source: str = 'legacy_mask',
         personalized: bool = False,
         profile_dim: int = 32,
+        dynamics_history_memory: bool = False,
+        # ---- S4 概率轨迹（默认 off；on 时只新增模块，不改变 S2 默认路径）----
+        s4_variant: str = 'off',
+        s4_residual_rank: int = 8,
+        s4_residual_hidden: int = 128,
+        s4_residual_init_scale: float = 0.1,
+        s4_noise_rank: int = 8,
+        s4_noise_scale: float = 1e-2,
+        s4_train_samples: int = 32,
     ):
         super().__init__()
         if patch_len < 1 or context_max < patch_len:
@@ -523,10 +447,6 @@ class NeuroTwinTFM(nn.Module):
         if self.dynamics_mode not in ('discrete', 'graph_ode'):
             raise ValueError(
                 f"dynamics_mode 必须是 discrete/graph_ode，收到 '{dynamics_mode}'")
-        if self.dynamics_mode == 'graph_ode' and str(tfm_patho_mode) == 'moe':
-            raise ValueError(
-                'graph_ode 路线不组合 MoE/RECC（方案 §11）：'
-                "请使用 tfm_patho_mode='film'/'none' 或 dynamics_mode=discrete。")
         self.ode_steps = int(ode_steps)
         if self.ode_steps < 1:
             raise ValueError(f'ode_steps 必须 >= 1，收到 {ode_steps}')
@@ -541,6 +461,28 @@ class NeuroTwinTFM(nn.Module):
         self.profile_dim = int(profile_dim) if self.personalized else 0
         if self.personalized and self.profile_dim < 1:
             raise ValueError(f'profile_dim 必须 >= 1，收到 {profile_dim}')
+        # S2 状态耦合开关：默认 False 时不构建任何新参数，旧权重 strict 加载不变
+        self.dynamics_history_memory = bool(dynamics_history_memory) \
+            and self.dynamics_mode == 'graph_ode'
+        # S4 概率化链（S4-1 输出端残差 / S4-2 潜状态随机创新）。默认 off 时
+        # 不构建任何模块，旧 checkpoint 的参数集合与数值路径逐位不变。
+        self.s4_variant = str(s4_variant)
+        if self.s4_variant not in ('off', 's4_1', 's4_2'):
+            raise ValueError(
+                f"s4_variant 必须是 off/s4_1/s4_2，收到 '{s4_variant}'")
+        if self.s4_variant != 'off' and self.dynamics_mode != 'graph_ode':
+            raise ValueError(
+                'S4-1/S4-2 仅支持 dynamics_mode=graph_ode；discrete 路线没有'
+                '连续轨迹分布可建模。')
+        self.s4_residual_rank = int(s4_residual_rank)
+        self.s4_residual_hidden = int(s4_residual_hidden)
+        self.s4_residual_init_scale = float(s4_residual_init_scale)
+        self.s4_noise_rank = int(s4_noise_rank)
+        self.s4_noise_scale = float(s4_noise_scale)
+        self.s4_train_samples = int(s4_train_samples)
+        if self.s4_train_samples < 1:
+            raise ValueError(
+                f's4_train_samples 必须 >=1，收到 {self.s4_train_samples}')
         # 条件臂声明（与 CLI ``--condition_arm`` 同义）：``None`` = 调用方未声明，
         # 保持 legacy 语义；``'none'`` = 显式声明「无条件」，此时 **legacy 单标量
         # HAMD FiLM 也不构建**，否则 D_none 参照其实是旧模型（阶段 1 的 H0 定义）。
@@ -568,16 +510,13 @@ class NeuroTwinTFM(nn.Module):
         active_arm = self.condition_arm if self.condition_arm is not None else cfg_arm
         self.condition_disabled = active_arm == 'none'
         if self.pretrain_mode:
-            if str(tfm_patho_mode) == 'moe':
-                print("[TFM-MoE] HC 预训练不构建病理专家模块：tfm_patho_mode='moe' "
-                      "自动置为 none（RECC 方案 §51）。")
             self.tfm_patho_mode = 'film' if (
                 active_arm is not None and active_arm != 'none') else 'none'
         else:
             self.tfm_patho_mode = str(tfm_patho_mode)
-            if self.tfm_patho_mode not in ('none', 'film', 'moe'):
+            if self.tfm_patho_mode not in ('none', 'film'):
                 raise ValueError(
-                    f"tfm_patho_mode 必须是 none/film/moe，收到 {tfm_patho_mode}")
+                    f"tfm_patho_mode 必须是 none/film，收到 {tfm_patho_mode}")
             if self.condition_disabled and self.tfm_patho_mode != 'none':
                 print(f"[condition] arm=none：不构建 legacy 数值条件调制（"
                       f"tfm_patho_mode='{self.tfm_patho_mode}' 置为 none）；"
@@ -675,7 +614,7 @@ class NeuroTwinTFM(nn.Module):
         if self.conditioning_on:
             if self.cond_inject in ('heads', 'heads+backbone'):
                 head_cond_dim = cond_dim
-        elif self.tfm_patho_mode in ('film', 'moe'):
+        elif self.tfm_patho_mode == 'film':
             head_cond_dim = cond_dim
         cond_rng_isolated = self.conditioning_on
         if self.dynamics_mode == 'graph_ode':
@@ -684,17 +623,16 @@ class NeuroTwinTFM(nn.Module):
                 dim=dim, hidden_dim=one_step_hidden_dim,
                 cond_dim=head_cond_dim or None,
                 profile_dim=self.profile_dim or None,
-                ode_steps=self.ode_steps)
+                ode_steps=self.ode_steps,
+                history_memory=dynamics_history_memory,
+                stochastic=(self.s4_variant == 's4_2'),
+                noise_rank=self.s4_noise_rank,
+                noise_scale=self.s4_noise_scale)
         else:
             self.one_step_head = OneStepDynamicsHead(
                 dim=dim, hidden_dim=one_step_hidden_dim, dropout=dropout,
                 cond_dim=head_cond_dim or None,
                 pathology_mode=self.tfm_patho_mode,
-                num_experts=tfm_num_experts, top_k=tfm_top_k,
-                expert_hidden_dim=tfm_expert_hidden_dim,
-                router_hidden_dim=tfm_router_hidden_dim,
-                router_temperature=tfm_router_temperature,
-                dense_warmup_epochs=tfm_moe_dense_warmup_epochs,
                 cond_lambda=cond_lambda_os,
                 cond_gate_residual=(cond_gate_residual and self.conditioning_on
                                     and self.cond_inject != 'backbone'),
@@ -707,6 +645,17 @@ class NeuroTwinTFM(nn.Module):
             build_intervention=cpm_intervention,
             cond_lambda=cond_lambda_cpm,
             cond_rng_isolated=cond_rng_isolated)
+
+        # ---- S4-1：输出端低秩时空残差头（fork_rng 不影响 S2 参数初始化）----
+        self.s4_residual_head = None
+        if self.s4_variant == 's4_1':
+            with torch.random.fork_rng(devices=[]):
+                self.s4_residual_head = LowRankSpatioTemporalResidualHead(
+                    dim=dim, n_rois=features, horizon=cpm_horizon,
+                    rank=self.s4_residual_rank,
+                    hidden=self.s4_residual_hidden,
+                    n_samples=self.s4_train_samples,
+                    scale_init=self.s4_residual_init_scale)
 
         # ---- 个体基线 profile（方案 §5；personalized=False 不创建）----
         self.profile_encoder = None
@@ -816,28 +765,24 @@ class NeuroTwinTFM(nn.Module):
         out = self.rev_norm(pred_norm.unsqueeze(-1), 'denorm', stats=stats)
         return out.squeeze(-1)
 
-    def _denorm_expert_candidates(self, expert_state_norm: torch.Tensor,
-                                  stats) -> torch.Tensor:
-        """[B,E,F]（归一化完整状态）→ 原始空间（RECC 方案 §39：复用 BrainRevIN 仿射）。
-
-        入参必须是**已加 x_last 锚点的完整状态**（candidate_schema v2），与
-        one-step 主输出走同一 residual→state→denorm 链路；通过 permute 把
-        expert 轴放进 BrainRevIN 的窗口位做批量反归一化，无需手写 RevIN affine。
-        """
+    def _denorm_samples(self, samples_norm: torch.Tensor, stats) -> torch.Tensor:
+        """[B,K,F,H]（归一化）→ 数据尺度；逐样本复用 RevIN 的逐 ROI 仿射。"""
         if self.rev_norm is None:
-            return expert_state_norm
-        cand4 = expert_state_norm.permute(0, 2, 1).unsqueeze(-1)  # [B,F,E,1]
-        raw4 = self.rev_norm(cand4, 'denorm', stats=stats)
-        return raw4.squeeze(-1).permute(0, 2, 1)                 # [B,E,F]
+            return samples_norm
+        mean, stdev = stats
+        x = samples_norm.float()
+        if self.rev_norm.affine:
+            w = self.rev_norm.affine_weight.view(1, 1, -1, 1)
+            b = self.rev_norm.affine_bias.view(1, 1, -1, 1)
+            x = (x - b) / (w + self.rev_norm.eps)
+        mean2 = mean[:, :, 0, 0].float()[:, None, :, None]
+        std2 = stdev[:, :, 0, 0].float()[:, None, :, None]
+        return x * std2 + mean2
 
-    def _denorm_pair_candidates(self, pair_state_norm: torch.Tensor,
-                                stats) -> torch.Tensor:
-        """[B,P,F]（归一化完整状态）→ 原始空间（同 :meth:`_denorm_expert_candidates`）。"""
-        if self.rev_norm is None:
-            return pair_state_norm
-        cand4 = pair_state_norm.permute(0, 2, 1).unsqueeze(-1)    # [B,F,P,1]
-        raw4 = self.rev_norm(cand4, 'denorm', stats=stats)
-        return raw4.squeeze(-1).permute(0, 2, 1)                 # [B,P,F]
+    def s4_modules(self):
+        """返回所有 S4 新增子模块（冻结/优化器/迁移用；默认 off 时为空）。"""
+        return [m for _, m in self.named_modules()
+                if getattr(m, 'is_s4_module', False)]
 
     # ------------------------------------------------------------------
     # 前向（next_timepoint 协议同形：[B,F,1,K] → [B,F,1,1]）
@@ -846,8 +791,6 @@ class NeuroTwinTFM(nn.Module):
                 pathology_score: Optional[torch.Tensor] = None,
                 future_control: Optional[torch.Tensor] = None,
                 pathology_epoch: Optional[int] = None,
-                return_expert_pred: bool = False,
-                return_pair_pred: bool = False,
                 condition: Optional[dict] = None,
                 condition_epoch: Optional[int] = None,
                 controls: Optional[torch.Tensor] = None,
@@ -863,13 +806,7 @@ class NeuroTwinTFM(nn.Module):
             pathology_score: [B, D] 或 None（HC 预训练 / 未提供评分）
             future_control: [B, F, cpm_horizon] 未来已知控制量（仅
                 ``cpm_intervention=True`` 时生效；V1 默认 None）
-            pathology_epoch: 当前训练 epoch（0 基）；None 视为部署态
-                （Top-K 稀疏路由）。moe 模式的 dense warmup 期（§14）由
-                训练循环显式传入真实 epoch。
-            return_expert_pred: 构造逐专家 candidate（RECC / diagnose 需要；
-                仅 moe 模式生效，方案 §40）
-            return_pair_pred: 额外构造 Top-2 等权 pair candidate（Pair-RECC，
-                方案 §27；仅 moe 模式 + return_expert_pred 时生效）
+            pathology_epoch: 当前训练 epoch（0 基）；保留的兼容参数。
         Returns:
             pred: [B, F, 1, 1] one-step 下一状态预测（原始空间，
                   供既有评估/损失直接消费）
@@ -877,17 +814,6 @@ class NeuroTwinTFM(nn.Module):
                 ``cpm_pred``  [B, F, H] CPM 全 horizon 预测（原始空间）
                 ``sc_prior``  SoftAnatomicalPrior 输出（图正则消费）
                 ``pathology_cond`` 条件向量（finetune；诊断用）
-                moe 模式（RECC 方案 §40）另含：
-                ``tfm_router_probs`` [B,E] / ``tfm_router_weights`` [B,E] /
-                ``tfm_router_logits`` [B,E] / ``tfm_topk_indices`` [B,K]；
-                ``return_expert_pred=True`` 时还有 ``tfm_expert_pred`` [B,E,F]
-                （原始空间完整 candidate，state_anchored_v2 契约）、
-                ``tfm_expert_state_norm`` [B,E,F] / ``tfm_expert_delta_norm``
-                [B,E,F]、``tfm_shared_pred`` [B,F]（shared-only 原始空间）、
-                ``tfm_expert_delta_z_norm`` [B,E,F,D]、
-                ``tfm_router_probs_coupling`` [B,E]（detach 耦合分支）；
-                ``return_pair_pred=True`` 时还有 ``tfm_pair_pred`` [B,P,F]
-                （原始空间，P=C(E,2)）与 ``tfm_pair_indices`` [P,2]。
         """
         if x.ndim != 4 or x.shape[2] != 1:
             raise ValueError(
@@ -915,10 +841,6 @@ class NeuroTwinTFM(nn.Module):
         if self.dynamics_mode == 'graph_ode':
             one_aux = {}    # graph_ode 无旧 one-step 头 aux（下方统一 update 消费）
             # ---- 受控图 ODE 分支（方案 §6.3.1）：同一次编码创建初始状态 ----
-            if self.tfm_patho_mode == 'moe' or return_expert_pred or return_pair_pred:
-                raise ValueError(
-                    'graph_ode 路线不组合 MoE/RECC/expert candidate（方案 §11）；'
-                    '请使用 dynamics_mode=discrete。')
             if future_control is not None:
                 raise ValueError(
                     'future_control [B,F,H] 只属于 legacy CPM；受控动态请传 '
@@ -936,9 +858,11 @@ class NeuroTwinTFM(nn.Module):
             # dynamics_horizon 是可选覆盖，缺省复用 CPM H（不新增 horizon CLI）
             dyn_h = (int(dynamics_horizon)
                      if dynamics_horizon is not None else self.cpm_horizon)
+            memory = self._history_memory(tokens)
             z_final, q_traj_norm, z_traj = self.one_step_head(
                 z_t, x_last_norm, sc_info['A_eff'], cond=cond, profile=profile,
-                controls=controls, time_deltas=time_deltas, horizon=dyn_h)
+                controls=controls, time_deltas=time_deltas, horizon=dyn_h,
+                memory=memory)
             del z_final   # forward 只消费 q 轨迹；latent 末状态经 state API 使用
             # 主输出 = 动态轨迹第一帧（反归一化后 [B,F,1,1]），不再额外加 x_last
             one_pred_norm = q_traj_norm[:, :, 0:1].unsqueeze(-1)
@@ -948,40 +872,29 @@ class NeuroTwinTFM(nn.Module):
                        'norm_stats': norm_stats}
             if profile is not None:
                 dyn_aux['personal_profile'] = profile              # [B,profile_dim]
+            # ---- S4 概率轨迹：只追加 samples，不改变确定性均值/方差路径 ----
+            if self.s4_variant != 'off':
+                if self.s4_variant == 's4_1':
+                    # 输出端：上下文汇总 detach，残差头只更新自身参数
+                    ctx = z_t.mean(dim=1).detach()
+                    residual_norm = self.s4_residual_head(
+                        ctx, n_samples=self.s4_train_samples)
+                    samples_norm = (q_traj_norm.unsqueeze(1)
+                                    + residual_norm.to(q_traj_norm.dtype))
+                    dyn_aux['dynamics_residual_norm'] = residual_norm
+                else:
+                    samples_norm, _ = self.one_step_head.forward_samples(
+                        z_t, x_last_norm, sc_info['A_eff'], cond=cond,
+                        profile=profile, controls=controls,
+                        time_deltas=time_deltas, horizon=dyn_h, memory=memory,
+                        n_samples=self.s4_train_samples)
+                dyn_aux['dynamics_samples'] = self._denorm_samples(
+                    samples_norm, norm_stats)                      # [B,K,F,H]
         else:
-            need_expert = bool(return_expert_pred) and self.tfm_patho_mode == 'moe'
-            need_pair = need_expert and bool(return_pair_pred)
             delta_norm, one_aux = self.one_step_head(
                 z_t, sc_info['A_eff'], cond,
-                pathology_epoch=pathology_epoch,
-                return_expert_pred=need_expert,
-                return_pair_pred=need_pair)
+                pathology_epoch=pathology_epoch)
             one_pred_norm = (x_last_norm + delta_norm).unsqueeze(-1).unsqueeze(-1)
-
-        if self.dynamics_mode != 'graph_ode' and need_expert \
-                and 'tfm_expert_delta_norm' in one_aux:
-            # 完整预测契约（candidate_schema v2，RECC 执行计划 §5.1）：candidate
-            # 与正式 mixture 输出走同一 residual → 加锚 state → denorm 链路。
-            # 共同偏移不会在“candidate 与 target 的损失”中自动抵消，漏锚会改变
-            # competence 排名（§2.3 排名翻转反例），因此锚点必须显式加回。
-            # residual / state（norm） / pred（raw）三层键都保留，命名可区分。
-            expert_delta_norm = one_aux['tfm_expert_delta_norm']        # [B,E,F]
-            expert_state_norm = x_last_norm.unsqueeze(1) + expert_delta_norm
-            one_aux['tfm_expert_state_norm'] = expert_state_norm
-            one_aux['tfm_expert_pred'] = self._denorm_expert_candidates(
-                expert_state_norm, norm_stats)                 # [B,E,F] 原始空间
-            shared_delta_norm = one_aux['tfm_shared_delta_norm']        # [B,F]
-            shared_state_norm = x_last_norm + shared_delta_norm
-            one_aux['tfm_shared_state_norm'] = shared_state_norm
-            one_aux['tfm_shared_pred'] = self._denorm_expert_candidates(
-                shared_state_norm.unsqueeze(1), norm_stats).squeeze(1)  # [B,F]
-            one_aux['tfm_candidate_schema'] = TFM_CANDIDATE_SCHEMA
-            if need_pair and 'tfm_pair_delta_norm' in one_aux:
-                pair_delta_norm = one_aux['tfm_pair_delta_norm']       # [B,P,F]
-                pair_state_norm = x_last_norm.unsqueeze(1) + pair_delta_norm
-                one_aux['tfm_pair_state_norm'] = pair_state_norm
-                one_aux['tfm_pair_pred'] = self._denorm_pair_candidates(
-                    pair_state_norm, norm_stats)               # [B,P,F] 原始空间
 
         # CPM 头（§11）：ROI × Horizon 查询，一次输出整段未来
         cpm_pred_norm = self.cpm_head(
@@ -1204,6 +1117,18 @@ class NeuroTwinTFM(nn.Module):
         """A_eff → 非负对称图 A（方案 §6.1.1：动态头只做对称化，不另学图）。"""
         return 0.5 * (a_eff + a_eff.transpose(-1, -2))
 
+    def _history_memory(self, tokens: torch.Tensor) -> Optional[torch.Tensor]:
+        """S2 历史记忆：编码 token 在 patch 维取均值 → [B,F,D]；未启用时返回 None。
+
+        记忆只由**已观测历史**编码得到，rollout 期间保持固定，使自由推进始终可以
+        访问真实历史，而不必反复把预测值反馈回编码器（D2 已证明后者会放大漂移）。
+        显式转 float32：ODE 积分在 autocast 关闭下运行，记忆在进入图 ODE 头之前就
+        统一到 fp32，避免 torch.compile 图内出现 Half/float 混合的 matmul。
+        """
+        if not self.dynamics_history_memory:
+            return None
+        return _pool_history_tokens(tokens)
+
     def calibrate_profile(self, calibration_bold: torch.Tensor) -> torch.Tensor:
         """基线 ``[B,F,1,L]`` → p ``[B,profile_dim]``（共享编码器一次，方案 §5/§6.3）。
 
@@ -1265,6 +1190,7 @@ class NeuroTwinTFM(nn.Module):
         state = {'z': tokens[:, :, -1, :], 'q': x_grid[:, :, -1],
                  'adj': self._symmetrize_adj(sc_info['A_eff']),
                  'cond': cond, 'profile': profile,
+                 'memory': self._history_memory(tokens),
                  'norm_stats': norm_stats, 'history': history}
         if self.graph_source == 'legacy_mask':
             state['sc_matrix'] = sc_matrix
@@ -1289,7 +1215,8 @@ class NeuroTwinTFM(nn.Module):
                             device=state['z'].device, dtype=torch.float32)
         z_new, q_new = self.one_step_head.integrate_interval(
             state['z'], state['q'], state['adj'], dt,
-            cond=state['cond'], profile=state['profile'], control=control)
+            cond=state['cond'], profile=state['profile'], control=control,
+            memory=state.get('memory'))
         x_new = self._denorm_q(q_new, state['norm_stats'])     # [B,F] 数据尺度
         history_new = torch.cat(
             [state['history'][:, 1:, :], x_new.unsqueeze(1)], dim=1)
@@ -1326,6 +1253,7 @@ class NeuroTwinTFM(nn.Module):
         new_state = dict(state)
         new_state.update({'z': tokens[:, :, -1, :], 'q': x_grid[:, :, -1],
                           'adj': self._symmetrize_adj(sc_info['A_eff']),
+                          'memory': self._history_memory(tokens),
                           'norm_stats': norm_stats, 'history': history_new})
         return new_state
 

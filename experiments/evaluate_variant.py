@@ -275,7 +275,8 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
                         eval_rollout=None, eval_fc=None, eval_spectral=None,
                         spectral_tr=None, refresh_split_manifest=False,
                         compute_importance=False, importance_max_tasks=256,
-                        importance_permutations=0, importance_fdr_alpha=0.05):
+                        importance_permutations=0, importance_fdr_alpha=0.05,
+                        direction_deadzone=None):
     """Next-Timepoint（Next Brain-State Prediction）评估入口。
 
     主指标是**单时间点全脑状态**的 MAE/RMSE/spatial PCC，baselines 为
@@ -353,7 +354,8 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
             extra_report=extra, ar1=ar1, compute_importance=compute_importance,
             importance_max_tasks=importance_max_tasks,
             importance_permutations=importance_permutations,
-            importance_fdr_alpha=importance_fdr_alpha)
+            importance_fdr_alpha=importance_fdr_alpha,
+            direction_deadzone=direction_deadzone)
         summary.update(npe.summarize(report))
         if split == 'test':
             first = f"t+{report['protocol']['forecast_offsets'][0]}"
@@ -371,13 +373,15 @@ def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
              refresh_split_manifest=False, eval_rollout=None, eval_fc=None,
              eval_spectral=None, spectral_tr=None,
              importance_max_tasks=256, importance_permutations=0,
-             importance_fdr_alpha=0.05):
+             importance_fdr_alpha=0.05, direction_deadzone=None,
+             s4_samples=None):
     """评估单个 checkpoint 的对外入口（唯一口径 next_timepoint）。
 
     从 checkpoint 的 config.args 快照自省重建模型，转发到 evaluate_next_point。
     ``compute_feature_importance=True`` 时额外产 ``feature_importance_<split>.json``
     （ROI 置换重要性 + BH-FDR 显著脑区）；``visualize`` 已随旧版可视化组件移除，
-    传入 True 时显式报错。
+    传入 True 时显式报错。``s4_samples`` 覆盖测试期轨迹条数 K（MC 稳定性复核用），
+    不影响训练期设置。
     """
     _args = load_train_args(ckpt_path)
     task_mode = str(getattr(_args, 'task_mode', 'next_timepoint'))
@@ -388,6 +392,15 @@ def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
         raise ValueError(
             '--visualize 已随旧可视化组件移除；'
             '请用 analysis/visualize_roi_importance.py 与 analysis/visualize_sig_region.py。')
+    if s4_samples is not None:
+        if str(getattr(_args, 's4_variant', 'off') or 'off') == 'off':
+            raise ValueError(
+                '--s4_samples 只对 S4 概率 checkpoint（s4_variant!=off）有效，'
+                f"当前快照 s4_variant={getattr(_args, 's4_variant', 'off')!r}")
+        if int(s4_samples) < 2:
+            raise ValueError(f'--s4_samples 必须 >= 2（经验分布至少两条轨迹），'
+                             f'收到 {s4_samples}')
+        _args.s4_train_samples = int(s4_samples)
     return evaluate_next_point(
         ckpt_path, out_dir, _args, eval_splits=eval_splits, seed=seed, device=device,
         save_arrays=save_arrays,
@@ -396,7 +409,8 @@ def evaluate(ckpt_path, out_dir, eval_splits=('test',), seed=2024,
         compute_importance=compute_feature_importance,
         importance_max_tasks=importance_max_tasks,
         importance_permutations=importance_permutations,
-        importance_fdr_alpha=importance_fdr_alpha)
+        importance_fdr_alpha=importance_fdr_alpha,
+        direction_deadzone=direction_deadzone)
 
 
 def main():
@@ -426,6 +440,9 @@ def main():
                     help='额外输出 Welch PSD 低频段一致性指标')
     ap.add_argument('--spectral_tr', type=float, default=None,
                     help='频谱评估使用的 TR（秒）；默认沿用 checkpoint 配置')
+    ap.add_argument('--direction_deadzone', type=float, default=None,
+                    help='方向准确率死区：|真实一阶差分| <= 该值的 ROI 不计入 '
+                         'sign 一致率；默认 0.05（BOLD 已逐 ROI z-score）')
     # ---- ROI 置换重要性（产出 feature_importance_<split>.json） ----
     ap.add_argument('--feature_importance', action='store_true',
                     help='额外计算 ROI 置换重要性并落盘 feature_importance_<split>.json')
@@ -436,6 +453,10 @@ def main():
                          '>0 时用经验零分布（代价随该值线性增长）')
     ap.add_argument('--feature_importance_fdr_alpha', type=float, default=0.05,
                     help='BH-FDR 显著脑区阈值（默认 0.05）')
+    ap.add_argument('--s4_samples', type=int, default=None,
+                    help='S4 概率 checkpoint 的测试期轨迹条数 K，覆盖训练期的 '
+                         '--s4_train_samples（如 64 复核 Monte Carlo 稳定性）；'
+                         '需配合 --save_arrays 才会落盘 dynamics_samples')
     ns = ap.parse_args()
     device = torch.device(ns.device) if ns.device else None
     summary = evaluate(ns.ckpt, ns.out_dir, tuple(ns.splits.split(',')),
@@ -447,7 +468,9 @@ def main():
                        compute_feature_importance=ns.feature_importance,
                        importance_max_tasks=ns.feature_importance_max_tasks,
                        importance_permutations=ns.feature_importance_permutations,
-                       importance_fdr_alpha=ns.feature_importance_fdr_alpha)
+                       importance_fdr_alpha=ns.feature_importance_fdr_alpha,
+                       direction_deadzone=ns.direction_deadzone,
+                       s4_samples=ns.s4_samples)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

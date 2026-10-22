@@ -40,6 +40,9 @@ log = logging.getLogger(__name__)
 EPS = 1e-8
 DEFAULT_ROLLOUT_HORIZONS = (1, 2, 4, 8, 16)
 DEFAULT_SPECTRAL_BAND = (0.01, 0.1)   # Hz（低频段）
+# 方向准确率死区：真实一阶差分绝对值不超过该阈值的 (anchor, ROI) 视为噪声，
+# 不计入 sign 一致率。BOLD 已逐 ROI z-score，默认 0.05 约等于 5% ROI 标准差/TR。
+DEFAULT_DIRECTION_DEADZONE = 0.05
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -162,6 +165,359 @@ def per_task_next_state(pred, target, mask, anchor=None):
     return arrays
 
 
+def per_task_head_metrics(pred, target, mask, anchor,
+                          direction_deadzone=DEFAULT_DIRECTION_DEADZONE):
+    """单个预测头（Graph-ODE 或 CPM）的逐 horizon 指标 [N, H]。
+
+    与 ``per_task_next_state`` 的区别是显式区分两种差分口径：
+
+    - ``delta_mae_anchor``：``|(ŷ_h − x_t) − (y_h − x_t)|``，在数学上恒等于
+      ``MAE``（共同锚点抵消），保留该列只为证明/核对这一点；
+    - ``delta_mae_step``：相邻帧一阶差分误差。``Δŷ_1=ŷ_1−x_t``、
+      ``Δŷ_h=ŷ_h−ŷ_(h−1)``（真值同理），与训练侧
+      ``temporal_difference_huber`` 完全同口径。只有该指标能反映模型是否学到
+      局部时间动力学，而不是单纯复制锚点。
+
+    ``direction_accuracy_step`` / ``direction_accuracy_anchor`` 分别对上述两种
+    差分统计 sign 一致率；真实差分绝对值 <= ``direction_deadzone`` 的样本不计入，
+    避免近零噪声左右方向指标。
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred/target 形状不一致：{pred.shape} vs {target.shape}")
+    if pred.ndim != 3:
+        raise ValueError(f"pred/target 期望 [N,F,H]，收到 {pred.shape}")
+    n, f, h = pred.shape
+    if anchor is None:
+        raise ValueError("方向/差分指标需要 anchor [N,F]（context 末位 x_t）")
+    anchor = np.asarray(anchor, dtype=np.float64)
+    if anchor.shape != (n, f):
+        raise ValueError(f"anchor 形状应为 {(n, f)}，收到 {anchor.shape}")
+    valid = (np.asarray(mask, dtype=bool) if mask is not None
+             else np.ones((n, h), bool))
+    if valid.shape != (n, h):
+        raise ValueError(f"mask 形状 {valid.shape} 应为 {(n, h)}")
+
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    err = pred - target
+    mae = np.abs(err).mean(axis=1)
+    rmse = np.sqrt((err ** 2).mean(axis=1))
+    pc = pred - pred.mean(axis=1, keepdims=True)
+    tc = target - target.mean(axis=1, keepdims=True)
+    denom = np.sqrt((pc ** 2).sum(axis=1) * (tc ** 2).sum(axis=1)) + EPS
+    spatial_pcc = (pc * tc).sum(axis=1) / denom
+    r2 = 1.0 - (err ** 2).sum(axis=1) / ((tc ** 2).sum(axis=1) + EPS)
+    var_ratio = np.where(
+        target.var(axis=1) > EPS, pred.var(axis=1) / (target.var(axis=1) + EPS),
+        np.nan)
+
+    # 相邻帧差分：h=1 用真实锚点，h>=2 用各自轨迹的前一帧
+    prev_p = np.concatenate([anchor[:, :, None], pred[:, :, :-1]], axis=2)
+    prev_t = np.concatenate([anchor[:, :, None], target[:, :, :-1]], axis=2)
+    d_pred = pred - prev_p
+    d_true = target - prev_t
+    step_valid = valid.copy()
+    if h > 1:
+        step_valid[:, 1:] &= valid[:, :-1]
+    d_err = np.abs(d_pred - d_true)
+    delta_mae_step = np.where(
+        step_valid, d_err.mean(axis=1), np.nan)
+    # 数学恒等列：Δ 相对锚点，与点值 MAE 相同
+    delta_mae_anchor = mae.copy()
+
+    eligible_step = (step_valid[:, None, :]
+                     & (np.abs(d_true) > float(direction_deadzone)))
+    agree_step = (np.sign(d_pred) == np.sign(d_true)) & eligible_step
+    n_eligible_step = eligible_step.sum(axis=1)
+    da_step = np.where(
+        n_eligible_step > 0,
+        agree_step.sum(axis=1) / np.maximum(n_eligible_step, 1), np.nan)
+
+    h_delta = pred - anchor[:, :, None]
+    h_delta_true = target - anchor[:, :, None]
+    eligible_anchor = (valid[:, None, :]
+                       & (np.abs(h_delta_true) > float(direction_deadzone)))
+    agree_anchor = (np.sign(h_delta) == np.sign(h_delta_true)) & eligible_anchor
+    n_eligible_anchor = eligible_anchor.sum(axis=1)
+    da_anchor = np.where(
+        n_eligible_anchor > 0,
+        agree_anchor.sum(axis=1) / np.maximum(n_eligible_anchor, 1), np.nan)
+
+    # 变化幅度比：预测一阶差分 / 真实一阶差分（<1 表示趋平，>1 表示过冲）
+    mag_p = np.abs(d_pred).mean(axis=1)
+    mag_t = np.abs(d_true).mean(axis=1)
+    mag_ratio = np.where(step_valid & (mag_t > EPS), mag_p / (mag_t + EPS), np.nan)
+
+    arrays = {
+        'mae': mae, 'rmse': rmse, 'spatial_pcc': spatial_pcc, 'r2': r2,
+        'variance_ratio': var_ratio,
+        'delta_mae_anchor': delta_mae_anchor,
+        'delta_mae_step': delta_mae_step,
+        'delta_direction': da_step,
+        'direction_accuracy_step': da_step,
+        'direction_accuracy_anchor': da_anchor,
+        'delta_magnitude_ratio': mag_ratio,
+    }
+    for key in ('mae', 'rmse', 'spatial_pcc', 'r2', 'delta_mae_anchor'):
+        arrays[key] = np.where(valid, arrays[key], np.nan)
+    return arrays
+
+
+def _dual_direction_agreement(cpm, ode, anchor, target, direction_deadzone):
+    """逐 (N,H) 统计两头相对锚点方向一致的 ROI 比例（排除近零真实变化）。"""
+    anchor3 = anchor[:, :, None]
+    eligible = np.abs(target - anchor3) > float(direction_deadzone)   # [N,F,H]
+    agree = (np.sign(cpm - anchor3) == np.sign(ode - anchor3)) & eligible
+    n_eligible = eligible.sum(axis=1)
+    return np.where(n_eligible > 0,
+                    agree.sum(axis=1) / np.maximum(n_eligible, 1), np.nan)
+
+
+def per_task_dual_head_metrics(cpm_pred, ode_pred, target, mask, anchor,
+                               direction_deadzone=DEFAULT_DIRECTION_DEADZONE):
+    """CPM 与 Graph-ODE 双头的逐 horizon 一致性/质量指标 [N, H]。
+
+    仅看 Gap 降低不足以说明一致性约束有效：两个头可能一起收敛到同一个错误。
+    因此同时报告：
+
+    - ``gap``：``mean_ROI |ŷ_CPM − ŷ_ODE|``（L1，与训练侧一致性损失同口径）；
+    - ``gap_norm``：Gap / 两头平均 MAE，用于跨臂比较（避免误差尺度变化造成假下降）；
+    - ``cpm_mae`` / ``ode_mae``：各自预测质量；
+    - ``both_fail_vs_persistence``：同一 (task, horizon) 两头 MAE 都大于
+      persistence 基线的比例（“一起预测错误”的直接证据）；
+    - ``head_error_corr``：同一 anchor 上逐 ROI 绝对误差的 Pearson 相关
+      （误差同向移动的程度，1 表示错误结构几乎相同）；
+    - ``oracle_mae``：逐 anchor 取两头较小 MAE，相对单头最优值的下降量
+      ``oracle_gain_vs_best_head`` 衡量两头互补性。
+    """
+    if cpm_pred.shape != ode_pred.shape or cpm_pred.shape != target.shape:
+        raise ValueError(
+            "双头指标要求 CPM/ODE/target 同形，收到 "
+            f"{cpm_pred.shape}/{ode_pred.shape}/{target.shape}")
+    if cpm_pred.ndim != 3:
+        raise ValueError(f"双头指标期望 [N,F,H]，收到 {cpm_pred.shape}")
+    n, f, h = cpm_pred.shape
+    anchor = np.asarray(anchor, dtype=np.float64)
+    if anchor.shape != (n, f):
+        raise ValueError(f"anchor 形状应为 {(n, f)}，收到 {anchor.shape}")
+    valid = (np.asarray(mask, dtype=bool) if mask is not None
+             else np.ones((n, h), bool))
+    if valid.shape != (n, h):
+        raise ValueError(f"mask 形状 {valid.shape} 应为 {(n, h)}")
+
+    cpm = np.asarray(cpm_pred, dtype=np.float64)
+    ode = np.asarray(ode_pred, dtype=np.float64)
+    tgt = np.asarray(target, dtype=np.float64)
+    cpm_abs = np.abs(cpm - tgt)
+    ode_abs = np.abs(ode - tgt)
+    cpm_mae = cpm_abs.mean(axis=1)
+    ode_mae = ode_abs.mean(axis=1)
+    pers_mae = np.abs(anchor[:, :, None] - tgt).mean(axis=1)
+    gap = np.abs(cpm - ode).mean(axis=1)
+    gap_norm = gap / (0.5 * (cpm_mae + ode_mae) + EPS)
+    oracle = np.minimum(cpm_mae, ode_mae)
+    both_fail = ((cpm_mae > pers_mae) & (ode_mae > pers_mae)).astype(np.float64)
+    cpm_win = (cpm_mae < ode_mae).astype(np.float64)
+
+    # 逐 (anchor, horizon) 沿 ROI 的绝对误差相关
+    cc = cpm_abs - cpm_abs.mean(axis=1, keepdims=True)
+    oc = ode_abs - ode_abs.mean(axis=1, keepdims=True)
+    corr_den = np.sqrt((cc ** 2).sum(axis=1) * (oc ** 2).sum(axis=1))
+    head_error_corr = np.where(
+        corr_den > EPS, (cc * oc).sum(axis=1) / (corr_den + EPS), np.nan)
+
+    arrays = {
+        'gap': gap, 'gap_norm': gap_norm,
+        'cpm_mae': cpm_mae, 'ode_mae': ode_mae,
+        'persistence_mae': pers_mae,
+        'both_fail_vs_persistence': both_fail,
+        'head_error_corr': head_error_corr,
+        'oracle_mae': oracle,
+        'oracle_gain_vs_cpm': cpm_mae - oracle,
+        'oracle_gain_vs_ode': ode_mae - oracle,
+        'cpm_win_rate': cpm_win,
+        # 两头相对锚点的变化方向是否一致（不涉及真值），用于判断是否“同错”；
+        # 同样排除真实变化接近零的 ROI，避免噪声抬高一致性
+        'direction_agreement': _dual_direction_agreement(
+            cpm, ode, anchor, target, direction_deadzone),
+    }
+    for key in ('gap', 'gap_norm', 'cpm_mae', 'ode_mae', 'persistence_mae',
+                'both_fail_vs_persistence', 'head_error_corr', 'oracle_mae',
+                'oracle_gain_vs_cpm', 'oracle_gain_vs_ode', 'cpm_win_rate',
+                'direction_agreement'):
+        arrays[key] = np.where(valid, arrays[key], np.nan)
+    return arrays
+
+
+def _step_deltas(pred, target, anchor):
+    """相邻帧一阶差分（与 temporal_difference_huber 同口径）。"""
+    prev_p = np.concatenate([anchor[:, :, None], pred[:, :, :-1]], axis=2)
+    prev_t = np.concatenate([anchor[:, :, None], target[:, :, :-1]], axis=2)
+    return pred - prev_p, target - prev_t
+
+
+def _step_valid(mask):
+    """相邻帧差分有效性：h 与 h−1 的真值都有效；h=1 只需自身有效。"""
+    mask = np.asarray(mask, dtype=bool)
+    valid = mask.copy()
+    if mask.shape[1] > 1:
+        valid[:, 1:] &= mask[:, :-1]
+    return valid
+
+
+def amplitude_quantile_edges(target, mask, anchor, n_bins=5):
+    """用真实相邻帧变化幅度的分位数确定幅度分层边界。
+
+    三臂使用完全相同的 test 锚点与真值，因此边界也相同；返回长度
+    ``n_bins+1``（首边界 0、末边界 +inf），供 ``per_task_amplitude_diagnostics``
+    对模型与基线做同一套分层。
+    """
+    if int(n_bins) < 1:
+        raise ValueError(f'n_bins 必须 >= 1，收到 {n_bins}')
+    target = np.asarray(target, dtype=np.float64)
+    anchor = np.asarray(anchor, dtype=np.float64)
+    mask = (np.asarray(mask, dtype=bool) if mask is not None
+            else np.ones(target.shape[:2], bool))
+    _, dt = _step_deltas(target, target, anchor)
+    valid = _step_valid(mask)
+    vals = np.abs(dt)[np.broadcast_to(valid[:, None, :], dt.shape)]
+    if vals.size == 0:
+        raise ValueError('真实差分没有有效元素，无法确定幅度分层边界')
+    edges = np.quantile(vals, np.linspace(0.0, 1.0, int(n_bins) + 1))
+    edges[0] = 0.0
+    edges[-1] = np.inf
+    for i in range(1, len(edges) - 1):
+        if edges[i] <= edges[i - 1]:
+            edges[i] = edges[i - 1] + 1e-6
+    return edges.tolist()
+
+
+def per_task_amplitude_diagnostics(pred, target, mask, anchor,
+                                   amp_edges=None, n_bins=5):
+    """逐 anchor 的幅度/动态诊断，回答“方向对但幅度是否被压缩”。
+
+    输出的标量数组均为 ``[N]``，逐 horizon 数组为 ``[N,H]``，分层数组为
+    ``[N,B]``：
+
+    - ``delta_std_ratio``：``std(Δŷ)/std(Δy)``（H1–H8 × 全部 ROI 的有效元素），
+      <1 表示变化幅度整体偏小；
+    - ``delta_std_ratio_h1`` / ``_h2_8``：分别看单步与多步推进的幅度比。
+      H1≈1 而 H2–H8<1 说明压缩来自状态推进/条件均值，而非单步 readout；
+    - ``delta_pcc`` / ``delta_pcc_h2_8``：``Corr(Δŷ, Δy)``，衡量是否跟随变化过程；
+    - ``temporal_variance_ratio``：逐 ROI 在有效未来轨迹上的
+      ``Var(ŷ_t..)/Var(y_t..)`` 再对 ROI 平均；<1 表示轨迹方差塌缩；
+    - ``trajectory_variance_ratio_flat``：把 H×ROI 展平后的方差比（对照口径）；
+    - ``amp_bin_mae``：按真实 ``|Δy|`` 分位分层的 Delta MAE（默认 5 层），
+      可直接检查“大幅变化是否尤其欠拟合”。
+
+    ``amp_edges`` 由 :func:`amplitude_quantile_edges` 在真值上预先算好，保证
+    模型与基线、不同实验臂使用完全相同的分层边界。
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f'pred/target 形状不一致：{pred.shape} vs {target.shape}')
+    if pred.ndim != 3:
+        raise ValueError(f'pred/target 期望 [N,F,H]，收到 {pred.shape}')
+    n, f, h = pred.shape
+    anchor = np.asarray(anchor, dtype=np.float64)
+    if anchor.shape != (n, f):
+        raise ValueError(f'anchor 形状应为 {(n, f)}，收到 {anchor.shape}')
+    mask = (np.asarray(mask, dtype=bool) if mask is not None
+            else np.ones((n, h), bool))
+    if mask.shape != (n, h):
+        raise ValueError(f'mask 形状 {mask.shape} 应为 {(n, h)}')
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    dp, dt = _step_deltas(pred, target, anchor)
+    step_valid = _step_valid(mask)
+    if amp_edges is None:
+        amp_edges = amplitude_quantile_edges(target, mask, anchor, n_bins=n_bins)
+    amp_edges = np.asarray(amp_edges, dtype=np.float64)
+    nb = len(amp_edges) - 1
+
+    keys = ('delta_std_ratio', 'delta_pcc', 'temporal_variance_ratio',
+            'trajectory_variance_ratio_flat',
+            'delta_std_ratio_h1', 'delta_std_ratio_h2_8',
+            'delta_pcc_h1', 'delta_pcc_h2_8',
+            'mean_abs_pred_delta', 'mean_abs_true_delta')
+    out = {k: np.full(n, np.nan, dtype=np.float64) for k in keys}
+    out['delta_std_ratio_h'] = np.full((n, h), np.nan)
+    out['delta_pcc_h'] = np.full((n, h), np.nan)
+    out['amp_bin_mae'] = np.full((n, nb), np.nan)
+    out['amp_bin_count'] = np.zeros((n, nb), dtype=np.float64)
+    out['amp_bin_true_abs_mean'] = np.full((n, nb), np.nan)
+
+    for i in range(n):
+        valid = step_valid[i]
+        if not valid.any():
+            continue
+        m3 = np.broadcast_to(valid[None, :], (f, h))
+        x = dp[i][m3]
+        y = dt[i][m3]
+        sx, sy = float(np.std(x)), float(np.std(y))
+        if sy > EPS:
+            out['delta_std_ratio'][i] = sx / sy
+        if sx > EPS and sy > EPS:
+            out['delta_pcc'][i] = float(np.corrcoef(x, y)[0, 1])
+        out['mean_abs_pred_delta'][i] = float(np.abs(x).mean())
+        out['mean_abs_true_delta'][i] = float(np.abs(y).mean())
+
+        # 轨迹方差比：逐 ROI 在有效 horizon 上的时间方差
+        vh = mask[i]
+        if vh.sum() >= 3:
+            pv = pred[i][:, vh]
+            tv = target[i][:, vh]
+            vp, vt = pv.var(axis=1), tv.var(axis=1)
+            ok = vt > EPS
+            if ok.any():
+                out['temporal_variance_ratio'][i] = float(
+                    np.mean(vp[ok] / (vt[ok] + EPS)))
+            fp = pred[i][:, vh].reshape(-1)
+            ft = target[i][:, vh].reshape(-1)
+            if ft.var() > EPS:
+                out['trajectory_variance_ratio_flat'][i] = float(
+                    fp.var() / (ft.var() + EPS))
+
+        # H1 与 H2-8 分开看压缩发生在哪一段
+        for key, sel in (('h1', np.array([0])),
+                         ('h2_8', np.arange(1, h))):
+            if h == 1 and key == 'h2_8':
+                continue
+            sel = sel[valid[sel]]
+            if sel.size == 0:
+                continue
+            xx = dp[i][:, sel].reshape(-1)
+            yy = dt[i][:, sel].reshape(-1)
+            syy = float(np.std(yy))
+            if syy > EPS:
+                out[f'delta_std_ratio_{key}'][i] = float(np.std(xx)) / syy
+            if xx.std() > EPS and syy > EPS:
+                out[f'delta_pcc_{key}'][i] = float(np.corrcoef(xx, yy)[0, 1])
+
+        # 逐 horizon 的幅度比与 PCC（跨 ROI）
+        for hi in range(h):
+            if not valid[hi]:
+                continue
+            xx = dp[i][:, hi]
+            yy = dt[i][:, hi]
+            if yy.std() > EPS:
+                out['delta_std_ratio_h'][i, hi] = xx.std() / yy.std()
+            if xx.std() > EPS and yy.std() > EPS:
+                out['delta_pcc_h'][i, hi] = float(np.corrcoef(xx, yy)[0, 1])
+
+        # 按真实变化幅度分位分层
+        mag = np.abs(y)
+        err = np.abs(x - y)
+        which = np.digitize(mag, amp_edges[1:-1], right=False)
+        for b in range(nb):
+            sel = which == b
+            cnt = int(sel.sum())
+            out['amp_bin_count'][i, b] = cnt
+            if cnt:
+                out['amp_bin_mae'][i, b] = float(err[sel].mean())
+                out['amp_bin_true_abs_mean'][i, b] = float(mag[sel].mean())
+    return out
+
+
 def aggregate_columns(arrays, subj_idx, labels):
     """把 [N, C] 指标数组聚合为 {metric: {label: {...}}}（被试级为主口径）。
 
@@ -209,6 +565,29 @@ def _block_summary(agg, label):
     if 'delta_direction' in agg and label in agg['delta_direction']:
         block['delta_direction'] = agg['delta_direction'][label]['mean']
         block['delta_direction_std'] = agg['delta_direction'][label]['std']
+    # 第一阶段新增指标：差分幅度/方向、双头一致性与质量
+    for metric, key in (
+            ('delta_mae_step', 'delta_MAE_step'),
+            ('delta_mae_anchor', 'delta_MAE_anchor'),
+            ('direction_accuracy_step', 'direction_accuracy_step'),
+            ('direction_accuracy_anchor', 'direction_accuracy_anchor'),
+            ('delta_magnitude_ratio', 'delta_magnitude_ratio'),
+            ('variance_ratio', 'variance_ratio'),
+            ('gap', 'gap'), ('gap_norm', 'gap_norm'),
+            ('cpm_mae', 'CPM_MAE'), ('ode_mae', 'ODE_MAE'),
+            ('persistence_mae', 'persistence_MAE'),
+            ('both_fail_vs_persistence', 'both_fail_vs_persistence'),
+            ('head_error_corr', 'head_error_corr'),
+            ('oracle_mae', 'oracle_MAE'),
+            ('oracle_gain_vs_cpm', 'oracle_gain_vs_cpm'),
+            ('oracle_gain_vs_ode', 'oracle_gain_vs_ode'),
+            ('cpm_win_rate', 'cpm_win_rate'),
+            ('direction_agreement', 'direction_agreement')):
+        if metric in agg and label in agg[metric]:
+            d = agg[metric][label]
+            block[key] = d['mean']
+            block[f'{key}_std'] = d['std']
+            block[f'{key}_median'] = d['median']
     return block
 
 
@@ -633,6 +1012,10 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
 
     ``condition_bundle`` 为 checkpoint 的 ``config.condition``；提供时条件统计量走
     **inherit**（逐位复用训练期 train-only 快照），不在评估侧重拟合。
+
+    ``split`` 额外支持 ``train``：用与 val/test 相同的确定性 anchor / context
+    协议构造**训练被试**评估视图（no rollout），仅供概率校准的常数方差参照等
+    只读分析使用，不参与模型选择。
     """
     from main import condition_loader_kwargs, parse_pathology_fields
     dims = resolve_task_dims(args)
@@ -685,7 +1068,25 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
         return loader.get_test(), loader.get_test_subjects(), loader
     if split == 'val':
         return loader.get_val(), loader.get_val_subjects(), loader
-    raise ValueError(f"split 仅支持 val/test，收到 '{split}'")
+    if split == 'train':
+        from torch.utils.data import DataLoader
+        from utils.dataloader import NextPointEvalView
+        subjects = loader.get_train_subjects()
+        indices = loader._expand_subjects_to_sample_indices(subjects)
+        view = NextPointEvalView(
+            loader.base_dataset, indices,
+            context_length=loader.eval_context_length,
+            anchors_per_subject=loader.eval_anchors_per_subject,
+            rollout_tasks_per_subject=0, rollout_steps=0,
+            all_future_steps=loader.eval_all_future_steps)
+        kwargs = dict(batch_size=loader.eval_batch_size, shuffle=False,
+                      num_workers=loader.num_workers,
+                      pin_memory=loader.pin_memory)
+        if loader.num_workers > 0:
+            kwargs.update(persistent_workers=loader.persistent_workers,
+                          prefetch_factor=loader.prefetch_factor)
+        return DataLoader(view, **kwargs), subjects, loader
+    raise ValueError(f"split 仅支持 train/val/test，收到 '{split}'")
 
 
 @torch.no_grad()
@@ -704,6 +1105,10 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         cpm_pred [N, F, Hc] / cpm_target [N, F, R] / cpm_mask [N, R]
                                        （仅 collect_cpm=True：TFM 的 CPM 头输出，
                                          要求评估视图为所有 anchor 提供 future）
+        ode_pred [N, F, Hc]            Graph-ODE 动态头轨迹（原始空间；
+                                       仅 graph_ode 且 forward 返回 dynamics_pred 时）
+        future [N, F, R] / future_mask [N, R]
+                                       评估视图为所有 anchor 提供的未来真值
     """
     model.eval()
     from main import _index_condition, dynamics_extras
@@ -763,6 +1168,25 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                 chunk['subject_index'].append(
                     cond['subject_index'].detach().cpu().numpy())
 
+        # ---- 未来真值与 Graph-ODE 轨迹（每次前向已计算，不额外推理）----
+        if 'future' in batch:
+            chunk['future'].append(batch['future'].float().numpy())       # [B,F,R]
+            chunk['future_mask'].append(batch['future_mask'].float().numpy())  # [B,R]
+        ode = (aux_info.get('dynamics_pred', None)
+               if isinstance(aux_info, dict) else None)
+        if torch.is_tensor(ode):
+            chunk['ode_pred'].append(ode.float().cpu().numpy())           # [B,F,H]
+        # S4-0：Graph-ODE VarianceHead 的逐 ROI/horizon 输出。std 已由模型换算到
+        # 数据尺度；logvar 保留归一化空间，供校准诊断复核。旧模型/其他路线没有
+        # 这两个键时不写入，保存端以空数组占位保持 npz 字段稳定。
+        for key, aux_key in (('dynamics_std', 'dynamics_std'),
+                             ('dynamics_logvar_norm', 'dynamics_logvar_norm'),
+                             ('dynamics_samples', 'dynamics_samples')):
+            val = (aux_info.get(aux_key, None)
+                   if isinstance(aux_info, dict) else None)
+            if torch.is_tensor(val):
+                chunk[key].append(val.float().cpu().numpy())
+
         # ---- CPM 全 horizon 预测（TFM；评估视图须为所有 anchor 提供 future）----
         if collect_cpm:
             if 'future' not in batch:
@@ -818,6 +1242,18 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         'baselines': {name: np.concatenate(chunk[f'base_{name}'], axis=0)
                       for name in ('persistence', 'trend', 'ar1')
                       if chunk[f'base_{name}']},
+        'ode_pred': (np.concatenate(chunk['ode_pred'], axis=0)
+                     if chunk['ode_pred'] else None),
+        'dynamics_std': (np.concatenate(chunk['dynamics_std'], axis=0)
+                         if chunk['dynamics_std'] else None),
+        'dynamics_logvar_norm': (np.concatenate(chunk['dynamics_logvar_norm'], axis=0)
+                                 if chunk['dynamics_logvar_norm'] else None),
+        'dynamics_samples': (np.concatenate(chunk['dynamics_samples'], axis=0)
+                             if chunk['dynamics_samples'] else None),
+        'future': (np.concatenate(chunk['future'], axis=0)
+                   if chunk['future'] else None),
+        'future_mask': (np.concatenate(chunk['future_mask'], axis=0)
+                        if chunk['future_mask'] else None),
         'roll_pred': (np.concatenate(chunk['roll_pred'], axis=0)
                       if chunk['roll_pred'] else None),
         'roll_target': (np.concatenate(chunk['roll_target'], axis=0)
@@ -832,6 +1268,15 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
         'roll_cutoff': (np.concatenate(chunk['roll_cutoff'], axis=0)
                         if chunk['roll_cutoff'] else None),
     }
+    n_anchor = len(data['subj_ids'])
+    for key in ('future', 'future_mask', 'ode_pred', 'cpm_pred',
+                'dynamics_std', 'dynamics_logvar_norm', 'dynamics_samples'):
+        arr = data.get(key)
+        if arr is not None and arr.shape[0] != n_anchor:
+            raise AssertionError(
+                f'{key} 行数 {arr.shape[0]} != anchor 数 {n_anchor}；'
+                '评估视图必须为每个 anchor 提供同形未来真值/轨迹。')
+
     # ---- 字段级条件矩阵（按**字段名**读取，绝不假设第 0 列是 HAMD）----
     conditioner = getattr(model, 'conditioner', None)
     fields = list(conditioner.names) if conditioner is not None else []
@@ -888,12 +1333,31 @@ def _hamd_association(data, arrays, subj_idx, labels):
     return out
 
 
+def save_predictions_npz(path, **arrays):
+    """保存评估预测为 ``np.savez_compressed``，并保证 ``allow_pickle=False`` 可读。
+
+    ``condition_fields`` 等字段历史上以 ``dtype=object`` 落盘，读取时必须
+    ``allow_pickle=True``。这里统一把 object/字符串字段转成固定宽度字符串数组，
+    数值字段原样保存；``None`` 跳过（调用方对可选字段传 ``[]`` 以保持键存在）。
+    """
+    payload = {}
+    for key, value in arrays.items():
+        if value is None:
+            continue
+        arr = np.asarray(value)
+        if arr.dtype == object:
+            arr = arr.astype(str)
+        payload[key] = arr
+    np.savez_compressed(path, **payload)
+    return path
+
+
 def evaluate_split(model, data_loader, args, device, out_dir, split,
                    eval_rollout=True, eval_fc=True, eval_spectral=False,
                    spectral_tr=2.0, save_arrays=False, n_params=None,
                    extra_report=None, ar1=None, compute_importance=False,
                    importance_max_tasks=256, importance_permutations=0,
-                   importance_fdr_alpha=0.05):
+                   importance_fdr_alpha=0.05, direction_deadzone=None):
     """单个 split 的完整 next_timepoint 评估，落盘 metrics_<split>.json 与两个 csv。
 
     ``compute_importance=True`` 时额外做 ROI 置换重要性并落盘
@@ -905,6 +1369,12 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
     rollout_steps = eval_rollout_steps(args, horizons)
     fc_min_len = int(getattr(args, 'fc_min_length', 32))
     cpm_horizon = int(getattr(args, 'cpm_horizon', 0) or 0)
+    if direction_deadzone is None:
+        direction_deadzone = float(getattr(args, 'direction_deadzone',
+                                           DEFAULT_DIRECTION_DEADZONE))
+    direction_deadzone = float(direction_deadzone)
+    if direction_deadzone < 0:
+        raise ValueError(f'direction_deadzone 必须 >= 0，收到 {direction_deadzone}')
     data = run_inference(model, data_loader, device, offsets, rollout_steps,
                          ar1=ar1, eval_rollout=eval_rollout,
                          collect_cpm=cpm_horizon > 0)
@@ -932,6 +1402,9 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         'eval_anchors_per_subject': int(getattr(args, 'eval_anchors_per_subject', 16)),
         'rollout_steps': int(rollout_steps), 'rollout_horizons': list(horizons),
         'fc_min_length': fc_min_len,
+        'direction_deadzone': direction_deadzone,
+        'direction_rule': ('sign(Δŷ_h)==sign(Δy_h)，Δ 为相邻帧一阶差分；'
+                           '|Δy_h| <= direction_deadzone 的 ROI 不计入'),
         'n_subjects': int(len(np.unique(subj_idx))), 'n_tasks': int(len(subj_idx)),
         'n_rollout_tasks': (int(len(data['roll_subj']))
                             if data['roll_subj'] is not None else 0),
@@ -1067,6 +1540,149 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         report['cpm_horizon'] = {'enabled': False,
                                  'reason': '评估视图提供 all_future_steps 时计算'}
 
+    # ---- 第一阶段核心：Graph-ODE / CPM 逐 horizon 动力学 + 双头一致性 ----
+    phase1_head_arrays = OrderedDict()
+    phase1_head_labels = OrderedDict()
+    phase1_diag_arrays = OrderedDict()
+    phase1_diag_labels = []
+    if data.get('future') is not None:
+        future = data['future']
+        future_mask = data['future_mask']
+        max_h = int(future.shape[2])
+        head_h = min(int(cpm_horizon or max_h), max_h)
+        fut = future[:, :, :head_h]
+        fmask = future_mask[:, :head_h]
+        phase1_labels = [f'H{k}' for k in range(1, head_h + 1)]
+
+        ode_pred = data.get('ode_pred')
+        cpm_pred = data.get('cpm_pred')
+        if ode_pred is not None:
+            ho = min(int(ode_pred.shape[2]), head_h)
+            labels_o = phase1_labels[:ho]
+            a = per_task_head_metrics(
+                ode_pred[:, :, :ho], fut[:, :, :ho], fmask[:, :ho],
+                anchor=anchor, direction_deadzone=direction_deadzone)
+            phase1_head_arrays['ODE'] = a
+            phase1_head_labels['ODE'] = labels_o
+        if cpm_pred is not None:
+            hc = min(int(cpm_pred.shape[2]), head_h)
+            labels_c = phase1_labels[:hc]
+            a = per_task_head_metrics(
+                cpm_pred[:, :, :hc], fut[:, :, :hc], fmask[:, :hc],
+                anchor=anchor, direction_deadzone=direction_deadzone)
+            phase1_head_arrays['CPM'] = a
+            phase1_head_labels['CPM'] = labels_c
+        if 'ODE' in phase1_head_arrays and 'CPM' in phase1_head_arrays:
+            hd = min(int(phase1_head_arrays['ODE']['mae'].shape[1]),
+                     int(phase1_head_arrays['CPM']['mae'].shape[1]))
+            labels_d = phase1_labels[:hd]
+            a = per_task_dual_head_metrics(
+                cpm_pred[:, :, :hd], ode_pred[:, :, :hd],
+                fut[:, :, :hd], fmask[:, :hd], anchor=anchor,
+                direction_deadzone=direction_deadzone)
+            phase1_head_arrays['DUAL'] = a
+            phase1_head_labels['DUAL'] = labels_d
+
+        head_blocks = OrderedDict()
+        for name, a in phase1_head_arrays.items():
+            agg_h = aggregate_columns(a, subj_idx, phase1_head_labels[name])
+            block = OrderedDict()
+            for label in phase1_head_labels[name]:
+                blk = _block_summary(agg_h, label)
+                if blk:
+                    block[label] = blk
+            block['overall'] = _overall_all(agg_h, phase1_head_labels[name])
+            head_blocks[name] = block
+
+        phase1_subject = OrderedDict()
+        if 'ODE' in phase1_head_arrays:
+            phase1_subject['ODE'] = _subj_block(
+                phase1_head_arrays['ODE'], subj_idx,
+                ('mae', 'rmse', 'spatial_pcc',
+                 'delta_mae_step', 'delta_mae_anchor',
+                 'direction_accuracy_step', 'direction_accuracy_anchor',
+                 'delta_magnitude_ratio', 'variance_ratio'))
+        if 'CPM' in phase1_head_arrays:
+            phase1_subject['CPM'] = _subj_block(
+                phase1_head_arrays['CPM'], subj_idx,
+                ('mae', 'rmse', 'spatial_pcc',
+                 'delta_mae_step', 'delta_mae_anchor',
+                 'direction_accuracy_step', 'direction_accuracy_anchor',
+                 'delta_magnitude_ratio', 'variance_ratio'))
+        if 'DUAL' in phase1_head_arrays:
+            phase1_subject['DUAL'] = _subj_block(
+                phase1_head_arrays['DUAL'], subj_idx,
+                ('gap', 'gap_norm', 'cpm_mae', 'ode_mae', 'persistence_mae',
+                 'both_fail_vs_persistence', 'head_error_corr', 'oracle_mae',
+                 'oracle_gain_vs_cpm', 'oracle_gain_vs_ode', 'cpm_win_rate',
+                 'direction_agreement'))
+        # ---- 幅度诊断：ODE/CPM + 三条轨迹基线，共用同一套分位分层 ----
+        diag_edges = amplitude_quantile_edges(fut, fmask, anchor)
+        if ode_pred is not None:
+            phase1_diag_arrays['ODE'] = per_task_amplitude_diagnostics(
+                ode_pred[:, :, :head_h], fut, fmask, anchor, amp_edges=diag_edges)
+        if cpm_pred is not None:
+            phase1_diag_arrays['CPM'] = per_task_amplitude_diagnostics(
+                cpm_pred[:, :, :head_h], fut, fmask, anchor, amp_edges=diag_edges)
+        for bname, btraj in _trajectory_baselines(
+                data['x_last'], data['x_prev'], ar1, head_h).items():
+            phase1_diag_arrays[bname] = per_task_amplitude_diagnostics(
+                btraj, fut, fmask, anchor, amp_edges=diag_edges)
+        phase1_diag_labels = phase1_labels
+        diag_report = OrderedDict(
+            (name, _diag_block(d, subj_idx, phase1_labels, diag_edges))
+            for name, d in phase1_diag_arrays.items())
+
+        report['phase1'] = OrderedDict([
+            ('enabled', True),
+            ('horizon', int(head_h)),
+            ('labels', phase1_labels),
+            ('direction_deadzone', direction_deadzone),
+            ('definition', {
+                'delta_MAE_step': '相邻帧一阶差分误差：Δŷ_1=ŷ_1−x_t，'
+                                  'Δŷ_h=ŷ_h−ŷ_(h−1)（与训练 temporal_difference_huber 同口径）',
+                'delta_MAE_anchor': '相对锚点差分误差 |(ŷ_h−x_t)−(y_h−x_t)|，'
+                                    '数学上恒等于点值 MAE（保留用于核对）',
+                'direction_accuracy_step': 'sign(Δŷ_h)==sign(Δy_h) 的 ROI 比例；'
+                                           '排除 |Δy_h|<=deadzone 的近零变化',
+                'direction_accuracy_anchor': 'sign(ŷ_h−x_t)==sign(y_h−x_t) 的 ROI 比例；'
+                                             '排除 |y_h−x_t|<=deadzone 的近零变化',
+                'gap': 'mean_ROI |ŷ_CPM−ŷ_ODE|（与训练 cross_head_consistency 同口径）',
+                'gap_norm': 'gap / (0.5·(CPM_MAE+ODE_MAE))，避免误差尺度变化造成假下降',
+                'both_fail_vs_persistence': '同一 anchor/horizon 两头 MAE 均大于 '
+                                            'persistence 的比例（“一起预测错误”）',
+                'head_error_corr': '同一 anchor 上逐 ROI 绝对误差的 Pearson 相关',
+                'oracle_MAE': '逐 anchor 取两头较小 MAE（用于衡量两头互补性）',
+            }),
+            ('ODE', head_blocks.get('ODE', {'enabled': False,
+                                           'reason': '模型未返回 dynamics_pred'})),
+            ('CPM', head_blocks.get('CPM', {'enabled': False,
+                                            'reason': '未收集 CPM 输出'})),
+            ('dual_head', head_blocks.get('DUAL', {
+                'enabled': False, 'reason': '需要 ODE 与 CPM 同时可用'})),
+            ('subject_level', phase1_subject),
+            ('diagnostics', OrderedDict([
+                ('amplitude_bin_edges',
+                 [float(e) if np.isfinite(e) else 1e9 for e in diag_edges]),
+                ('definition', {
+                    'delta_std_ratio': 'std(Δŷ)/std(Δy)；<1 表示变化幅度压缩',
+                    'delta_std_ratio_h1': 'H1 单步幅度比（检验 readout 是否压缩）',
+                    'delta_std_ratio_h2_8': 'H2–H8 多步幅度比（检验状态推进/条件均值）',
+                    'delta_pcc': 'Corr(Δŷ, Δy)，H1–H8 × 全部 ROI 的有效元素',
+                    'temporal_variance_ratio': '逐 ROI 在有效未来轨迹上的 '
+                                               'Var(ŷ)/Var(y) 再对 ROI 平均',
+                    'trajectory_variance_ratio_flat': 'H×ROI 展平后的方差比',
+                    'amp_bin_mae': '按真实 |Δy| 五分位的 Delta MAE；Q5 为最大幅变化',
+                    'baselines': 'persistence / trend / AR(1) 用同一套真值分层计算；'
+                                 'AR(1) 参数只用 train subjects 拟合',
+                }),
+                ('blocks', diag_report),
+            ])),
+        ])
+    else:
+        report['phase1'] = {'enabled': False,
+                            'reason': '评估视图未提供 future/future_mask'}
+
     # ---- FC（rollout 轨迹；长度不足则不计算） ----
     if eval_fc and data['roll_pred'] is not None:
         roll_subj = np.array([str(s) for s in data['roll_subj']], dtype=object)
@@ -1149,9 +1765,17 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / f'metrics_{split}.json').open('w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=float)
+    phase1_extra = OrderedDict(
+        (head, {'labels': phase1_head_labels[head], 'arrays': arrs})
+        for head, arrs in phase1_head_arrays.items())
     _write_subject_csv(out_dir / f'per_subject_metrics_{split}.csv', data, arrays,
-                       base_arrays, subj_idx, labels)
-    _write_task_csv(out_dir / f'per_task_metrics_{split}.csv', data, arrays, labels)
+                       base_arrays, subj_idx, labels, extra_arrays=phase1_extra)
+    _write_task_csv(out_dir / f'per_task_metrics_{split}.csv', data, arrays, labels,
+                    extra_arrays=phase1_extra)
+    if phase1_diag_arrays:
+        _write_phase1_diagnostics_csv(
+            out_dir / f'phase1_diagnostics_subject_{split}.csv',
+            phase1_diag_arrays, phase1_diag_labels, subj_idx)
     if save_arrays:
         extra = {}
         # 条件矩阵按 [N, K] 原样落盘（**不展平**），字段名一并保存，供置换诊断、
@@ -1159,19 +1783,36 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         for key in ('cond_z', 'cond_code', 'cond_mask', 'cond_raw', 'subject_index'):
             if data.get(key) is not None:
                 extra[key] = data[key]
-        extra['condition_fields'] = np.array(data.get('condition_fields', []),
-                                             dtype=object)
-        np.savez_compressed(
+        extra['condition_fields'] = np.asarray(
+            data.get('condition_fields', []), dtype=str)
+        save_predictions_npz(
             out_dir / f'predictions_{split}.npz',
             pred=pred, target=target, mask=mask, x_last=data['x_last'],
-            x_prev=data['x_prev'], subj_ids=data['subj_ids'], cutoff=data['cutoff'],
+            x_prev=data['x_prev'],
+            subj_ids=np.asarray(data['subj_ids']).astype(str), cutoff=data['cutoff'],
             context_len=data['context_len'], hamd=data['hamd'],
             offsets=np.array(offsets),
             pred_persistence=data['baselines'].get('persistence'),
             pred_trend=data['baselines'].get('trend'),
             pred_ar1=data['baselines'].get('ar1'),
+            ode_pred=(data['ode_pred'] if data.get('ode_pred') is not None
+                      else []),
+            dynamics_std=(data['dynamics_std']
+                          if data.get('dynamics_std') is not None else []),
+            dynamics_logvar_norm=(data['dynamics_logvar_norm']
+                                  if data.get('dynamics_logvar_norm') is not None
+                                  else []),
+            dynamics_samples=(data['dynamics_samples']
+                              if data.get('dynamics_samples') is not None
+                              else []),
+            cpm_pred=(data['cpm_pred'] if data.get('cpm_pred') is not None
+                      else []),
+            future=(data['future'] if data.get('future') is not None else []),
+            future_mask=(data['future_mask']
+                         if data.get('future_mask') is not None else []),
             rollout=(data['roll_pred'] if data['roll_pred'] is not None else []),
-            rollout_target=(data['roll_target'] if data['roll_target'] is not None else []),
+            rollout_target=(data['roll_target']
+                            if data['roll_target'] is not None else []),
             rollout_preds_ar1=data['roll_baselines'].get('ar1', []),
             **extra)
     log.info('[next_timepoint] %s 评估完成 | next MAE=%.4f | spatial PCC=%.4f',
@@ -1195,7 +1836,168 @@ def _overall_block(agg, labels):
     return block
 
 
-def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
+def _overall_all(agg, labels):
+    """把 ``_block_summary`` 的全部标量指标按任务数加权跨 horizon 平均。
+
+    与 ``_overall_block`` 的区别是不限定 MAE/RMSE/PCC/R2，因此 Delta/DA、
+    双头 Gap 等新增指标也能得到 overall 行；``_std``/``_median``/``n_*`` 不重复
+    聚合（跨 horizon 的标准差没有直接解释）。
+    """
+    blocks = {label: _block_summary(agg, label) for label in labels}
+    keys = set()
+    for blk in blocks.values():
+        keys.update(blk)
+    out = {}
+    for key in sorted(keys):
+        if key.endswith(('_std', '_median')) or key.startswith('n_'):
+            continue
+        vals, ws = [], []
+        for label, blk in blocks.items():
+            v = blk.get(key)
+            if v is None or not np.isfinite(v):
+                continue
+            vals.append(float(v))
+            ws.append(float(blk.get('n_tasks', 1)))
+        if vals:
+            out[key] = float(sum(v * w for v, w in zip(vals, ws)) / max(1e-12, sum(ws)))
+    return out
+
+
+def _subject_overall(array, subj_idx):
+    """逐被试把 [N,H] 指标压成标量（被试内跨 anchor/horizon 等权平均）。"""
+    vals = []
+    for s in np.unique(subj_idx):
+        col = np.asarray(array, dtype=np.float64)[subj_idx == s]
+        ok = np.isfinite(col)
+        if ok.any():
+            vals.append(float(col[ok].mean()))
+    return np.asarray(vals, dtype=np.float64)
+
+
+def _subject_summary(values):
+    """被试级均值序列 → mean/std/median/n。"""
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return {'mean': float('nan'), 'std': float('nan'),
+                'median': float('nan'), 'n_subjects': 0}
+    return {'mean': float(v.mean()), 'std': float(v.std()),
+            'median': float(np.median(v)), 'n_subjects': int(v.size)}
+
+
+def _subj_block(arrays, subj_idx, metrics):
+    """对一组指标做被试级汇总（论文统计主口径）。"""
+    return {metric: _subject_summary(_subject_overall(arrays[metric], subj_idx))
+            for metric in metrics if metric in arrays}
+
+
+_DIAG_SCALAR_KEYS = (
+    'delta_std_ratio', 'delta_pcc', 'temporal_variance_ratio',
+    'trajectory_variance_ratio_flat',
+    'delta_std_ratio_h1', 'delta_std_ratio_h2_8',
+    'delta_pcc_h1', 'delta_pcc_h2_8',
+    'mean_abs_pred_delta', 'mean_abs_true_delta',
+)
+
+
+def _diag_block(diag, subj_idx, labels, edges):
+    """把逐 anchor 诊断数组整理成 JSON 报告块（被试级 mean/std/median）。"""
+    overall = {key: _subject_summary(_subject_overall(diag[key], subj_idx))
+               for key in _DIAG_SCALAR_KEYS if key in diag}
+    per_horizon = {}
+    for metric in ('delta_std_ratio_h', 'delta_pcc_h'):
+        agg = aggregate_columns({metric: diag[metric]}, subj_idx, labels)
+        per_horizon[metric] = {
+            label: agg[metric][label] for label in labels
+            if metric in agg and label in agg[metric]}
+    bin_labels = [f'Q{i + 1}' for i in range(diag['amp_bin_mae'].shape[1])]
+    mae_agg = aggregate_columns({'amp_bin_mae': diag['amp_bin_mae']},
+                                subj_idx, bin_labels).get('amp_bin_mae', {})
+    mean_agg = aggregate_columns({'amp_bin_true_abs_mean': diag['amp_bin_true_abs_mean']},
+                                 subj_idx, bin_labels).get('amp_bin_true_abs_mean', {})
+    bins = {}
+    for label in bin_labels:
+        if label not in mae_agg:
+            continue
+        bins[label] = {
+            'MAE': mae_agg[label]['mean'],
+            'MAE_std': mae_agg[label]['std'],
+            'true_abs_delta_mean': mean_agg.get(label, {}).get('mean'),
+            'n_tasks': mae_agg[label]['n_tasks'],
+            'n_subjects': mae_agg[label]['n_subjects'],
+        }
+    return {
+        'overall': overall,
+        'per_horizon': per_horizon,
+        'amplitude_strata': {
+            'labels': bin_labels,
+            'edges': [float(e) if np.isfinite(e) else 1e9 for e in edges],
+            'bins': bins,
+            'note': 'Q1..Q5 按真实 |Δy| 的五分位分层；Q5 为最大幅变化',
+        },
+    }
+
+
+def _trajectory_baselines(x_last, x_prev, ar1, horizon):
+    """构造 persistence / trend / AR(1) 的全 horizon 轨迹 [N,F,H]。"""
+    x_last = np.asarray(x_last, dtype=np.float64)
+    x_prev = np.asarray(x_prev, dtype=np.float64)
+    h = int(horizon)
+    n, f = x_last.shape
+    k = np.arange(1, h + 1, dtype=np.float64)
+    out = {
+        'persistence': np.repeat(x_last[:, :, None], h, axis=2),
+        'trend': (x_last[:, :, None]
+                  + k[None, None, :] * (x_last - x_prev)[:, :, None]),
+    }
+    if ar1 is not None:
+        a = np.asarray(ar1['a'], dtype=np.float64).reshape(1, f)
+        b = np.asarray(ar1['b'], dtype=np.float64).reshape(1, f)
+        cur = x_last.copy()
+        steps = []
+        for _ in range(h):
+            cur = a * cur + b
+            steps.append(cur.copy())
+        out['ar1'] = np.stack(steps, axis=2)
+    return out
+
+
+def _write_phase1_diagnostics_csv(path, diag_arrays, labels, subj_idx):
+    """逐被试写出幅度诊断（供 compare_phase1 配对使用）。"""
+    subjects = sorted(set(str(s) for s in subj_idx))
+    rows = []
+    for s in subjects:
+        sel = subj_idx == s
+        row = {'subject_id': s, 'n_tasks': int(sel.sum())}
+        for name, diag in diag_arrays.items():
+            for key in _DIAG_SCALAR_KEYS:
+                if key in diag:
+                    row[f'{name}_{key}'] = float(
+                        np.nanmean(diag[key][sel])) if np.isfinite(
+                            diag[key][sel]).any() else float('nan')
+            for hi, label in enumerate(labels):
+                for metric in ('delta_std_ratio_h', 'delta_pcc_h'):
+                    v = diag[metric][sel, hi]
+                    row[f'{name}_{label}_{metric}'] = (
+                        float(np.nanmean(v)) if np.isfinite(v).any()
+                        else float('nan'))
+            for b in range(diag['amp_bin_mae'].shape[1]):
+                v = diag['amp_bin_mae'][sel, b]
+                row[f'{name}_Q{b + 1}_MAE'] = (
+                    float(np.nanmean(v)) if np.isfinite(v).any()
+                    else float('nan'))
+        rows.append(row)
+    cols = list(rows[0].keys()) if rows else ['subject_id', 'n_tasks']
+    with path.open('w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    log.info('[next_timepoint] 幅度诊断已写入: %s（%d 个被试）', path, len(rows))
+
+
+def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels,
+                       extra_arrays=None):
     """被试级 CSV（论文统计的主口径：先被试内平均，再跨被试统计）。
 
     条件注入时逐字段值与有效性按**字段名**成列写出（不假设第 0 列是 HAMD），
@@ -1239,12 +2041,22 @@ def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
                 col = arrs['mae'][sel, i]
                 col = col[~np.isnan(col)]
                 row[f'{name}_{label}_MAE'] = float(col.mean()) if len(col) else float('nan')
+        for head, spec in (extra_arrays or {}).items():
+            for metric, arr in spec['arrays'].items():
+                for i, label in enumerate(spec['labels']):
+                    col = arr[sel, i]
+                    col = col[~np.isnan(col)]
+                    row[f'{head}_{label}_{metric}'] = (
+                        float(col.mean()) if len(col) else float('nan'))
         rows.append(row)
     cols = (['subject_id', 'hamd', 'n_tasks']
             + sum(([f'cond_{name}', f'obs_{name}'] for name in fields), [])
             + [f'{label}_{m}' for label in labels
                for m in ('MAE', 'RMSE', 'PCC_spatial', 'R2')]
-            + [f'{name}_{label}_MAE' for name in base_arrays for label in labels])
+            + [f'{name}_{label}_MAE' for name in base_arrays for label in labels]
+            + [f'{head}_{label}_{metric}'
+               for head, spec in (extra_arrays or {}).items()
+               for metric in spec['arrays'] for label in spec['labels']])
     with path.open('w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -1253,8 +2065,8 @@ def _write_subject_csv(path, data, arrays, base_arrays, subj_idx, labels):
     log.info('[next_timepoint] 被试级指标已写入: %s（%d 个被试）', path, len(rows))
 
 
-def _write_task_csv(path, data, arrays, labels):
-    """任务级 CSV（cutoff/context 长度明细，便于逐任务核对）。"""
+def _write_task_csv(path, data, arrays, labels, extra_arrays=None):
+    """任务级 CSV（cutoff/context 长度明细，便于逐任务核对/配对比较）。"""
     rows = []
     for i, s in enumerate(data['subj_ids']):
         row = {'subj_id': str(s), 'context_len': int(data['context_len'][i]),
@@ -1264,10 +2076,17 @@ def _write_task_csv(path, data, arrays, labels):
             row[f'{label}_RMSE'] = float(arrays['rmse'][i, j])
             row[f'{label}_PCC_spatial'] = float(arrays['spatial_pcc'][i, j])
             row[f'{label}_R2'] = float(arrays['r2'][i, j])
+        for head, spec in (extra_arrays or {}).items():
+            for metric, arr in spec['arrays'].items():
+                for j, label in enumerate(spec['labels']):
+                    row[f'{head}_{label}_{metric}'] = float(arr[i, j])
         rows.append(row)
     cols = (['subj_id', 'context_len', 'cutoff']
             + [f'{label}_{m}' for label in labels
-               for m in ('MAE', 'RMSE', 'PCC_spatial', 'R2')])
+               for m in ('MAE', 'RMSE', 'PCC_spatial', 'R2')]
+            + [f'{head}_{label}_{metric}'
+               for head, spec in (extra_arrays or {}).items()
+               for metric in spec['arrays'] for label in spec['labels']])
     with path.open('w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -1306,6 +2125,36 @@ def summarize(report):
         for label, blk in cpm.get('model', {}).items():
             summary[f'{split}_cpm_mae_{label}'] = blk.get('MAE')
             summary[f'{split}_cpm_pcc_{label}'] = blk.get('PCC_spatial')
+    phase1 = report.get('phase1', {})
+    if phase1.get('enabled'):
+        for head, key in (('ODE', 'ode'), ('CPM', 'cpm_head')):
+            head_block = phase1.get(head, {})
+            for label, blk in head_block.items():
+                if label == 'overall' or not isinstance(blk, dict):
+                    continue
+                summary[f'{split}_{key}_mae_{label}'] = blk.get('MAE')
+                summary[f'{split}_{key}_delta_mae_step_{label}'] = blk.get(
+                    'delta_MAE_step')
+                summary[f'{split}_{key}_da_step_{label}'] = blk.get(
+                    'direction_accuracy_step')
+            overall = head_block.get('overall', {})
+            if overall:
+                summary[f'{split}_{key}_mae_overall'] = overall.get('MAE')
+                summary[f'{split}_{key}_delta_mae_step_overall'] = overall.get(
+                    'delta_MAE_step')
+                summary[f'{split}_{key}_da_step_overall'] = overall.get(
+                    'direction_accuracy_step')
+        dual = phase1.get('dual_head', {})
+        for label, blk in dual.items():
+            if label == 'overall' or not isinstance(blk, dict):
+                continue
+            summary[f'{split}_gap_{label}'] = blk.get('gap')
+            summary[f'{split}_dual_both_fail_{label}'] = blk.get(
+                'both_fail_vs_persistence')
+        dual_overall = dual.get('overall', {})
+        if dual_overall:
+            summary[f'{split}_gap_overall'] = dual_overall.get('gap')
+            summary[f'{split}_gap_norm_overall'] = dual_overall.get('gap_norm')
     fc = report.get('fc', {}).get('model', {}) if isinstance(report.get('fc'), dict) else {}
     if isinstance(fc, dict) and fc.get('available'):
         summary[f'{split}_fc_upper_mae'] = fc.get('fc_mae')

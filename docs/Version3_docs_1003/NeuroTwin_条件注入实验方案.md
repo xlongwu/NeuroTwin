@@ -284,7 +284,7 @@ test (n= 225) Sex 1.000 Age 1.000 edu 1.000 illness .831 HAMD 1.000
 
 - M1/M2/M3 同 §3 规则 4 预注册的**同一 HC checkpoint**、同一预处理、同一训练配方（§v1 12.1 的全清单），只在 `ΔE` 形式与字段集上不同。
 - 置换单位为**被试**，同一被试所有窗口共享同一置换条件；`perm_value_keep_mask` 与 `perm_joint_value_mask` 分别报告。
-- 统计：被试级配对 + bootstrap（≥5,000 次重采样被试）95% CI；主指标 = 验证集 one-step 被试级 MAE（与现 checkpoint 判据一致）；护栏 = CPM H8 MAE、rollout H16 MAE、`variance_ratio`、FC edge PCC（恶化 >2% 不得晋级）；效应门槛 ≥1% 且 CI 不跨 0 且 ≥2/3 种子同向（依据历史噪声量级：`tfm_no_cond` vs FiLM −0.04%、MoE 各臂 0.10–0.29%）。
+- 统计：被试级配对 + bootstrap（≥5,000 次重采样被试）95% CI；主指标 = 验证集 one-step 被试级 MAE（`dynamics_mode=discrete` 下它仍是 checkpoint 判据，故与本方案的选优同数；2026-10-15 起 `graph_ode` 路线的判据已改为验证集 `metric_mae_dynamics_h1_N_subject`——同一次前向的 Graph-ODE 轨迹在 H1..N × 全部 ROI 上的逐锚点 MAE，只纳入 `future_mask` 具备完整 N 步真值的锚点，先被试内平均再跨被试等权，N=`--dynamics_metric_horizon` 默认 8——若改用 graph_ode 执行本方案，晋级须按该多步指标核对，不能再默认与本主指标同值）；护栏 = CPM H8 MAE、rollout H16 MAE、`variance_ratio`、FC edge PCC（恶化 >2% 不得晋级）；效应门槛 ≥1% 且 CI 不跨 0 且 ≥2/3 种子同向（依据历史噪声量级：`tfm_no_cond` vs FiLM −0.04%、MoE 各臂 0.10–0.29%）。
 - 结果必须按 `Dataset(V1/V2)` 分层报告（§2.3-C4 的 HAMD 口径要求）；分层显示两源效应方向相反时，判该字段收益不可信（预注册）。
 - 1 个种子只用于可行性与量级判断；**晋级方法**再用 ≥3 个预先指定种子复核（在结果可见前写定种子）。
 - 预算：8 次训练 × ≈5.5 GPU·h ≈ **44 GPU·h**（实测单卡 150-epoch 微调 246–797 分钟，中位约 330 分钟，`tfm_baseline`=327）；诊断与评估为纯推理 ≈6 次 × 0.4 h。

@@ -6,6 +6,8 @@
 本文件保留 main 训练循环与 CLI 定义。
 """
 import argparse
+import contextlib
+import math
 import os
 import shutil
 import sys
@@ -30,18 +32,12 @@ from utils.dataloader import (CONDITION_FILE_BY_MODE, CONDITION_GROUP_BY_MODE,
 from utils.common import (parse_int_list, resolve_forecast_offsets,
                           resolve_task_dims, set_seed, str2bool)
 from models.conditioning import ConditioningConfig
-from models.tfm import NeuroTwinTFM, TFM_CANDIDATE_SCHEMA
+from models.tfm import NeuroTwinTFM
 from utils.condition_schema import DROPOUT_SEED, parse_extra_codes
 from train.losses import (TFMDualLoss, compute_graph_regularization, spatial_pcc,
                           compute_cpm_mask)
-from train.tfm_coupling import (
-    compute_tfm_coupling_diagnostics,
-    compute_tfm_expert_diversity,
-    compute_tfm_pair_recc,
-    compute_tfm_recc,
-    compute_tfm_router_regularization,
-    get_tfm_recc_weight,
-)
+from train.prob_losses import (ensemble_crps, ensemble_energy_score,
+                               temporal_variogram_score)
 from train.optim import (ModelEMA, build_optimizer, build_scheduler,
                          check_pretrain_config_compat, count_trainable_params,
                          load_backbone_only, load_backbone_weights,
@@ -244,7 +240,8 @@ def split_hash(dl, args) -> str:
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 
-def _report_conditioning(model, optimizer, args, dl):
+def _report_conditioning(model, optimizer, args, dl,
+                         allow_frozen_conditioning=False):
     """登记实际参数量并校验条件参数全部进入优化器（方案 §11 / 验收 L）。"""
     from train.optim import param_report, verify_conditioning_param_groups
     rep = param_report(model, optimizer)
@@ -255,7 +252,9 @@ def _report_conditioning(model, optimizer, args, dl):
     if getattr(model, 'conditioner', None) is not None:
         print(f"[params] 条件编码器内部: {model.conditioner.param_report()} "
               f"| layout={model.conditioner.layout()['layout_hash']}")
-        verify_conditioning_param_groups(model, optimizer)
+        verify_conditioning_param_groups(
+            model, optimizer,
+            allow_frozen_conditioning=allow_frozen_conditioning)
         print('[params] 条件参数组校验通过（全部入优化器、无重复、numel 一致）')
     return rep
 
@@ -303,22 +302,187 @@ def parse_pathology_fields(fields):
     return parsed or None
 
 
+#: graph_ode 路线的 checkpoint 主判据默认口径：H1..H8 全 ROI、先被试内再跨被试等权平均
+#: 实际步数由 ``--dynamics_metric_horizon`` 决定，键名由 :func:`dynamics_metric_key` 派生
+DYNAMICS_CKPT_HORIZON = 8
+
+
+def dynamics_metric_key(horizon: int) -> str:
+    """主判据键名，如 ``metric_mae_dynamics_h1_8_subject``（h1..hN 逐被试等权）。"""
+    if int(horizon) < 1:
+        raise ValueError(f'horizon 必须 >= 1，收到 {horizon}')
+    return f'metric_mae_dynamics_h1_{int(horizon)}_subject'
+
+
+def dynamics_metric_name(horizon: int) -> str:
+    """主判据的日志显示名。"""
+    if int(horizon) < 1:
+        raise ValueError(f'horizon 必须 >= 1，收到 {horizon}')
+    return f'val graph-ODE H1-{int(horizon)} subject MAE'
+
+
+def resolve_dynamics_metric_horizon(args) -> int:
+    """本实验的选优 horizon：CLI 覆盖 > 模型的 cpm_horizon（graph_ode 头的范围）> 8。"""
+    configured = int(getattr(args, 'dynamics_metric_horizon', 0) or 0)
+    if configured > 0:
+        return configured
+    return int(getattr(args, 'cpm_horizon', 0) or 0) or DYNAMICS_CKPT_HORIZON
+
+
+def dynamics_anchor_mae(dynamics_pred, future, future_mask,
+                        horizon: int = DYNAMICS_CKPT_HORIZON):
+    """Graph-ODE 轨迹的逐锚点 H1..H``horizon`` 全 ROI 平均绝对误差。
+
+    Args:
+        dynamics_pred: ``[B,F,H]`` Graph-ODE 持续推进得到的预测（数据尺度，
+            与动态损失 ``dynamics_target`` 同尺度）
+        future: ``[B,F,R]`` 未来真值（数据尺度，序列末尾截断处补零）
+        future_mask: ``[B,R]`` 逐步真值有效性（动态口径用 future_mask，
+            不是 CPM 的 cpm_mask）
+    Returns:
+        ``(anchor_mae [B], full_mask [B] bool)``。``full_mask`` 标记具备完整
+        ``horizon`` 步真值的锚点；``anchor_mae`` 只在被标记处有意义，其余位置
+        置零，避免短未来锚点以不同预测范围参与主指标。
+    """
+    if int(horizon) < 1:
+        raise ValueError(f'horizon 必须 >= 1，收到 {horizon}')
+    if dynamics_pred.ndim != 3:
+        raise ValueError(
+            f'dynamics_pred 期望 [B,F,H]，收到 {tuple(dynamics_pred.shape)}')
+    b, f, h = dynamics_pred.shape
+    if h < horizon:
+        raise ValueError(
+            f'dynamics_pred 只有 {h} 步，无法计算 H1..{horizon} 指标；'
+            f'请确认模型的 dynamics_horizon/cpm_horizon >= {horizon}。')
+    if future.ndim != 3 or tuple(future.shape[:2]) != (b, f):
+        raise ValueError(
+            f'future 期望 [B,F,R] 且 (B,F)==({b},{f})，收到 {tuple(future.shape)}')
+    if future.shape[2] < horizon:
+        raise ValueError(
+            f'future 只有 {future.shape[2]} 步，少于指标要求的 {horizon} 步；'
+            '请确认验证视图的 future_steps 覆盖完整预测范围。')
+    if tuple(future_mask.shape) != (b, future.shape[2]):
+        raise ValueError(
+            f'future_mask 期望 [B,{future.shape[2]}]，收到 {tuple(future_mask.shape)}')
+    err = (dynamics_pred[:, :, :horizon]
+           - future[:, :, :horizon].to(dynamics_pred.dtype)).abs()
+    anchor_mae = err.mean(dim=(1, 2))                                   # [B]
+    full_mask = (future_mask[:, :horizon] > 0).all(dim=1)                # [B]
+    return anchor_mae * full_mask.to(anchor_mae.dtype), full_mask
+
+
+def aggregate_dynamics_subject_metric(subj_acc, n_total_anchors: int,
+                                      horizon: int = DYNAMICS_CKPT_HORIZON):
+    """``{subj: [Σ锚点MAE, n_完整锚点]}`` → (主指标, 被试数, 锚点数)。
+
+    聚合顺序为「先被试内均值、再跨被试等权均值」，因此结果与 batch 划分和
+    每名被试的锚点数无关。没有任何完整 ``horizon`` 步目标时直接报错，
+    不回退到单步 MAE 等其他口径。
+    """
+    subj_means = [total / n for total, n in subj_acc.values() if n > 0]
+    if not subj_means:
+        raise RuntimeError(
+            f'验证集没有具备完整 {horizon} 步真实目标的锚点'
+            f'（总锚点={n_total_anchors}，涉及被试={len(subj_acc)}），'
+            f'无法计算 {dynamics_metric_key(horizon)}。请检查验证视图的 '
+            f'future_steps / future_mask 是否覆盖 H1..{horizon}；'
+            '本指标作为 checkpoint 选优判据时不允许回退到其他口径。')
+    n_anchors = int(sum(n for _, n in subj_acc.values()))
+    return sum(subj_means) / len(subj_means), len(subj_means), n_anchors
+
+
+class CheckpointSelector:
+    """按单一验证指标跟踪 best checkpoint 与 patience（指标越低越好）。
+
+    指标键在构造时固定：单步与多步 MAE 量纲不同、数值不可比较，因此同一 run
+    内不允许中途换判据，也不继承其他判据的历史 best 值。
+    """
+
+    def __init__(self, metric_key: str, metric_name: str = '', patience: int = 1):
+        if not metric_key:
+            raise ValueError('metric_key 不能为空')
+        if int(patience) < 1:
+            raise ValueError(f'patience 必须 >= 1，收到 {patience}')
+        self.metric_key = metric_key
+        self.metric_name = metric_name or metric_key
+        self.patience = int(patience)
+        self.best = float('inf')
+        self.counter = 0
+
+    def step(self, metrics) -> tuple:
+        """消费一个 epoch 的验证指标，返回 ``(is_best, current)`` 并更新 patience。"""
+        if self.metric_key not in metrics:
+            raise KeyError(
+                f'验证结果缺少选优指标 {self.metric_key}；'
+                f'可用键示例: {sorted(k for k in metrics if k.startswith("metric_"))[:8]}')
+        current = float(metrics[self.metric_key])
+        if not math.isfinite(current):
+            raise ValueError(
+                f'{self.metric_key} 为非有限值 {current}，无法据此选优；'
+                '请先排查该 epoch 的动态预测是否发散，而不是让 NaN 参与比较。')
+        is_best = current < self.best
+        if is_best:
+            self.best = current
+            self.counter = 0
+        else:
+            self.counter += 1
+        return is_best, current
+
+    @property
+    def should_stop(self) -> bool:
+        return self.counter >= self.patience
+
+
+def _format_loss_weight(name, info):
+    """[LossW] 日志项：固定权重项没有 log_s，不能按浮点格式打印。"""
+    log_s = info.get('log_s')
+    log_s_text = 'fixed' if log_s is None else f'{log_s:+.4f}'
+    return f"{name}: w={info['weight']:.4f} (log_s={log_s_text})"
+
+
+@contextlib.contextmanager
+def paired_val_rng(active: bool, seed: int):
+    """验证期共同随机数：固定采样轨迹的随机流，使各 epoch 的集合指标（CRPS/ES/
+    Variogram）比较的是模型权重而不是采样运气；退出时恢复原随机流，训练侧
+    dropout/数据采样序列逐位不变。``active=False`` 时是空操作。
+
+    S4 的 ``dynamics_samples`` 在 forward 内用 ``torch.randn`` 生成，若沿用训练推进后
+    的全局 RNG，checkpoint 选优可能选中「运气好」的那一次采样（方案 §S4 验收）。
+    """
+    if not active:
+        yield
+        return
+    cpu_state = torch.get_rng_state()
+    cuda_state = (torch.cuda.get_rng_state_all()
+                  if torch.cuda.is_available() else None)
+    torch.manual_seed(int(seed))
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
+
+
 @torch.no_grad()
 def evaluate_tfm(model, data_loader, criterion, device, args,
                  rollout_steps=0, rollout_horizons=None,
-                 pathology_epoch=None, need_expert_pred=False,
-                 need_pair_pred=False):
-    """TFM 的验证/测试循环：one-step 主指标 + CPM 逐 horizon。
+                 pathology_epoch=None, loss_epoch=None):
+    """TFM 的验证/测试循环：one-step 指标 + CPM 逐 horizon + Graph-ODE 多步判据。
 
-    指标键（``metric_mae_next`` 等）供 checkpoint 判据与日志复用，另加：
+    指标键（``metric_mae_next`` 等）供日志与 checkpoint 判据复用，另加：
       - ``cpm_mae_H{h}``：CPM 头在 t+h 处的逐元素 MAE（元素数归一）；
       - ``cpm_persistence_mae_H{h}``：persistence 基线在同一 horizon 的 MAE；
       - ``metric_cpm_mae``：CPM 全 horizon 平均 MAE；
-      - moe + need_expert_pred 时：Router–Expert 耦合诊断指标
-        （``router_top1_agreement`` 等，RECC 方案 §63–§69；仅记录，不参与
-        checkpoint 判据——判据始终为 ``metric_mae_next``，方案 §87）。
+      - ``metric_mae_dynamics_h1_N_subject``（N=--dynamics_metric_horizon）：
+        Graph-ODE 持续推进（``aux_info['dynamics_pred']``，不用 CPM 输出替代）
+        在 H1..N、全部 ROI 上的逐锚点 MAE，**只纳入 future_mask 显示具备完整
+        N 步真值的锚点**，先被试内平均、再跨被试等权平均。graph_ode 路线的
+        checkpoint 判据即此指标（越低越好）；配套计数键
+        ``..._n_subjects`` / ``..._n_anchors`` / ``..._n_subjects_without_full_anchor``
+        / ``..._n_anchors_total``。整轮验证集没有有效锚点时直接报错，不回退。
 
-    聚合口径（RECC 执行计划 §5.3）：主判据 ``metric_mae_next`` 采用
+    聚合口径：单步 ``metric_mae_next`` 与多步主判据均采用
     **先被试内平均、再跨被试平均**，与最终评估 analysis/next_point_eval.py 的
     subject 口径一致，避免 batch 均值权重随末位小 batch / task 数变化影响
     微小收益下的选权重；batch 均值另存 ``metric_mae_next_batchmean`` 供追溯。
@@ -327,12 +491,15 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
     model.eval()
     meters = defaultdict(list)
     subj_mae_acc = defaultdict(lambda: [0.0, 0])     # subj -> [Σ逐样本MAE, n]
+    # graph_ode 多步主判据的累积：只统计具备完整 H 步真值的锚点
+    dyn_metric_horizon = resolve_dynamics_metric_horizon(args)
+    dyn_subj_acc = defaultdict(lambda: [0.0, 0])     # subj -> [Σ锚点MAE, n_完整锚点]
+    dyn_subjects_seen = set()                         # 验证集中出现过的被试
+    dyn_anchor_total = 0                              # 遍历过的锚点总数（含不完整）
     rollout_acc = defaultdict(lambda: [0.0, 0, 0])
     cpm_acc = defaultdict(lambda: [0.0, 0, 0])       # h -> [Σ|err|, Σw, n_elem]
     rollout_hs = [int(h) for h in (rollout_horizons or []) if int(h) <= int(rollout_steps)]
     horizon = int(getattr(model, 'cpm_horizon', 0) or args.cpm_horizon)
-    huber_delta = float(getattr(args, 'cpm_huber_delta', 1.0))
-    comp_tau = float(getattr(args, 'tfm_competence_temperature', 1.0))
     pbar = make_pbar(data_loader, len(data_loader), '[Val-TFM]')
 
     for batch in pbar:
@@ -343,8 +510,6 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
         fmask = batch['future_mask'].to(device, non_blocking=True)   # [B,R]
         outputs, aux_info = model(bx, bs, bp,
                                   pathology_epoch=pathology_epoch,
-                                  return_expert_pred=need_expert_pred,
-                                  return_pair_pred=need_pair_pred,
                                   condition=cond,
                                   condition_epoch=None,              # 验证：关闭随机 Dropout
                                   controls=(bctl[:, :horizon] if bctl is not None else None),
@@ -368,7 +533,24 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                 dynamics_target_norm=_normalized_future(model, cpm_target, norm_stats),
             )
         total_loss, loss_stats = criterion(outputs, by, cpm_pred,
-                                           cpm_target, cpm_mask, **dyn_kwargs)
+                                           cpm_target, cpm_mask,
+                                           context_last=bl, epoch=loss_epoch,
+                                           **dyn_kwargs)
+        # S4：验证集集合 CRPS（仅监控/可选选优；不参与反传）
+        prob_samples = aux_info.get('dynamics_samples', None)
+        if torch.is_tensor(prob_samples) and prob_samples.shape[0] > 0:
+            hp = min(int(prob_samples.shape[3]), int(horizon), int(fut.shape[2]))
+            if hp > 0:
+                ps = prob_samples[:, :, :, :hp]
+                ft = fut[:, :, :hp]
+                fm = fmask[:, :hp]
+                meters['metric_crps_dynamics'].append(
+                    ensemble_crps(ps, ft, fm).detach())
+                meters['metric_energy_dynamics'].append(
+                    ensemble_energy_score(ps, ft, fm).detach())
+                if hp >= 2:
+                    meters['metric_variogram_dynamics'].append(
+                        temporal_variogram_score(ps, ft, fm).detach())
         graph_reg, graph_stats = compute_graph_regularization(
             aux_info, device,
             sparsity_weight=args.sc_sparsity_weight,
@@ -376,8 +558,6 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
             temporal_weight=args.sc_temporal_weight,
         )
         total_loss = total_loss + graph_reg
-        # 注意：验证 total 不叠加 RECC / Router 正则（不同 λ 的实验之间保持
-        # 可比；checkpoint 判据只看 metric_mae_next，方案 §87）
 
         b, f, h, _ = outputs.shape
         if bm is None:
@@ -394,6 +574,23 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                 acc = subj_mae_acc[str(sid)]
                 acc[0] += float(per_sample_mae[i].item())
                 acc[1] += 1
+        # ---- 多步主判据累积：本次前向的 Graph-ODE 轨迹（不额外推理、不用 CPM 替代）----
+        if aux_info.get('dynamics_pred', None) is not None:
+            if subj_ids is None:
+                raise KeyError(
+                    'batch 缺少 subj_id：graph_ode 多步判据必须先按被试平均再跨被试等权'
+                    '平均，不能用 batch 均值替代。')
+            dyn_pred = aux_info['dynamics_pred']                       # [B,F,H] 数据尺度
+            dyn_anchor_mae, dyn_full = dynamics_anchor_mae(
+                dyn_pred, fut, fmask, horizon=dyn_metric_horizon)
+            dyn_anchor_total += int(dyn_pred.shape[0])
+            for i, sid in enumerate(subj_ids):
+                sid = str(sid)
+                dyn_subjects_seen.add(sid)
+                if bool(dyn_full[i]):
+                    acc = dyn_subj_acc[sid]
+                    acc[0] += float(dyn_anchor_mae[i].item())
+                    acc[1] += 1
         rmse = (((outputs - by) ** 2) * w4.expand_as(outputs)).sum() / \
             (w4.expand_as(outputs).sum().clamp_min(1e-8))
         rmse = rmse.clamp_min(0).sqrt()
@@ -442,14 +639,6 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                      PCC=f"{float(pcc_spatial):.4f}",
                      CPM=f"{metric_cpm_mae:.4f}")
 
-        # ---- Router–Expert 耦合诊断（moe + RECC/diagnose 模式，RECC 方案 §63–§69）----
-        if need_expert_pred and 'tfm_expert_pred' in aux_info:
-            diag = compute_tfm_coupling_diagnostics(
-                aux_info, by, actual_pred=outputs[:, :, 0, 0],
-                tau=comp_tau, huber_delta=huber_delta)
-            for k, v in diag.items():
-                meters[k].append(v.detach())
-
         # ---- free rollout（one-step 头自回归；中间不使用真值）----
         if rollout_hs and 'rollout_flag' in batch:
             rf = batch['rollout_flag'].bool()
@@ -493,6 +682,17 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
         result['metric_mae_next_batchmean'] = result['metric_mae_next']
         result['metric_mae_next'] = sum(subj_means) / len(subj_means)
         result['metric_mae_next_n_subjects'] = float(len(subj_means))
+    if dyn_anchor_total:
+        # 多步主判据：无完整 H 步锚点时由聚合函数直接报错，不静默缺键
+        dyn_key = dynamics_metric_key(dyn_metric_horizon)
+        metric_value, n_subj, n_anchors = aggregate_dynamics_subject_metric(
+            dyn_subj_acc, dyn_anchor_total, horizon=dyn_metric_horizon)
+        result[dyn_key] = metric_value
+        result[f'{dyn_key}_n_subjects'] = float(n_subj)
+        result[f'{dyn_key}_n_anchors'] = float(n_anchors)
+        result[f'{dyn_key}_n_subjects_without_full_anchor'] = float(
+            len(dyn_subjects_seen) - n_subj)
+        result[f'{dyn_key}_n_anchors_total'] = float(dyn_anchor_total)
     return result
 
 
@@ -544,34 +744,28 @@ def main(args):
     # checkpoint config.args 快照保留 model_arch 键：evaluate_variant 重建与
     # pretrain 签名校验依赖它（TFM 已是唯一主干，CLI 不再暴露该开关）
     args.model_arch = 'tfm'
+    # DataLoader 共享内存策略：默认的 file_descriptor 依赖 TMPDIR 下的
+    # resource_sharer socket；Qoder/GUI 会话切换会清理该临时目录，导致长训练在
+    # worker 交接时抛 FileNotFoundError。file_system 走 /dev/shm 文件描述符，
+    # 不依赖该 socket（可用 TORCH_SHARING_STRATEGY 显式覆盖）。
+    _sharing = os.environ.get('TORCH_SHARING_STRATEGY', 'file_system')
+    _setter = getattr(torch.multiprocessing, 'set_sharing_strategy', None)
+    if _setter is not None and _sharing:
+        try:
+            _setter(_sharing)
+            print(f'[dataloader] torch 共享内存策略: {_sharing}')
+        except (RuntimeError, ValueError) as exc:
+            print(f'[dataloader] 共享内存策略 {_sharing} 设置失败，沿用默认：{exc}')
     check_seed_separation(args)
-    # ---- TFM 病理专家 / RECC 配置约束（RECC 方案 §51，fail-fast）----
+    # ---- 病理条件模式约束 ----
     if args.mode == 'pretrain':
-        # HC 预训练不构建**病理专家 MoE**（RECC 方案 §52：避免 Expert 学成健康
-        # 亚型）；但条件注入模块允许在 HC 上建立/拟合/前反向（v1 revised §1.3），
-        # 由 condition_arm 决定，One-Step 的 film 模式在模型内部随条件开关设置。
+        # HC 预训练不构建病理条件模块（避免把病理效应学成健康亚型）；条件注入
+        # 模块允许在 HC 上建立/拟合/前反向（v1 revised §1.3），由 condition_arm
+        # 决定，One-Step 的 film 模式在模型内部随条件开关设置。
         if getattr(args, 'tfm_patho_mode', 'none') != 'none':
-            print(f"[TFM-MoE] HC 预训练不构建病理专家模块：tfm_patho_mode="
-                  f"'{args.tfm_patho_mode}' 自动置为 none（方案 §51）。")
+            print(f"[TFM] HC 预训练不构建病理条件模块：tfm_patho_mode="
+                  f"'{args.tfm_patho_mode}' 自动置为 none。")
         args.tfm_patho_mode = 'none'
-        args.tfm_recc_mode = 'off'
-    else:
-        if args.tfm_recc_mode != 'off' and args.tfm_patho_mode != 'moe':
-            raise ValueError(
-                f"tfm_recc_mode='{args.tfm_recc_mode}' 要求 tfm_patho_mode='moe'，"
-                f"收到 '{args.tfm_patho_mode}'（方案 §51）。")
-        if args.tfm_patho_mode == 'moe':
-            if args.tfm_num_experts < 2:
-                raise ValueError(
-                    f"tfm_num_experts 必须 >= 2，收到 {args.tfm_num_experts}")
-            if not 1 <= args.tfm_top_k <= args.tfm_num_experts:
-                raise ValueError(
-                    f"tfm_top_k 必须在 [1, tfm_num_experts] 内，收到 "
-                    f"top_k={args.tfm_top_k}, num_experts={args.tfm_num_experts}")
-        if args.tfm_recc_mode == 'pair' and args.tfm_pair_recc_weight <= 0:
-            raise ValueError(
-                "tfm_recc_mode='pair' 需要 --tfm_pair_recc_weight > 0 "
-                "（Pair-RECC 损失权重，方案 §86）。")
     if getattr(args, 'device', ''):
         device = torch.device(args.device)
     else:
@@ -727,12 +921,6 @@ def main(args):
         sc_sinkhorn_iters=args.sc_sinkhorn_iters,
         one_step_hidden_dim=args.tfm_one_step_hidden_dim,
         tfm_patho_mode=args.tfm_patho_mode,
-        tfm_num_experts=args.tfm_num_experts,
-        tfm_top_k=args.tfm_top_k,
-        tfm_expert_hidden_dim=args.tfm_expert_hidden_dim,
-        tfm_router_hidden_dim=args.tfm_router_hidden_dim,
-        tfm_router_temperature=args.tfm_router_temperature,
-        tfm_moe_dense_warmup_epochs=args.tfm_moe_dense_warmup_epochs,
         cpm_horizon=args.cpm_horizon, cpm_layers=args.cpm_layers,
         cpm_intervention=args.cpm_intervention,
         pretrain_mode=(args.mode == 'pretrain'),
@@ -760,7 +948,16 @@ def main(args):
         graph_source=args.graph_source,
         personalized=args.personalized,
         profile_dim=args.profile_dim,
+        dynamics_history_memory=args.dynamics_history_memory,
+        s4_variant=args.s4_variant,
+        s4_residual_rank=args.s4_residual_rank,
+        s4_residual_hidden=args.s4_residual_hidden,
+        s4_residual_init_scale=args.s4_residual_init_scale,
+        s4_noise_rank=args.s4_noise_rank,
+        s4_noise_scale=args.s4_noise_scale,
+        s4_train_samples=args.s4_train_samples,
     ).to(device)
+    s4_active = args.s4_variant != 'off'
 
     if args.mode == 'finetune':
         if not os.path.exists(args.pretrained_weight):
@@ -818,14 +1015,30 @@ def main(args):
                                   skip_pattern=getattr(args, 'pretrained_skip_pattern', ''))
         set_finetune_stage(model, backbone_unfrozen=False)
         stage1_trainables = []
-        if model.tfm_patho_mode == 'moe':
-            stage1_trainables.append('病理 MoE（Router+Experts）')
         if getattr(model.one_step_head, 'film', None) is not None:
             stage1_trainables.append('One-Step FiLM')
         if getattr(model.cpm_head, 'film', None) is not None:
             stage1_trainables.append('CPM FiLM')
-        print(f'已进入分阶段微调: 前期仅训练条件适配器（{ "+ ".join(stage1_trainables) }），'
-              '后期逐步解冻主干（RECC 方案 §46）。')
+        if s4_active and args.s4_stage == 'head':
+            # S4 两阶段 stage 1：严格只训练新增概率模块，连条件适配器也冻结，
+            # 避免 S2 点预测损失（或常数项）污染概率模块的梯度解释。
+            for p in model.parameters():
+                p.requires_grad = False
+            s4_modules = model.s4_modules()
+            if not s4_modules:
+                raise RuntimeError('S4 已启用但没有构建任何 S4 模块，请检查模型构造参数。')
+            for module in s4_modules:
+                for p in module.parameters():
+                    p.requires_grad = True
+            print(f'[S4] stage=head：前 {args.freeze_backbone_epochs} epoch 仅训练 '
+                  f'{args.s4_variant} 新模块（主干/条件/双头全部冻结）；'
+                  '之后解冻并联合微调。')
+        elif s4_active and args.s4_stage == 'joint':
+            set_finetune_stage(model, backbone_unfrozen=True)
+            print(f'[S4] stage=joint：从 epoch 0 起联合训练 {args.s4_variant} 与 S2 全部模块。')
+        else:
+            print(f'已进入分阶段微调: 前期仅训练条件适配器'
+                  f'（{ "+ ".join(stage1_trainables) }），后期逐步解冻主干。')
 
     if args.mode == 'finetune':
         fit_pathology_normalizer(model, dl, args)
@@ -850,77 +1063,83 @@ def main(args):
         huber_delta=args.cpm_huber_delta,
         lambda_dynamics=args.lambda_dynamics,
         lambda_variance=args.lambda_variance,
+        weighting=getattr(args, 'loss_weighting', 'fixed'),
+        lambda_temporal_diff=args.lambda_temporal_diff,
+        lambda_cross_head=args.lambda_cross_head,
+        cpm_horizon_weight=args.cpm_horizon_weight,
+        cpm_horizon_alpha=args.cpm_horizon_alpha,
+        cross_head_start_epoch=args.cross_head_start_epoch,
     ).to(device)
     print(f"[TFM] 损失: lambda_one={args.lambda_one} "
           f"lambda_cpm={args.lambda_cpm} lambda_pcc={args.lambda_pcc} "
           f"cpm_gamma={args.cpm_gamma} huber_delta={args.cpm_huber_delta} | "
           f"lambda_dynamics={args.lambda_dynamics} "
           f"lambda_variance={args.lambda_variance} | "
+          f"lambda_temporal_diff={args.lambda_temporal_diff} "
+          f"lambda_cross_head={args.lambda_cross_head} "
+          f"cpm_horizon_weight={args.cpm_horizon_weight}（α={args.cpm_horizon_alpha}）| "
           f"cpm_horizon={args.cpm_horizon}（One-Step + CPM 双头，方案 §9/§20）")
+    if criterion.weighting == 'uncertainty':
+        n_log_s = len(list(criterion.log_s.parameters()))
+        print(f"[TFM] 损失权重: 同方差不确定性加权（Kendall CVPR 2018，"
+              f"Σ exp(-log_s_i)·L_i + log_s_i）| 可学习 log 方差参数 {n_log_s} 个"
+              f"，初始有效权重=对应 --lambda_*（warm start）| "
+              f"优化器组 loss_weight: lr=lr_peak×{args.loss_lr_scale}, "
+              f"weight_decay=0 | 启用任务项: "
+              + ', '.join(k for k, v in criterion.get_loss_weights().items()
+                          if isinstance(v, dict)))
 
-    # TFM 病理残差专家 / RECC 运行时开关（RECC 方案 §48–§50）
-    moe_active = (args.mode == 'finetune' and args.tfm_patho_mode == 'moe')
-    recc_mode = args.tfm_recc_mode if moe_active else 'off'
-    div_weight = args.tfm_moe_diversity_weight if moe_active else 0.0
-    # diagnose/r2e/pair 均需 candidate；Δz 去相关正则（E2）同样需要 Δz
-    need_expert_pred = moe_active and (recc_mode != 'off' or div_weight > 0)
-    need_pair_pred = moe_active and recc_mode == 'pair'    # pair candidate 仅 pair 模式构造
-    # 模式隔离审计（RECC 执行计划 §5.3：禁止隐含 pair loss / 隐含耦合损失）。
-    # D 变体曾以 r2e + tfm_pair_recc_weight=0.05 运行：该权重在此路径确实不生效，
-    # 此处显式告警避免误读配置。
-    if moe_active and recc_mode == 'r2e' and args.tfm_pair_recc_weight > 0:
-        print(f"[TFM-RECC][audit] recc_mode='r2e' 时 --tfm_pair_recc_weight="
-              f"{args.tfm_pair_recc_weight} 不生效（不构造 pair candidate、不加 "
-              f"pair loss，方案 §56 模式隔离）。")
-    if moe_active and recc_mode == 'diagnose' and \
-            (args.tfm_recc_weight > 0 or args.tfm_pair_recc_weight > 0):
-        print(f"[TFM-RECC][audit] recc_mode='diagnose' 只统计 competence 诊断，"
-              f"λ_recc={args.tfm_recc_weight} / λ_pair={args.tfm_pair_recc_weight} "
-              f"均不生效。")
-    # 训练/复评口径分别落盘（执行计划 §4.1/§6.3）：checkpoint 元数据记录本
-    # 次训练实际使用的 candidate 口径，旧权重复评结果由分析脚本另行标注
-    model_aux_schema = TFM_CANDIDATE_SCHEMA if moe_active else 'not_applicable'
     print(f"[TFM] One-Step 条件模式: 模型生效 tfm_patho_mode={model.tfm_patho_mode}"
           f"（args 值 {args.tfm_patho_mode}）"
           f" | OS FiLM: {'on' if getattr(model.one_step_head, 'film', None) is not None else 'off'}"
           f" | CPM FiLM: {'on' if getattr(model.cpm_head, 'film', None) is not None else 'off'}"
           f" | 主干条件 RMSNorm: {'on' if getattr(model, 'cond_norm', None) is not None else 'off'}")
-    if moe_active:
-        print(f"[TFM-MoE] E={args.tfm_num_experts} top_k={args.tfm_top_k} | "
-              f"expert_hidden={args.tfm_expert_hidden_dim} "
-              f"router_hidden={args.tfm_router_hidden_dim} "
-              f"T_router={args.tfm_router_temperature} | "
-              f"dense_warmup={args.tfm_moe_dense_warmup_epochs} epochs | "
-              f"router_reg: balance={args.tfm_router_balance_weight} "
-              f"z={args.tfm_router_z_weight} "
-              f"entropy={args.tfm_router_entropy_weight}（方案 §25）"
-              + (f" | Δz去相关: weight={div_weight}" if div_weight > 0 else ""))
-        print(f"[TFM-RECC] mode={recc_mode}"
-              + (f" | λ_recc={args.tfm_recc_weight} "
-                 f"(start={args.tfm_recc_start_epoch}, ramp={args.tfm_recc_ramp_epochs})"
-                 if recc_mode in ('r2e', 'pair') else " | 仅统计 competence 诊断，不加耦合损失")
-              + (f" | λ_pair={args.tfm_pair_recc_weight} τ_c={args.tfm_competence_temperature} "
-                 f"λ_c_pcc={args.tfm_competence_pcc_weight}" if recc_mode != 'off' else ""))
 
     optimizer = build_optimizer(model, criterion, args)
     scheduler = build_scheduler(optimizer, args)
-    _report_conditioning(model, optimizer, args, dl)
+    _report_conditioning(
+        model, optimizer, args, dl,
+        allow_frozen_conditioning=(s4_active and args.s4_stage == 'head'))
     scaler    = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     ema       = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
-    if args.compile and hasattr(torch, 'compile'):
-        # 变长 context（K 逐 batch 变化）会让 dynamo 按 shape 反复重编译，
-        # 因此该任务跳过编译；固定 --context_lengths 时可手动评估收益。
-        print("[next_timepoint] 变长 context（K 随 batch 变化）会触发 torch.compile "
-              "反复重编译（每个 K 一份计算图），已自动跳过编译。")
+    if args.compile and device.type == 'cuda' and hasattr(torch, 'compile'):
+        # 变长 context（K 逐 batch 变化）按静态 shape 编译会每个 K 重编译一份计算图，
+        # 曾因此整体跳过编译；改用 dynamic=True 将 shape 维符号化，一次编译覆盖不同 K。
+        # ODE 头内部的 bool((dt<=0).any()) 等检查会造成少量 graph break，不影响正确性。
+        # EMA（上方 deepcopy）与 save_backbone_weights 均按 _orig_mod 解包，
+        # checkpoint 键名不受编译包装影响（train/optim.py）。
+        model = torch.compile(model, dynamic=True)
+        print("[next_timepoint] torch.compile(dynamic=True) 已启用（变长 K 符号化，"
+              "首个 epoch 含一次性编译耗时属预期）。")
 
-    # 主 checkpoint 判据 = 验证集 next-state MAE（prompt §三十八：不使用单纯 PCC 选模型）
-    ckpt_metric_key  = 'metric_mae_next'
-    ckpt_metric_name = 'val next-state MAE'
-    best_ckpt_value  = float('inf')
-    patience_counter = 0
-    backbone_unfrozen = (args.mode == 'pretrain')
+    # 主 checkpoint 判据（prompt §三十八：不使用单纯 PCC 选模型）：
+    #   graph_ode → 验证集 H1..N 被试级多步 MAE（本阶段改动，越低越好）
+    #   discrete  → 无 Graph-ODE 轨迹可评估，保持原单步 next-state MAE 判据
+    # 两个口径数值量纲不同、不可互相比较；同一 run 内判据固定，不继承另一口径的历史 best。
+    dyn_metric_horizon = resolve_dynamics_metric_horizon(args)
+    dyn_metric_key = dynamics_metric_key(dyn_metric_horizon)
+    if s4_active and args.s4_ckpt_metric == 'crps':
+        ckpt_metric_key = 'metric_crps_dynamics'
+        ckpt_metric_name = 'val dynamics CRPS'
+    elif args.dynamics_mode == 'graph_ode':
+        if dyn_metric_horizon > int(dims['cpm_horizon']):
+            raise ValueError(
+                f'--dynamics_metric_horizon={dyn_metric_horizon} 超出模型的 '
+                f'--cpm_horizon={dims["cpm_horizon"]}：多步判据无法覆盖到第 '
+                f'{dyn_metric_horizon} 步，请调小 horizon 或增大预测范围。')
+        ckpt_metric_key = dyn_metric_key
+        ckpt_metric_name = dynamics_metric_name(dyn_metric_horizon)
+    else:
+        ckpt_metric_key = 'metric_mae_next'
+        ckpt_metric_name = 'val next-state MAE'
+    selector = CheckpointSelector(ckpt_metric_key, ckpt_metric_name,
+                                  patience=args.patience)
+    backbone_unfrozen = ((args.mode == 'pretrain')
+                         or (s4_active and args.s4_stage == 'joint'))
     print(f"[next_timepoint] checkpoint 选择判据: {ckpt_metric_name}"
-          f"（同时记录其他指标，最终说明见训练日志/评估报告）")
+          f"（dynamics_mode={args.dynamics_mode}, metric_key={ckpt_metric_key}）| "
+          f"单步 MAE 继续记录为观察指标（metric_mae_next）| "
+          f"最终说明见训练日志/评估报告")
 
     save_dir = os.path.join(args.checkpoint_dir, args.name)
     if os.path.exists(save_dir):
@@ -931,27 +1150,6 @@ def main(args):
         idx  = [int(m.groups()[0]) for m in ms if m]
         save_dir = f"{p}{max(idx)+1 if idx else 2}"
     os.makedirs(save_dir, exist_ok=True)
-
-    # 条件模块激活记录（方案 §五：记录 OS/CPM/encoder 的首次非零梯度与首次参数更新）。
-    # 只在显式给预算时启用，且**只读**梯度与参数值，不参与 loss/step，因此不改变训练。
-    activation_probe = None
-    act_budget = int(getattr(args, 'cond_activation_steps', 0) or 0)
-    act_step = 0
-    if act_budget > 0:
-        from train.condition_activation import (ACTIVATION_STEP_CAP, ActivationProbe,
-                                                format_summary)
-        from train.optim import conditioning_module_prefixes
-        if not 1 <= act_budget <= ACTIVATION_STEP_CAP:
-            raise ValueError(
-                f'--cond_activation_steps={act_budget} 超出允许范围 1..{ACTIVATION_STEP_CAP}'
-                '（合成激活检查的步数上限是预注册的，不能放宽）。')
-        if not conditioning_module_prefixes(model):
-            print('[activation] 本配置未建立任何条件模块（arm=none / 条件关闭）：'
-                  '不生成激活记录，避免把「不存在」写成「未激活」。')
-        else:
-            activation_probe = ActivationProbe(model, optimizer=optimizer)
-            print(f'[activation] 激活记录已启用，预算 {act_budget} 个 train step；'
-                  '首次非零梯度与首次参数更新分开记录（零初始化首步梯度为零属正常）。')
 
     for epoch in range(args.train_epochs):
         if (args.mode == 'finetune'
@@ -964,23 +1162,6 @@ def main(args):
             print(f"Epoch {epoch+1}: 已解冻主干，新增可训练参数 numel={added} "
                   f"groups={names}，可训练参数量 = {count_trainable_params(model)}"
                   f"（沿用现有 optimizer 状态与 scheduler 进度）")
-
-        # 本 epoch 的 RECC / 路由模式（RECC 方案 §14/§24：dense warmup 与
-        # λ_recc ramp 都按 0 基 epoch 调度）
-        recc_weight = 0.0
-        if recc_mode in ('r2e', 'pair'):
-            recc_weight = get_tfm_recc_weight(
-                epoch, args.tfm_recc_weight,
-                start_epoch=args.tfm_recc_start_epoch,
-                ramp_epochs=args.tfm_recc_ramp_epochs)
-            pair_weight = get_tfm_recc_weight(
-                epoch, args.tfm_pair_recc_weight,
-                start_epoch=args.tfm_recc_start_epoch,
-                ramp_epochs=args.tfm_recc_ramp_epochs) \
-                if recc_mode == 'pair' else 0.0
-            tqdm.write(f"[RECC] epoch {epoch + 1}: λ_recc={recc_weight:.4f}"
-                       + (f" λ_pair={pair_weight:.4f}" if recc_mode == 'pair' else "")
-                       + f" | dense_routing={epoch < args.tfm_moe_dense_warmup_epochs}")
 
         model.train()
         # 轨迹任务：每 epoch 重新打乱分桶 sampler（同 batch 内 L 一致的约束保持不变）
@@ -995,10 +1176,6 @@ def main(args):
 
         for step, batch in enumerate(pbar, start=1):
             optimizer.zero_grad(set_to_none=True)
-            if activation_probe is not None and act_step < act_budget:
-                # 步前快照：只有与「本步更新前的值」比较，才能区分「优化器真的改写了
-                # 条件参数」与「梯度非零但被裁剪/跳过 step」
-                activation_probe.note_step_boundary(model)
             # next_timepoint：x [B,F,1,K] / y [B,F,H,1] / x_last [B,F] / mask [B,H]
             bx, by, bl, bm, bs, bp = next_point_batch(batch, device)
             cond = condition_batch(batch, device)
@@ -1011,7 +1188,6 @@ def main(args):
             with torch.amp.autocast('cuda', enabled=amp_enabled):
                 outputs, aux_info = model(bx, bs, bp,
                                           pathology_epoch=epoch,
-                                          return_expert_pred=need_expert_pred,
                                           condition=cond,
                                           condition_epoch=epoch,
                                           controls=bctl,
@@ -1033,50 +1209,43 @@ def main(args):
                         dynamics_target_norm=_normalized_future(
                             model, by_roll, aux_info.get('norm_stats', None)),
                     )
-                total_loss, loss_stats = criterion(
-                    outputs, by, aux_info['cpm_pred'], by_roll,
-                    cpm_mask_train, **dyn_kwargs)
-                graph_reg, graph_stats = compute_graph_regularization(
-                    aux_info, device,
-                    sparsity_weight=args.sc_sparsity_weight,
-                    entropy_weight=args.sc_entropy_weight,
-                    temporal_weight=args.sc_temporal_weight,
-                )
-                total_loss = total_loss + graph_reg
-                coupled_stats = {}
-                if moe_active:
-                    # Router 正则（balance/z/entropy，方案 §25）：moe 模式全程启用
-                    router_reg, router_stats = compute_tfm_router_regularization(
-                        aux_info,
-                        balance_weight=args.tfm_router_balance_weight,
-                        z_weight=args.tfm_router_z_weight,
-                        entropy_weight=args.tfm_router_entropy_weight)
-                    total_loss = total_loss + router_reg
-                    coupled_stats.update(router_stats)
-                    if div_weight > 0:
-                        # 专家修正去相关正则（Phase B-E2）：训练 Expert 使
-                        # 各 Δz_i 可区分，competence/RECC 监督才有对象
-                        div_loss, div_stats = compute_tfm_expert_diversity(aux_info)
-                        total_loss = total_loss + div_weight * div_loss
-                        coupled_stats.update(div_stats)
-                if recc_mode in ('r2e', 'pair') and recc_weight > 0:
-                    # RECC-V1（方案 §20）：真实下一时刻 BOLD → Expert competence
-                    # → KL(sg(q) ‖ p_cpl)，梯度只更新 Router（§43）
-                    recc_loss, recc_stats = compute_tfm_recc(
-                        aux_info, by, tau=args.tfm_competence_temperature,
-                        pcc_weight=args.tfm_competence_pcc_weight,
-                        huber_delta=args.cpm_huber_delta)
-                    total_loss = total_loss + recc_weight * recc_loss
-                    coupled_stats.update(recc_stats)
-                if recc_mode == 'pair' and pair_weight > 0:
-                    # Pair-RECC（方案 §26–§29）：Top-2 等权 pair candidate 的
-                    # competence → Router implied pair score 对齐
-                    pair_loss, pair_stats = compute_tfm_pair_recc(
-                        aux_info, by, tau=args.tfm_competence_temperature,
-                        pcc_weight=args.tfm_competence_pcc_weight,
-                        huber_delta=args.cpm_huber_delta)
-                    total_loss = total_loss + pair_weight * pair_loss
-                    coupled_stats.update(pair_stats)
+                prob_loss = None
+                if s4_active:
+                    prob_samples = aux_info.get('dynamics_samples', None)
+                    if not torch.is_tensor(prob_samples):
+                        raise RuntimeError(
+                            'S4 已启用但模型未返回 dynamics_samples；请检查 s4_variant '
+                            '与 graph_ode 路径。')
+                    if by_roll is None or bm_roll is None:
+                        raise RuntimeError(
+                            'S4 CRPS 训练需要未来真值 future/future_mask，但当前 batch '
+                            '没有（请确认 train_rollout_steps > 0）。')
+                    hp = min(int(prob_samples.shape[3]), int(by_roll.shape[2]))
+                    prob_loss = ensemble_crps(
+                        prob_samples[:, :, :, :hp], by_roll[:, :, :hp],
+                        bm_roll[:, :hp])
+                if s4_active and args.s4_stage == 'head' and not backbone_unfrozen:
+                    # stage 1：只回传 CRPS，不计算/不反传 S2 点预测损失与损失权重参数
+                    zero = outputs.new_zeros(())
+                    total_loss = args.s4_crps_weight * prob_loss
+                    loss_stats = {'loss_one': zero, 'loss_cpm': zero,
+                                  'loss_crps': prob_loss.detach()}
+                    graph_reg = zero
+                    graph_stats = {}
+                else:
+                    total_loss, loss_stats = criterion(
+                        outputs, by, aux_info['cpm_pred'], by_roll,
+                        cpm_mask_train, context_last=bl, epoch=epoch, **dyn_kwargs)
+                    graph_reg, graph_stats = compute_graph_regularization(
+                        aux_info, device,
+                        sparsity_weight=args.sc_sparsity_weight,
+                        entropy_weight=args.sc_entropy_weight,
+                        temporal_weight=args.sc_temporal_weight,
+                    )
+                    total_loss = total_loss + graph_reg
+                    if prob_loss is not None:
+                        total_loss = total_loss + args.s4_crps_weight * prob_loss
+                        loss_stats['loss_crps'] = prob_loss.detach()
 
             scaler.scale(total_loss).backward()
 
@@ -1089,12 +1258,9 @@ def main(args):
 
             scaler.step(optimizer)
             scaler.update()
-            if activation_probe is not None and act_step < act_budget:
-                activation_probe.record_step(act_step + 1)
-            act_step += 1
             if ema is not None: ema.update(model)
 
-            for k, v in {**loss_stats, **graph_stats, **coupled_stats,
+            for k, v in {**loss_stats, **graph_stats,
                          'metric_total': total_loss.detach()}.items():
                 train_meters[k].append(v.detach())
             live['metric_total'] += float(total_loss.item())
@@ -1111,40 +1277,19 @@ def main(args):
             if 'loss_variance' in loss_stats:
                 live['_var'] = live.get('_var', 0.0) + float(loss_stats['loss_variance'].item())
                 postfix['Var'] = f"{live['_var']/step:.4f}"
-            if 'recc_loss' in coupled_stats:
-                live['_recc'] = live.get('_recc', 0.0) + float(coupled_stats['recc_loss'])
-                postfix['RECC'] = f"{live['_recc']/step:.4f}"
-            if 'router_balance' in coupled_stats:
-                live['_rbal'] = live.get('_rbal', 0.0) + float(coupled_stats['router_balance'])
-                postfix['Bal'] = f"{live['_rbal']/step:.3f}"
+            if 'loss_crps' in loss_stats:
+                live['_crps'] = live.get('_crps', 0.0) + float(loss_stats['loss_crps'].item())
+                postfix['CRPS'] = f"{live['_crps']/step:.4f}"
             pbar_metrics(pbar, **postfix)
 
         eval_model  = ema.ema if ema is not None else model
-        val_metrics = evaluate_tfm(eval_model, val_data, criterion, device,
-                                   args, rollout_steps=eval_rollout_steps,
-                                   rollout_horizons=eval_rollout_horizons,
-                                   pathology_epoch=epoch,
-                                   need_expert_pred=need_expert_pred,
-                                   need_pair_pred=need_pair_pred)
+        with paired_val_rng(s4_active, args.val_sampling_seed):
+            val_metrics = evaluate_tfm(eval_model, val_data, criterion, device,
+                                       args, rollout_steps=eval_rollout_steps,
+                                       rollout_horizons=eval_rollout_horizons,
+                                       pathology_epoch=epoch,
+                                       loss_epoch=epoch)
         scheduler.step()
-
-        if activation_probe is not None:
-            # 每个 epoch 末落盘一次：即使训练中断，也已留下「观测到哪一步」的激活证据。
-            # 只记录事实（首次非零梯度步 / 首次参数更新步），不据此判定模块有效性。
-            import json
-            act_payload = {
-                'name': args.name, 'mode': args.mode,
-                'condition_arm': args.condition_arm,
-                'cond_inject': args.cond_inject,
-                'epoch': epoch + 1,
-                'budget_steps': act_budget,
-                'observed_steps': activation_probe.steps_observed,
-                'summary': activation_probe.summary(),
-            }
-            with open(os.path.join(save_dir, 'condition_activation.json'),
-                      'w', encoding='utf-8') as f:
-                json.dump(act_payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-            print('[activation] ' + format_summary(act_payload['summary']).replace('\n', ' | '))
 
         train_metrics = {k: torch.stack(vs).mean().item() for k, vs in train_meters.items()}
         group_lrs    = {g.get('name', f'g{i}'): g['lr']
@@ -1155,7 +1300,6 @@ def main(args):
         tqdm.write(
             f"Epoch {epoch+1:03d} | {lr_text} | "
             f"backbone={'unfrozen' if backbone_unfrozen else 'frozen'} | "
-            f"routing={'dense' if epoch < args.tfm_moe_dense_warmup_epochs else 'topk'} | "
             f"Train Total: {train_metrics['metric_total']:.4f} | "
             f"one: {train_metrics['loss_one']:.4f} | "
             f"cpm: {train_metrics['loss_cpm']:.4f} | "
@@ -1165,6 +1309,8 @@ def main(args):
             f"Val CPM MAE: {val_metrics['metric_cpm_mae']:.4f} | "
             f"Val persistence MAE: {val_metrics['metric_persistence_mae']:.4f} | "
             f"Val trend MAE: {val_metrics['metric_trend_mae']:.4f}"
+            + (f" | Val CRPS: {val_metrics['metric_crps_dynamics']:.4f}"
+               if 'metric_crps_dynamics' in val_metrics else "")
         )
         cpm_h_log = [f"H{h}: {val_metrics[f'cpm_mae_H{h}']:.4f}"
                      for h in range(1, int(args.cpm_horizon) + 1)
@@ -1177,30 +1323,28 @@ def main(args):
         if roll_log:
             tqdm.write(f"[NextPoint] val rollout MAE (free, R={eval_rollout_steps}) | "
                        + ' | '.join(roll_log))
-        if need_expert_pred and 'router_top1_agreement' in val_metrics:
-            # Router–Expert 机制指标（RECC 方案 §63–§70）：诊断 mismatch 是否
-            # 存在（§97）、RECC 后是否改善（§98）；不参与 checkpoint 判据（§87）
-            gap = val_metrics.get('oracle_best_expert_gap', float('nan'))
-            pair_gap_text = ''
-            if 'oracle_best_pair_gap' in val_metrics:
-                pair_gap_text = (f" | pair_gap={val_metrics['oracle_best_pair_gap']:.5f}")
-            tqdm.write(
-                f"[TFM-MoE] val router diag | top1_agree={val_metrics['router_top1_agreement']:.3f} "
-                f"| top2_recall={val_metrics['router_top2_recall']:.3f} "
-                f"| regret={val_metrics['router_regret']:.5f} "
-                f"| spearman={val_metrics['router_competence_spearman']:.3f} "
-                f"| comp_entropy={val_metrics['competence_entropy']:.3f} "
-                f"| oracle_gap={gap:.5f}"
-                + pair_gap_text
-                + f" | expert_loss={val_metrics['expert_loss_mean']:.5f}")
+        is_best, cur_metric = selector.step(val_metrics)
+
+        if dyn_metric_key in val_metrics:
+            dyn_text = (
+                f"{val_metrics[dyn_metric_key]:.4f}"
+                f"(被试={val_metrics[f'{dyn_metric_key}_n_subjects']:.0f}, "
+                f"完整{dyn_metric_horizon}步锚点={val_metrics[f'{dyn_metric_key}_n_anchors']:.0f}, "
+                f"无完整锚点被试="
+                f"{val_metrics[f'{dyn_metric_key}_n_subjects_without_full_anchor']:.0f})")
+        else:
+            dyn_text = 'N/A（本配置无 Graph-ODE dynamics 轨迹）'
         tqdm.write(
-            f"[NextPoint] checkpoint criterion = {ckpt_metric_name}"
-            f"={val_metrics[ckpt_metric_key]:.4f} | "
+            f"[NextPoint] 单步 MAE={val_metrics['metric_mae_next']:.4f} | "
+            f"多步 MAE={dyn_text} | 选优指标 {ckpt_metric_name}={cur_metric:.4f} | "
             f"model vs persistence ΔMAE="
             f"{val_metrics['metric_persistence_mae'] - val_metrics['metric_mae_next']:+.4f}")
-
-        is_best = val_metrics[ckpt_metric_key] < best_ckpt_value
-        cur_metric = val_metrics[ckpt_metric_key]
+        if criterion.weighting == 'uncertainty':
+            # 学习到的任务权重演化（收敛监控）：weight=exp(-log_s)
+            tqdm.write("[LossW] " + ' | '.join(
+                _format_loss_weight(k, v)
+                for k, v in criterion.get_loss_weights().items()
+                if isinstance(v, dict)))
 
         def _ckpt_meta():
             # 权重本身不携带 epoch 曾导致 best/last 无法追溯（S0 缺口清单）；
@@ -1210,11 +1354,9 @@ def main(args):
             meta = {'args': vars(args), 'epoch': int(epoch),
                     'epoch_1based': int(epoch + 1),
                     'val_metric': float(cur_metric),
-                    'ckpt_metric_key': ckpt_metric_key,
-                    'backbone_unfrozen': bool(backbone_unfrozen),
-                    'dense_routing': bool(epoch < args.tfm_moe_dense_warmup_epochs),
-                    'recc_mode': recc_mode,
-                    'candidate_schema': model_aux_schema}
+                    'ckpt_metric_key': selector.metric_key,
+                    'ckpt_metric_name': selector.metric_name,
+                    'backbone_unfrozen': bool(backbone_unfrozen)}
             meta['condition'] = {
                 'config': condition_cfg_dict,
                 'stats': (dl.get_condition_stats().to_dict()
@@ -1223,25 +1365,31 @@ def main(args):
                 'split_hash': split_hash(dl, args),
             }
             meta['params'] = param_report(model, optimizer)
+            # 损失加权快照：记录加权模式与当时的可学习 log 方差 / 有效权重，
+            # 便于事后审计任务平衡的演化（fixed 模式下 log_s 为 None）。
+            lw = criterion.get_loss_weights()
+            meta['loss_weighting'] = {
+                'mode': criterion.weighting,
+                'log_s': {k: v['log_s'] for k, v in lw.items()
+                          if isinstance(v, dict)},
+                'weights': {k: v['weight'] for k, v in lw.items()
+                            if isinstance(v, dict)},
+            }
             return meta
         if is_best:
-            best_ckpt_value = cur_metric
             best_name = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
             save_backbone_weights(os.path.join(save_dir, best_name), eval_model,
                                   meta=_ckpt_meta())
             tqdm.write(f"New Best Model Saved! (Best {ckpt_metric_name}: "
-                       f"{best_ckpt_value:.4f})")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                tqdm.write(f"\nEarly Stopping! 连续 {args.patience} epoch 未改善。"
-                           f"\n最佳 {ckpt_metric_name}: {best_ckpt_value:.4f}")
-                last_name = 'base_last.pt' if args.mode == 'pretrain' else 'finetuned_last.pt'
-                save_backbone_weights(os.path.join(save_dir, last_name),
-                                      ema.ema if ema else model,
-                                      meta=_ckpt_meta())
-                break
+                       f"{selector.best:.4f})")
+        elif selector.should_stop:
+            tqdm.write(f"\nEarly Stopping! 连续 {selector.patience} epoch 未改善。"
+                       f"\n最佳 {ckpt_metric_name}: {selector.best:.4f}")
+            last_name = 'base_last.pt' if args.mode == 'pretrain' else 'finetuned_last.pt'
+            save_backbone_weights(os.path.join(save_dir, last_name),
+                                  ema.ema if ema else model,
+                                  meta=_ckpt_meta())
+            break
 
         if epoch == args.train_epochs - 1:
             last_name = 'base_last.pt' if args.mode == 'pretrain' else 'finetuned_last.pt'
@@ -1262,6 +1410,19 @@ def main(args):
             ('Val/Persistence_MAE', val_metrics['metric_persistence_mae']),
             ('Val/Trend_MAE', val_metrics['metric_trend_mae']),
         ]
+        if dyn_metric_key in val_metrics:
+            tb_scalars.append(
+                (f'Val/Dynamics_MAE_H1_{dyn_metric_horizon}_Subject',
+                 val_metrics[dyn_metric_key]))
+        if 'metric_crps_dynamics' in val_metrics:
+            tb_scalars.append(('Val/Dynamics_CRPS',
+                               val_metrics['metric_crps_dynamics']))
+        if 'metric_energy_dynamics' in val_metrics:
+            tb_scalars.append(('Val/Dynamics_EnergyScore',
+                               val_metrics['metric_energy_dynamics']))
+        if 'metric_variogram_dynamics' in val_metrics:
+            tb_scalars.append(('Val/Dynamics_VariogramScore',
+                               val_metrics['metric_variogram_dynamics']))
         for h, key in sorted((h, f'rollout_mae_H{h}')
                              for h in (eval_rollout_horizons or [])):
             if key in val_metrics:
@@ -1270,6 +1431,8 @@ def main(args):
             writer.add_scalar(tag, val, epoch)
         for name, lr in group_lrs.items():
             writer.add_scalar(f'LR/{name}', lr, epoch)
+        if 'loss_crps' in train_metrics:
+            writer.add_scalar('Train/CRPS', train_metrics['loss_crps'], epoch)
         for tag, key in [('Train/Graph_Sparsity', 'graph_sparsity'),
                           ('Train/Graph_Entropy', 'graph_entropy'),
                           ('Train/Graph_Temporal', 'graph_temporal'),
@@ -1291,6 +1454,11 @@ def main(args):
                          ('Val/Oracle_Best_Pair_Gap', 'oracle_best_pair_gap')]:
             if key in val_metrics:
                 writer.add_scalar(tag, val_metrics[key], epoch)
+        if criterion.weighting == 'uncertainty':
+            # 可学习任务权重的收敛曲线
+            for name, v in criterion.get_loss_weights().items():
+                if isinstance(v, dict):
+                    writer.add_scalar(f'LossW/{name}', v['weight'], epoch)
 
     writer.close()
     best_n = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
@@ -1337,10 +1505,6 @@ def parse_args():
     p.add_argument('--pathology_input_dim', type=int, default=1)
     p.add_argument('--seed', type=int, default=2024)
     p.add_argument('--data_root', default='./data')
-    p.add_argument('--cond_activation_steps', type=int, default=0, metavar='N',
-                   help='记录条件模块激活证据的 train step 预算（1..200）。0=不记录。'
-                        '只读梯度与参数值，不改变训练；产物写在 <save_dir>/'
-                        'condition_activation.json。')
     p.add_argument('--checkpoint_dir', default='./checkpoints')
     p.add_argument('--name', default='neurotwin')
     p.add_argument('--clinical_file', default='Rest-meta-MDD-V1V2-Merged-MDD.xlsx')
@@ -1552,66 +1716,21 @@ def parse_args():
     p.add_argument('--cpm_huber_delta', type=float, default=1.0,
                    help='TFM Huber 损失的过渡阈值 δ（原始空间 BOLD 量纲，'
                         'z-score 后单位方差取 1.0）。')
+    p.add_argument('--loss_weighting', default='uncertainty',
+                   choices=['uncertainty', 'fixed'],
+                   help='任务损失聚合方式：uncertainty=同方差不确定性自动加权'
+                        '（Σ exp(-log_s_i)·L_i + log_s_i，log_s_i 为可学习参数，'
+                        '初始有效权重等于对应 --lambda_*，Kendall et al. '
+                        'CVPR 2018）；fixed=固定权重（历史行为）。仅作用于 '
+                        'TFMDualLoss 的 one/CPM/dynamics/variance 四个任务项；'
+                        'SC 图正则等其余项仍由各自 λ 控制。')
 
-    # ---------- TFM 病理残差专家 MoE（RECC 方案 §6/§48） ----------
+    # ---------- One-Step 头病理条件模式 ----------
     p.add_argument('--tfm_patho_mode', default='film',
-                   choices=['none', 'film', 'moe'],
-                   help='One-Step 头病理条件模式（方案 §3/§5）：none=无条件；'
-                        'film=当前 baseline（FiLM 调制转移隐层）；'
-                        'moe=共享动力学 + 病理残差专家（z=z_t+Δz_shared+Δz_path，'
-                        'One-Step 关闭原 FiLM，病理条件只进 MoE）。'
-                        'CPM 恒保留自身 FiLM。HC 预训练自动 none。')
-    p.add_argument('--tfm_num_experts', type=int, default=4,
-                   help='病理专家数 E（方案 §81：当前样本量下默认不超过 4）。')
-    p.add_argument('--tfm_top_k', type=int, default=2,
-                   help='Top-K 稀疏路由的 K（方案 §82；K=E 等价 dense mixture）。')
-    p.add_argument('--tfm_expert_hidden_dim', type=int, default=256,
-                   help='病理专家 MLP 隐层宽度 H_e（方案 §11）。')
-    p.add_argument('--tfm_router_hidden_dim', type=int, default=128,
-                   help='Router MLP 隐层宽度（方案 §9）。')
-    p.add_argument('--tfm_router_temperature', type=float, default=1.0,
-                   help='Router softmax 温度 T_r（方案 §9）。')
-    p.add_argument('--tfm_moe_dense_warmup_epochs', type=int, default=5,
-                   help='前 N 个 epoch 使用 dense soft mixture，之后切换 Top-K '
-                        '稀疏路由，避免早期专家饿死（方案 §14）。')
-    p.add_argument('--tfm_moe_lr_scale', type=float, default=1.0,
-                   help='TFM 病理 MoE 参数组（tfm_moe）的学习率缩放（方案 §45）。')
-
-    # ---------- RECC：Router–Expert Competence Coupling（方案 §49） ----------
-    p.add_argument('--tfm_recc_mode', default='off',
-                   choices=['off', 'diagnose', 'r2e', 'pair'],
-                   help='RECC 模式（方案 §56）：off=无专家诊断；diagnose=只统计 '
-                        'competence/mismatch 不加损失；r2e=Expert competence → '
-                        'Router 校准（V1）；pair=叠加 Top-2 pair-aware coupling '
-                        '（V2）。非 off 要求 --tfm_patho_mode moe。')
-    p.add_argument('--tfm_recc_weight', type=float, default=0.05,
-                   help='L_RECC 权重 λ_recc（搜索 0.01/0.05/0.1，方案 §24）。')
-    p.add_argument('--tfm_pair_recc_weight', type=float, default=0.0,
-                   help='L_pair 权重 λ_pair（方案 §86；recc_mode=pair 时须 >0）。')
-    p.add_argument('--tfm_competence_temperature', type=float, default=1.0,
-                   help='competence 温度 τ_c（搜索 0.5/1.0/2.0，方案 §19）。')
-    p.add_argument('--tfm_competence_pcc_weight', type=float, default=0.0,
-                   help='Expert competence 的 spatial PCC 项权重 λ_c_pcc'
-                        '（V1 默认 0，方案 §18）。')
-    p.add_argument('--tfm_recc_start_epoch', type=int, default=5,
-                   help='λ_recc 从该 epoch 开始生效（早期 Expert competence 无意义，'
-                        '方案 §24/§47；与 dense warmup 5 个 epoch 对齐）。')
-    p.add_argument('--tfm_recc_ramp_epochs', type=int, default=10,
-                   help='λ_recc 线性增加的 epoch 数，之后固定（方案 §24）。')
-
-    # ---------- Router 正则（方案 §50） ----------
-    p.add_argument('--tfm_router_balance_weight', type=float, default=0.01,
-                   help='Router load-balance 正则权重（防 Expert collapse，方案 §25.1）。')
-    p.add_argument('--tfm_router_z_weight', type=float, default=0.001,
-                   help='Router z-loss 权重（抑制 logits 过度增大，方案 §25.2）。')
-    p.add_argument('--tfm_router_entropy_weight', type=float, default=0.0005,
-                   help='Router 熵正则权重（极小值防坍缩；过强会与 competence '
-                        'specialization 冲突，方案 §25.3）。')
-    p.add_argument('--tfm_moe_diversity_weight', type=float, default=0.0,
-                   help='专家修正去相关正则权重（L_div=mean_{i<j} cos²(Δz_i,Δz_j)，'
-                        '0=关闭）。训练 Expert 使各专家修正可区分，供 RECC competence '
-                        '监督有对象（Phase B-E2，2026-10-07）；>0 时自动开启 '
-                        'need_expert_pred。')
+                   choices=['none', 'film'],
+                   help='One-Step 头病理条件模式：none=无条件（HC 预训练自动置为 '
+                        'none）；film=FiLM 调制转移隐层（当前 baseline，legacy '
+                        'discrete 路线）。CPM 恒保留自身 FiLM。')
 
     # ---------- 任务口径与 next_timepoint 数据协议 ----------
     p.add_argument('--task_mode', default='next_timepoint',
@@ -1627,7 +1746,7 @@ def parse_args():
                    choices=['auto', 'normlize', 'windows', 'raw'],
                    help='连续 BOLD 数据源：auto=优先 data/Normlize/<grp>/ROISignals_<id>.mat，'
                         '缺失时回退用 50%% 重叠滑窗重构；normlize=仅用连续序列；windows=仅用滑窗重构；'
-                        'raw=仅用 data/Raw/<grp>/ROISignals_<id>.mat（[T,F] 前 150 TR、前 num_rois 列，'
+                        'raw=仅用 data/Raw/<grp>/ROISignals_<id>.mat（[T,F] 完整时间轴、前 num_rois 列，'
                         '每 ROI 用最早 calibration_length 个 TR 固定 mu0/s0 标准化，缺失直接报错不回退）。')
     p.add_argument('--train_samples_per_subject', type=int, default=0,
                    help='训练每个被试每 epoch 的样本预算；0=auto（min(合法组合数, 12)）。')
@@ -1697,6 +1816,9 @@ def parse_args():
                         '并提供 calibration_bold）。False 时不创建 profile 模块。')
     p.add_argument('--profile_dim', type=int, default=32,
                    help='个体 profile 维度（personalized=True 时生效；默认 32）。')
+    p.add_argument('--dynamics_history_memory', type=str2bool, default=False,
+                   help='S2：向量场加入固定历史记忆 FiLM（编码 token 的 patch 维均值，'
+                        'rollout 期间不变；零初始化，默认 False 不构建模块）。')
     p.add_argument('--calibration_length', type=int, default=0,
                    help='基线校准前缀长度（TR 数；bold_source=raw 时必须 >=1，'
                         '同时决定合法锚点下界与 calibration_bold 输出）。')
@@ -1708,8 +1830,68 @@ def parse_args():
                    help='graph_ode 动态多步损失权重（h=2..H masked Huber+PCC；默认 0.5）。')
     p.add_argument('--lambda_variance', type=float, default=0.05,
                    help='方差读出高斯 NLL 损失权重（只更新 VarianceHead；默认 0.05）。')
+    # ---- P0 损失扩展：时间差分 / 双头一致性 / horizon 权重策略 ----
+    # 默认 λ=0、策略=gamma，与既有训练行为逐位一致；启用后为固定权重项，
+    # 不进入 weighting='uncertainty' 聚合（只作用于 one/CPM/dynamics/variance）。
+    p.add_argument('--lambda_temporal_diff', type=float, default=0.0,
+                   help='P0 一阶时间差分 Huber 权重（CPM + graph_ode 轨迹，'
+                        '第一步参考真值历史末帧 x_t；0=禁用）。')
+    p.add_argument('--lambda_cross_head', type=float, default=0.0,
+                   help='P0 双预测头一致性权重（CPM 学生 ← sg(Graph-ODE) 教师；'
+                        '0=禁用，仅 graph_ode 路线生效）。')
+    p.add_argument('--cpm_horizon_weight', default='gamma',
+                   choices=['gamma', 'increasing'],
+                   help='CPM 逐 horizon 权重策略：gamma=γ^(h-1)（由 --cpm_gamma '
+                        '控制，默认）；increasing=远期递增 1+α(h-1)/(H-1)。')
+    p.add_argument('--cpm_horizon_alpha', type=float, default=0.5,
+                   help='--cpm_horizon_weight=increasing 时的 α（默认 0.5）。')
+    p.add_argument('--cross_head_start_epoch', type=int, default=0,
+                   help='双头一致性预热门控：epoch < 该值时暂不启用（默认 0=全程启用）。')
+    p.add_argument('--dynamics_metric_horizon', type=int,
+                   default=DYNAMICS_CKPT_HORIZON,
+                   help='graph_ode 选优指标覆盖的预测步数 N（H1..N，默认 8）；'
+                        '指标键名随 N 变化（metric_mae_dynamics_h1_N_subject），'
+                        '且只纳入具备完整 N 步真值的锚点。必须 <= --cpm_horizon。')
+
+    # ---------- S4 概率轨迹（默认 off；开启时才构建新模块） ----------
+    p.add_argument('--s4_variant', default='off', choices=['off', 's4_1', 's4_2'],
+                   help="S4 概率化链：off=S2 原路径；s4_1=输出端低秩时空残差头；"
+                        "s4_2=潜状态低秩随机创新（graph_ode 专用）。")
+    p.add_argument('--s4_stage', default='head', choices=['head', 'joint'],
+                   help="两阶段训练：head=前 --freeze_backbone_epochs 仅训 S4 模块，"
+                        "之后联合微调；joint=从第 0 epoch 起联合训练。")
+    p.add_argument('--s4_crps_weight', type=float, default=1.0,
+                   help='S4 集合 CRPS 损失权重（固定权重，不进入 uncertainty 聚合）。')
+    p.add_argument('--s4_lr_scale', type=float, default=1.0,
+                   help='S4 新模块学习率倍率（相对 --lr_peak）。')
+    p.add_argument('--s4_train_samples', type=int, default=32,
+                   help='训练/验证时每个锚点采样的轨迹条数 K（默认 32）。')
+    p.add_argument('--s4_residual_rank', type=int, default=8,
+                   help='S4-1 低秩空间因子秩 r（默认 8）。')
+    p.add_argument('--s4_residual_hidden', type=int, default=128,
+                   help='S4-1 残差头隐层宽度（默认 128）。')
+    p.add_argument('--s4_residual_init_scale', type=float, default=0.1,
+                   help='S4-1 残差尺度初值（小初始化，默认 0.1；不是零方差）。')
+    p.add_argument('--s4_noise_rank', type=int, default=8,
+                   help='S4-2 潜状态创新秩 r（默认 8；禁止全 ROI 独立噪声）。')
+    p.add_argument('--s4_noise_scale', type=float, default=1e-2,
+                   help='S4-2 创新增益初值尺度（小初始化，默认 0.01）。')
+    p.add_argument('--s4_ckpt_metric', default='point', choices=['point', 'crps'],
+                   help='S4 实验的 checkpoint 判据：point=沿用 graph-ODE 多步 MAE；'
+                        'crps=验证集 dynamics CRPS（越低越好）。')
+    p.add_argument('--val_sampling_seed', type=int, default=2024,
+                   help='S4 启用时验证期采样轨迹所用的随机种子（每个 epoch 重置并'
+                        '在验证后恢复原随机流）。使 CRPS 选优基于同一批随机创新，'
+                        '避免把采样运气当成模型改进；非 S4 运行不生效。')
 
     args = p.parse_args()
+    if args.s4_variant != 'off':
+        if args.dynamics_mode != 'graph_ode':
+            p.error('--s4_variant 仅支持 --dynamics_mode graph_ode')
+        if args.s4_stage == 'head' and args.freeze_backbone_epochs <= 0:
+            p.error('--s4_stage head 需要 --freeze_backbone_epochs >= 1')
+        if args.s4_train_samples < 2:
+            p.error('--s4_train_samples 必须 >= 2（CRPS 需要集合）')
     # 历史入口行为：finetune 省略 --pretrained_weight 时回填默认主权重路径。
     # 本轮脚本始终显式传入起点，不依赖这个默认值。
     if args.mode == 'finetune' and not args.pretrained_weight:

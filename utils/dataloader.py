@@ -479,23 +479,33 @@ class NeuroTwinNextPointDataset(Dataset):
     def _probe_series_length(self, subj_id: str) -> Optional[int]:
         """探测单被试连续序列长度 T（不读取全部数据，仅取 shape）。
 
-        优先 Normlize 连续序列（原始 ROI BOLD，[T, F] 或 [F, T]）；不可用时按
+        优先 Normlize 连续序列（原始 ROI BOLD，[T, F] 或 [F, T]，按 num_rois
+        判向——时间轴长度可能小于 ROI 数，不用 max(shape) 猜）；不可用时按
         ``ROISignals_window`` 的 50% 重叠布局推算：偶数序号窗（1,3,5,...）恰好
         覆盖 0:S, S:2S, ... 的连续片段（见 data/utils/window_stride.py）。
-        raw 分支从 Raw 的明确时间轴取长度（截取前 150 TR 后的有效长度）。
+        raw 分支从 Raw 的明确时间轴取完整长度（不截断）。
         """
         if self.bold_source == 'raw':
             path = self._raw_path(subj_id)
             if not path.exists():
                 return None
             arr = self._load_raw_array(subj_id)
-            return min(int(arr.shape[0]), 150)
+            return int(arr.shape[0])
         if self.bold_source in ('auto', 'normlize'):
             path = self._normlize_path(subj_id)
             if path.exists():
-                arr = self._read_mat_array(
-                    path, preferred_keys=['ROISignals', 'Data', 'bold'])
-                return int(max(arr.shape))
+                arr = np.asarray(self._read_mat_array(
+                    path, preferred_keys=['ROISignals', 'Data', 'bold']))
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"{subj_id} 的 Normlize BOLD 期望二维，收到 {arr.shape}（{path}）")
+                if arr.shape[1] == self.num_rois and arr.shape[0] != self.num_rois:
+                    return int(arr.shape[0])                        # [T, F]
+                if arr.shape[0] == self.num_rois and arr.shape[1] != self.num_rois:
+                    return int(arr.shape[1])                        # [F, T]
+                raise ValueError(
+                    f"{subj_id} 的 BOLD 形状 {arr.shape} 无法与 ROI 数 "
+                    f"{self.num_rois} 对齐（{path}）")
         if self.bold_source == 'normlize':
             return None
         window_paths = self._window_paths(subj_id)
@@ -607,7 +617,7 @@ class NeuroTwinNextPointDataset(Dataset):
 
         - 条目文件缺失、NPZ 缺 ``u`` 键、维度/宽度/长度不匹配或含非有限值 →
           **明确报错**（不用无刺激代替缺文件，不静默跳过）；
-        - T 与该被试（截取前 150 TR 后的）序列长度严格一致；
+        - T 与该被试的完整序列长度严格一致；
         - 控制幅值不使用 BOLD 均值/方差标准化，按上游定义的原值进入模型。
         """
         path = Path(manifest_path)
@@ -645,7 +655,7 @@ class NeuroTwinNextPointDataset(Dataset):
             if expected_t is not None and u.shape[0] != expected_t:
                 raise ValueError(
                     f"{subj_id} 的控制 u 长度 {u.shape[0]} 与序列 T={expected_t} "
-                    f"不一致（{npz_path}；序列长度按 raw 前 150 TR 截取口径）")
+                    f"不一致（{npz_path}；序列长度按完整时间轴口径）")
             controls[subj_id] = u
         queue_hits = sum(1 for s in controls if s in self._subject_pos)
         print(f"[controls] manifest 已加载: {path} | 条目={len(controls)} "
@@ -749,11 +759,12 @@ class NeuroTwinNextPointDataset(Dataset):
                 f"{subj_id} 的 BOLD 形状 {arr.shape} 无法与 ROI 数 {n_rois} 对齐（{src}）")
 
         if self.bold_source == 'raw':
-            # raw 分支（方案 §4.1）：明确 [T, F] 布局取前 150 TR、前 num_rois 列，
-            # 每 ROI 只用最早 calibration_length 个 TR 计算固定 mu0/s0 后标准化
-            # 整个序列；缺失直接报路径（_load_raw_array 内），不回退旧缓存。
+            # raw 分支（方案 §4.1）：明确 [T, F] 布局取前 num_rois 列（完整
+            # 时间轴，不截断），每 ROI 只用最早 calibration_length 个 TR 计算
+            # 固定 mu0/s0 后标准化整个序列；缺失直接报路径（_load_raw_array
+            # 内），不回退旧缓存。
             arr = self._load_raw_array(subj_id)
-            n_tr = min(int(arr.shape[0]), 150)
+            n_tr = int(arr.shape[0])
             if n_tr < self.calibration_length:
                 raise ValueError(
                     f"{subj_id} 的 Raw BOLD 只有 {n_tr} 个 TR，少于 "
@@ -765,7 +776,7 @@ class NeuroTwinNextPointDataset(Dataset):
             cal_stats = (mu0.astype(np.float32), s0.astype(np.float32))
             if not self._source_logged:
                 print(f"[next_timepoint] raw 数据源: {self.raw_dir}"
-                      f"（[T,F] → 前 150 TR/前 {self.num_rois} 列 → [F,T]，"
+                      f"（[T,F] → 前 {self.num_rois} 列 → [F,T]，完整时间轴不截断，"
                       f"最早 {self.calibration_length} TR 固定 mu0/s0 校准）")
                 self._source_logged = True
             series = ((x - mu0) / s0).astype(np.float32, copy=False)

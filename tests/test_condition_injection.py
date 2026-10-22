@@ -418,7 +418,8 @@ def test_E_extra_codes_reach_the_inherit_path(tmp_path):
                   context_min=4, context_max=6, context_lengths=[6],
                   eval_context_length=6, eval_anchors_per_subject=1,
                   eval_rollout_tasks_per_subject=0, eval_rollout_steps=0,
-                  train_samples_per_subject=1, val_ratio=0.25, test_ratio=0.25)
+                  train_samples_per_subject=1, val_ratio=0.25, test_ratio=0.25,
+                  num_rois=4)
     hc_dl = NeuroTwinDataLoader(data_root=root, mode='pretrain', condition_group='hc3',
                                 condition_extra_codes={'Sex': [1.0, 2.0]}, **common)
     base = hc_for_mdd(hc_dl.get_condition_stats())
@@ -473,7 +474,7 @@ def test_F_all_arms_share_cohort_and_split(tmp_path):
             data_root=root, mode='pretrain', batch_size=2, seed=7,
             num_workers=0, condition_group=('hc3' if arm != 'none' else None),
             condition_file=merged.name, eval_batch_size=2,
-            context_min=4, context_max=6, context_lengths=[6],
+            context_min=4, context_max=6, context_lengths=[6], num_rois=4,
             eval_context_length=6, eval_anchors_per_subject=2,
             eval_rollout_tasks_per_subject=0, eval_rollout_steps=0,
             val_ratio=0.25, test_ratio=0.25, train_samples_per_subject=1,
@@ -996,7 +997,7 @@ def test_N_full_dataflow_rows_match_anchors_not_k_times(tmp_path):
     root = _tiny_imaging_root(tmp_path, n_subjects=8, n_tr=12, n_rois=4)
     dl = NeuroTwinDataLoader(
         data_root=root, mode='finetune', batch_size=3, seed=7, num_workers=0,
-        condition_group='mdd8',
+        condition_group='mdd8', num_rois=4,
         eval_batch_size=3, context_min=4, context_max=6, context_lengths=[6],
         eval_context_length=6, eval_anchors_per_subject=2,
         eval_rollout_tasks_per_subject=1, eval_rollout_steps=3,
@@ -1047,7 +1048,7 @@ def test_N_condition_controls_behave_as_specified(tmp_path):
     for control in ('none', 'static_new', 'mask_only'):
         dl = NeuroTwinDataLoader(
             data_root=root, mode='finetune', batch_size=2, seed=7, num_workers=0,
-            condition_group='mdd8', condition_control=control,
+            condition_group='mdd8', condition_control=control, num_rois=4,
             eval_batch_size=2, context_min=4, context_max=6, context_lengths=[6],
             eval_context_length=6, eval_anchors_per_subject=1,
             eval_rollout_tasks_per_subject=0, eval_rollout_steps=0,

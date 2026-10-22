@@ -215,7 +215,6 @@ def test_patch4_from_snapshot_not_cli_default(final_model):
     assert final_model.context_max == 64
     assert final_model.tfm_patho_mode == 'film'
     assert final_model.one_step_head.pathology_mode == 'film'
-    assert final_model.one_step_head.pathology_moe is None
 
 
 @pytestmark_ckpt
@@ -328,11 +327,11 @@ def _write_fake_ckpt(path: Path, arch_version=4, mode='finetune',
 
 
 def test_film_gate_rejects_moe_checkpoint(tmp_path):
-    """MoE checkpoint（快照 tfm_patho_mode='moe'）被最终入口明确拒绝。"""
+    """MoE checkpoint（快照 tfm_patho_mode='moe'）在模型重建时被明确拒绝。"""
     ckpt = _write_fake_ckpt(tmp_path / 'moe.pt',
                             extra_args={'tfm_patho_mode': 'moe',
                                         'tfm_num_experts': 4, 'tfm_top_k': 2})
-    with pytest.raises(RuntimeError, match='tfm_patho_mode'):
+    with pytest.raises((RuntimeError, ValueError), match='tfm_patho_mode'):
         load_final_model(ckpt_path=ckpt, device='cpu', verify_hash=False)
 
 

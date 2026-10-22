@@ -282,25 +282,13 @@ def load_backbone_only(model, pretrained_path, device):
 
 
 def _iter_conditioning_modules(model):
-    """发现带 `is_conditioning_adapter` 标记的条件模块（AdaLN/LoRA/MoE 等）。
+    """发现带 `is_conditioning_adapter` 标记的条件模块（AdaLN/LoRA 等）。
 
     冻结/参数分组基于显式标记而非名字子串匹配，避免重命名导致行为漂移。
-    TFMPathologyMoE（TFM 病理残差专家）携带该标记：冻结 backbone 阶段
-    Router 与 Expert 仍参与训练（RECC 方案 §44/§46 Stage 1）。
     """
     seen = set()
     for _, module in model.named_modules():
         if getattr(module, 'is_conditioning_adapter', False) and id(module) not in seen:
-            seen.add(id(module))
-            yield module
-
-
-def _iter_tfm_pathology_moe_modules(model):
-    """发现 TFMPathologyMoE 模块（RECC 方案 §45：独立参数组 tfm_moe）。"""
-    from models.tfm_experts import TFMPathologyMoE
-    seen = set()
-    for _, module in model.named_modules():
-        if isinstance(module, TFMPathologyMoE) and id(module) not in seen:
             seen.add(id(module))
             yield module
 
@@ -341,6 +329,21 @@ def conditioning_module_prefixes(model) -> set:
     return out
 
 
+def s4_module_prefixes(model) -> set:
+    """S4 概率模块的参数键前缀（用于迁移归类/优化器分组）。"""
+    out = set()
+    for mod_name, module in model.named_modules():
+        if getattr(module, 'is_s4_module', False) and mod_name:
+            out.add(mod_name + '.')
+    return out
+
+
+def s4_module_ids(model) -> set:
+    return {id(p) for _, module in model.named_modules()
+            if getattr(module, 'is_s4_module', False)
+            for p in module.parameters()}
+
+
 def param_report(model, optimizer=None) -> dict:
     """登记实际参数量（方案 §11：不硬套旧方案的 35040/36388 等数字）。"""
     total = sum(p.numel() for p in model.parameters())
@@ -364,7 +367,8 @@ def param_report(model, optimizer=None) -> dict:
     }
 
 
-def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=False):
+def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=False,
+                                     allow_frozen_conditioning=False):
     """校验条件参数：全部进入优化器、无重复、numel 一致（验收 L）。
 
     同时检查「解冻后不会永久静默冻结」：条件模块的参数在冻结与解冻两态都必须
@@ -390,9 +394,12 @@ def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=Fa
                          if named[n].requires_grad and id(named[n]) in in_opt)
     if missing:
         problems.append(f'条件参数未进入优化器（{len(missing)} 个，例如 {missing[:5]}）')
-    if untrainable:
+    if untrainable and not allow_frozen_conditioning:
         problems.append(f'条件参数 requires_grad=False（{len(untrainable)} 个，例如 '
                         f'{untrainable[:5]}）；冻结期条件模块必须可训练')
+    elif untrainable:
+        print(f'[params] S4 stage=head：{len(untrainable)} 个条件参数按协议冻结'
+              '（此阶段仅训练 S4 新模块）')
     if dup:
         problems.append(f'优化器存在重复参数（{len(dup)} 个张量出现在多个参数组）')
     if cond_numel != opt_cond_numel:
@@ -484,7 +491,11 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
                     'arch_version': arch_version}
         print('警告: ' + msg + '（arch_policy=warn：继续迁移）')
 
-    cond_prefixes = tuple(sorted(conditioning_module_prefixes(model)))
+    # S4 新模块与条件适配器一样，是「旧 checkpoint 里没有、属预期新增」的键；
+    # 若漏掉这一步，迁移器会把 S4 参数误判为主干结构漂移并直接报错。
+    prefixes = (set(conditioning_module_prefixes(model))
+                | set(s4_module_prefixes(model)))
+    cond_prefixes = tuple(sorted(prefixes))
     model_state = model.state_dict()
     cls = classify_checkpoint_keys(model_state, state, cond_prefixes)
     zero_expanded = [k for k in cls['new_initialized'] if k in set(zero_expanded_keys)]
@@ -521,7 +532,7 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
           f"zero_expanded={len(zero_expanded)} | skipped={len(cls['skipped'])} | "
           f"missing={len(cls['missing'])}")
     if plain_new:
-        print(f"[migrate] 新增条件键示例: {plain_new[:5]}")
+        print(f"[migrate] 新增条件/S4 概率模块键示例: {plain_new[:5]}")
     return report
 
 
@@ -554,7 +565,7 @@ def unfreeze_while_preserving_state(model, optimizer, args):
 
 
 def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
-    """微调分阶段训练：默认训练条件模块（病理 FiLM / 病理 MoE），backbone_unfrozen 后解冻主干。"""
+    """微调分阶段训练：默认训练条件模块（病理 FiLM 等），backbone_unfrozen 后解冻主干。"""
     for p in model.parameters():
         p.requires_grad = False
     # 条件模块在冻结阶段即参与训练：它们是“让病理条件真正生效”的唯一路径
@@ -573,6 +584,8 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
         # 条件 FiLM 等适配器已由上方条件模块循环解冻，不在此重复。
         if getattr(model, 'profile_encoder', None) is not None:
             backbone_modules.append(model.profile_encoder)
+        # S4-1 残差头位于模型顶层，不在 one_step_head 内；联合阶段一并解冻。
+        backbone_modules.extend(getattr(model, 's4_modules', lambda: [])())
         for module in backbone_modules:
             for p in module.parameters():
                 p.requires_grad = True
@@ -583,7 +596,7 @@ def get_param_groups(model: NeuroTwinTFM, args):
 
     - pretrain: 单组 'all'（HC 预训练允许条件模块，此时条件参数随主干一起训练）
     - finetune: 'backbone' / 'condition'（条件模块：独立编码器、融合、FiLM、
-      条件 norm、门控残差/低秩）/ 'tfm_moe'，各自独立学习率。
+      条件 norm、门控残差/低秩）/ 's4'，各自独立学习率。
       条件组 LR 倍率取 ``condition_lr_scale``（方案 §11.2 的搜索维度），
       未提供时回退历史 ``adapter_lr_scale`` 以保持旧配置可复现。
     """
@@ -591,21 +604,17 @@ def get_param_groups(model: NeuroTwinTFM, args):
     if args.mode == 'pretrain':
         return [{'params': [p for _, p in named], 'lr': args.lr_peak, 'name': 'all'}]
 
-    moe_ids = set()
-    for module in _iter_tfm_pathology_moe_modules(model):
-        for p in module.parameters():
-            moe_ids.add(id(p))
-
     adapter_ids = set()
     for module in _iter_conditioning_modules(model):
         for p in module.parameters():
             adapter_ids.add(id(p))
 
-    moe_p     = [p for _, p in named if id(p) in moe_ids]
+    s4_ids = s4_module_ids(model)
     adapter_p = [p for _, p in named
-                 if id(p) in adapter_ids and id(p) not in moe_ids]
+                 if id(p) in adapter_ids and id(p) not in s4_ids]
+    s4_p      = [p for _, p in named if id(p) in s4_ids]
     backbone_p = [p for _, p in named
-                  if id(p) not in adapter_ids and id(p) not in moe_ids]
+                  if id(p) not in adapter_ids and id(p) not in s4_ids]
 
     cond_scale = getattr(args, 'condition_lr_scale', None)
     if cond_scale is None:
@@ -617,10 +626,10 @@ def get_param_groups(model: NeuroTwinTFM, args):
     if adapter_p:
         groups.append({'params': adapter_p,
                        'lr': args.lr_peak * float(cond_scale), 'name': 'condition'})
-    if moe_p:
-        groups.append({'params': moe_p,
-                       'lr': args.lr_peak * getattr(args, 'tfm_moe_lr_scale', 1.0),
-                       'name': 'tfm_moe'})
+    if s4_p:
+        groups.append({'params': s4_p,
+                       'lr': args.lr_peak * getattr(args, 's4_lr_scale', 1.0),
+                       'name': 's4'})
     return groups
 
 
