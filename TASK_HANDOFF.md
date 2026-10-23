@@ -10,7 +10,8 @@ S4 判读口径 §9）已吸收进 `docs/EXPERIMENTS.md`；重写前的完整原
   契约：`configs/baseline_s2_e2.json`；自检：`python baseline.py`；
   权重：`checkpoints/phase2_S2/neurotwin_tfm_finetune/finetuned_best.pt`。
 - 实验记录：`docs/EXPERIMENTS.md`；后续路线：`docs/RESEARCH_PLAN.md`。
-- 测试：`python -m pytest tests/` 全部通过（188 项，含基线契约与冻结契约）。
+- 测试：`python -m pytest tests/` 全部通过（200 项，含基线契约、划分清单、
+  脚本参数契约与调度器测试）。
 
 ## 本轮关键决定（要点）
 
@@ -34,8 +35,20 @@ S4 判读口径 §9）已吸收进 `docs/EXPERIMENTS.md`；重写前的完整原
    重新与 `configs/final_model.json` 一致（未改任何记录值）。
 7. E0 臂原权重归档于 `checkpoints/archive_e0_graph_ode_*`（graph_ode、λ=0）。
 
+## 2026-10-22 复核修正
+
+- 基线契约更正：采样 seed=20261009、Cond Dropout seed=20261008、HC 预训练为
+  `hc3/demo`；README/EXPERIMENTS 同步。
+- 训练脚本改为从 `configs/baseline_s2_e2.json` 读取共享配方（helper：
+  `scripts/_baseline_defaults.sh`），环境变量覆盖接口保留。
+- `baseline.py` 对 checkpoint `config.args` 做全量契约校验；新增脚本参数与
+  checkpoint 快照的一致性测试。
+- 学习率调度改为按参数组相对衰减，并在解冻追加参数组时同步 scheduler
+  （修复 backbone 组未进入余弦调度的问题）；现有 S2 权重不重训，修复从下一轮
+  训练起生效。
+
 ## 遗留事项 / 下一步
 
 - 后续开发按 `docs/RESEARCH_PLAN.md` 两条路线进行；不提前实现 L*/M*。
-- 已知训练配方问题（cosine eta_min 高于 backbone 峰值）待下次重训前独立修复。
 - S2 为单 seed 工程基线；正式统计定论需多 seed。
+- 下次重训将首次使用修复后的学习率调度；与现有 S2 指标对比时需注明配方差异。

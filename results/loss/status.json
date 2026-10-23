@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-22",
+  "status": "complete",
+  "environment": {
+    "torch": "2.6.0+cu118",
+    "cuda_available": true,
+    "nvidia_smi": "driver available outside sandbox",
+    "device_nodes": "two RTX A6000 GPUs available outside sandbox"
+  },
+  "implemented": [
+    "L1 adaptive temporal",
+    "L2 shared CPM/ODE horizon weights",
+    "L3 multiscale temporal",
+    "P1 temporal variogram"
+  ],
+  "experiments": {
+    "L0": {
+      "configuration": "results/loss/L0/training_config.json",
+      "test_metrics_path": "results/loss/L0/eval/metrics_test.json"
+    },
+    "L1": {
+      "configuration": "results/loss/L1/training_config.json",
+      "test_metrics_path": "results/loss/L1/eval/metrics_test.json"
+    },
+    "L2": {
+      "configuration": "results/loss/L2/training_config.json",
+      "test_metrics_path": "results/loss/L2/eval/metrics_test.json"
+    },
+    "L3": {
+      "configuration": "results/loss/L3/training_config.json",
+      "test_metrics_path": "results/loss/L3/eval/metrics_test.json"
+    },
+    "P0": {
+      "configuration": "results/loss/probabilistic/P0/training_config.json",
+      "test_metrics_path": "results/loss/probabilistic/P0/eval/metrics_test.json"
+    },
+    "P1": {
+      "configuration": "results/loss/probabilistic/P1/training_config.json",
+      "test_metrics_path": "results/loss/probabilistic/P1/eval/metrics_test.json"
+    }
+  },
+  "validation": {
+    "focused_tests": "50 passed",
+    "default_E2_legacy_comparison": "8 cases: bitwise equal total and statistics",
+    "cli": "all six generated commands parsed successfully",
+    "plotting": "Figure 1–5 generated from actual evaluated experiments; initial synthetic checks retained only as development history"
+  },
+  "conclusions": {
+    "L1": "Q5 improves at Q1 cost; negligible aggregate gain; retain E2",
+    "L2": "negligible H4-H8 gain; CPM degrades; retain E2",
+    "L3": "no independent benefit",
+    "P1": "modest joint-score improvement; still worse than iid; wider intervals; single-seed evidence only",
+    "L4": "not run: no accepted complementary deterministic candidates",
+    "recommendation": "retain formal S2 + E2"
+  },
+  "stage": "task_A_closed",
+  "updated_at": "2026-10-22T21:19:38.324608+08:00",
+  "python": "/home/user/anaconda3/envs/DiffNext/bin/python",
+  "report": "results/loss/compare/RESULTS.md",
+  "aggregation": "per-anchor normalization, then per-subject means; probability comparison checked against original JSON",
+  "replication": "single seed only; no candidate accepted for promotion",
+  "research_status": "首轮研究完成，E2 保留",
+  "archive_manifest": "results/loss/archive_manifest.json",
+  "follow_up": {
+    "new_loss_ablations": false,
+    "L4": false,
+    "multiseed": false,
+    "retraining": false
+  },
+  "cleanup_complete": true,
+  "checkpoint_retention": "experimental weights removed from results after closeout; formal checkpoints unchanged"
+}

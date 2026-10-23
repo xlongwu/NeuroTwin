@@ -45,6 +45,34 @@ def spatial_pcc(pred: torch.Tensor, target: torch.Tensor,
     return (pc * tc).sum(dim=1) / (n_p * n_t + eps)
 
 
+def temporal_pcc_loss(pred: torch.Tensor, target: torch.Tensor,
+                      mask: torch.Tensor = None, eps: float = 1e-8) -> torch.Tensor:
+    """Mean 1-PCC over valid (sample, ROI) future trajectories [B,F,H].
+
+    At least three observed future points and nonconstant targets are required.
+    Constant predictions remain supervised. Observed context is not appended.
+    Each valid ROI/trajectory has equal weight, independent of missing horizons.
+    """
+    if pred.ndim != 3 or pred.shape != target.shape:
+        raise ValueError('temporal PCC pred/target must share [B,F,H]')
+    b, _, h = pred.shape
+    if mask is not None and mask.shape != (b, h):
+        raise ValueError('temporal PCC mask must be [B,H]')
+    # Use float32 for stable variances/norms under autocast.
+    p, t = pred.float(), target.float()
+    w = p.new_ones(b, 1, h) if mask is None else mask.to(p)[:, None, :]
+    n = w.sum(-1)
+    count = n.clamp_min(1.0)
+    p_mean = (p * w).sum(-1) / count
+    t_mean = (t * w).sum(-1) / count
+    pc, tc = (p - p_mean[..., None]) * w, (t - t_mean[..., None]) * w
+    p_ss, t_ss = pc.square().sum(-1), tc.square().sum(-1)
+    valid = (n >= 3) & (t_ss / count > eps)
+    denom = (p_ss + eps).sqrt() * (t_ss + eps).sqrt() + eps
+    corr = ((pc * tc).sum(-1) / denom).clamp(-1.0, 1.0)
+    return ((1.0 - corr) * valid).sum() / valid.sum().clamp_min(1)
+
+
 def compute_graph_regularization(aux_info, device,
                                  sparsity_weight: float = 1e-3,
                                  entropy_weight: float = 1e-3,
@@ -130,7 +158,7 @@ def compute_cpm_mask(controls: torch.Tensor, future_mask: torch.Tensor) -> torch
     return future_mask.to(controls.dtype) * unseen
 
 
-def temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
+def _single_temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
                               mask: torch.Tensor = None,
                               context_last: torch.Tensor = None,
                               huber_delta: float = 1.0,
@@ -187,6 +215,78 @@ def temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
 
     hub = _huber_elementwise(pred - prev_p, target - prev_t, huber_delta)
     return (hub * w3).sum() / (w3.sum().clamp_min(eps) * f)
+
+
+def temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
+                              mask: torch.Tensor = None,
+                              context_last: torch.Tensor = None,
+                              huber_delta: float = 1.0, eps: float = 1e-8,
+                              temporal_mode: str = 'standard',
+                              temporal_lags=(1,), temporal_scale_weights=(1.0,),
+                              adaptive_delta_alpha: float = 0.5,
+                              adaptive_delta_clip: float = 3.0,
+                              adaptive_delta_scale: float = 1.0) -> torch.Tensor:
+    """E2-compatible temporal Huber; each lag is independently normalized.
+
+    Only the observed final context frame is available: lag k starts at h=k
+    with context_last, or h=k+1 without it. Validity requires both endpoints.
+    Adaptive weights use detached targets and a fixed train-only delta scale.
+    """
+    if temporal_mode not in ('standard', 'adaptive', 'multiscale'):
+        raise ValueError('unknown temporal_mode')
+    if temporal_mode == 'standard':
+        return _single_temporal_difference_huber(
+            pred, target, mask, context_last, huber_delta, eps)
+    if pred.ndim != 3 or pred.shape != target.shape:
+        raise ValueError('temporal pred/target must share [B,F,H]')
+    b, f, h = pred.shape
+    if mask is not None and mask.shape != (b, h):
+        raise ValueError('temporal mask must be [B,H]')
+    if context_last is not None and context_last.shape != (b, f):
+        raise ValueError('context_last must be [B,F]')
+    if temporal_mode == 'adaptive':
+        if (not math.isfinite(adaptive_delta_scale) or adaptive_delta_scale <= 0
+                or not math.isfinite(adaptive_delta_alpha) or adaptive_delta_alpha < 0
+                or not math.isfinite(adaptive_delta_clip) or adaptive_delta_clip <= 0):
+            raise ValueError('adaptive scale/clip must be positive; alpha nonnegative')
+        lags, weights = (1,), (1.0,)
+    else:
+        lags, weights = tuple(temporal_lags), tuple(temporal_scale_weights)
+        if (not lags or len(lags) != len(weights) or len(set(lags)) != len(lags)
+                or any(k not in (1, 2, 4) for k in lags)
+                or any(not math.isfinite(w) or w < 0 for w in weights)
+                or not math.isclose(sum(weights), 1.0, abs_tol=1e-7)):
+            raise ValueError('lags must be unique 1/2/4 with nonnegative weights summing to 1')
+    m = pred.new_ones(b, h) if mask is None else mask.to(pred)
+    pp, tt = pred, target
+    if context_last is not None:
+        pp = torch.cat((context_last[..., None], pp), -1)
+        tt = torch.cat((context_last[..., None], tt), -1)
+        m = torch.cat((m.new_ones(b, 1), m), -1)
+    loss = pred[..., :0].sum()
+    for lag, scale_weight in zip(lags, weights):
+        if lag >= pp.shape[-1]:
+            continue
+        dp, dt = pp[..., lag:] - pp[..., :-lag], tt[..., lag:] - tt[..., :-lag]
+        w = (m[:, lag:] * m[:, :-lag])[:, None, :].expand_as(dp)
+        if temporal_mode == 'adaptive':
+            w = w * (1.0 + adaptive_delta_alpha *
+                     (dt.detach().abs() / (adaptive_delta_scale + eps)).clamp(max=adaptive_delta_clip))
+        hub = _huber_elementwise(dp, dt, huber_delta)
+        loss = loss + scale_weight * (hub * w).sum() / w.sum().clamp_min(eps)
+    return loss
+
+
+def horizon_weights(horizon: int, reference: torch.Tensor, mode: str = 'gamma',
+                    gamma: float = 1.0, alpha: float = 0.5,
+                    power: float = 1.0) -> torch.Tensor:
+    """Shared CPM/Dynamics horizon weights, indexed on the full H1..H grid."""
+    index = torch.arange(horizon, device=reference.device, dtype=reference.dtype)
+    if mode == 'gamma':
+        return gamma ** index
+    if mode == 'increasing':
+        return 1.0 + alpha * (index / max(1, horizon - 1)).pow(power)
+    raise ValueError(f'unknown horizon mode: {mode}')
 
 
 def cross_head_consistency(cpm_pred: torch.Tensor, dynamics_pred: torch.Tensor,
@@ -253,7 +353,8 @@ class TFMDualLoss(nn.Module):
         ``temporal_difference_huber``）；
       - ``lambda_cross_head``：双头一致性 L1（CPM 学生 ← sg(Graph-ODE) 教师，
         见 ``cross_head_consistency``，``cross_head_start_epoch`` 控制预热）。
-    两者以固定权重直接加入总损失，**不**进入 weighting='uncertainty' 聚合。
+    temporal_diff / cross_head 以固定权重直接加入总损失，不进入 uncertainty 聚合。
+    lambda_temporal_pcc（默认 0）另加 CPM + ODE 的未来轨迹时间 PCC，亦为固定权重。
     """
 
     def __init__(self, lambda_one: float = 1.0, lambda_cpm: float = 1.0,
@@ -265,7 +366,15 @@ class TFMDualLoss(nn.Module):
                  lambda_cross_head: float = 0.0,
                  cpm_horizon_weight: str = 'gamma',
                  cpm_horizon_alpha: float = 0.5,
-                 cross_head_start_epoch: int = 0):
+                 cross_head_start_epoch: int = 0,
+                 temporal_mode: str = 'standard',
+                 temporal_lags=(1,), temporal_scale_weights=(1.0,),
+                 adaptive_delta_alpha: float = 0.5,
+                 adaptive_delta_clip: float = 3.0,
+                 adaptive_delta_scale: float = 1.0,
+                 dynamics_horizon_weight: bool = False,
+                 horizon_weight_power: float = 1.0,
+                 lambda_temporal_pcc: float = 0.0):
         super().__init__()
         if lambda_one < 0 or lambda_cpm < 0 or lambda_pcc < 0:
             raise ValueError(
@@ -306,9 +415,25 @@ class TFMDualLoss(nn.Module):
         self.lambda_variance = float(lambda_variance)
         self.lambda_temporal_diff = float(lambda_temporal_diff)
         self.lambda_cross_head = float(lambda_cross_head)
+        if not math.isfinite(lambda_temporal_pcc) or lambda_temporal_pcc < 0:
+            raise ValueError('lambda_temporal_pcc must be finite and nonnegative')
+        self.lambda_temporal_pcc = float(lambda_temporal_pcc)
         self.cpm_horizon_weight = str(cpm_horizon_weight)
         self.cpm_horizon_alpha = float(cpm_horizon_alpha)
         self.cross_head_start_epoch = int(cross_head_start_epoch)
+        if not math.isfinite(horizon_weight_power) or horizon_weight_power <= 0:
+            raise ValueError('horizon_weight_power must be positive')
+        self.dynamics_horizon_weight = bool(dynamics_horizon_weight)
+        self.horizon_weight_power = float(horizon_weight_power)
+        self.temporal_kwargs = dict(
+            temporal_mode=temporal_mode, temporal_lags=tuple(temporal_lags),
+            temporal_scale_weights=tuple(temporal_scale_weights),
+            adaptive_delta_alpha=adaptive_delta_alpha,
+            adaptive_delta_clip=adaptive_delta_clip,
+            adaptive_delta_scale=adaptive_delta_scale)
+        # Validate configuration even before the first supervised batch.
+        temporal_difference_huber(torch.zeros(1, 1, 8), torch.zeros(1, 1, 8),
+                                  **self.temporal_kwargs)
         if weighting not in ('fixed', 'uncertainty'):
             raise ValueError(
                 f"weighting 只支持 'fixed' / 'uncertainty'，收到 {weighting!r}")
@@ -344,7 +469,7 @@ class TFMDualLoss(nn.Module):
         """
         out = {'mode': self.weighting}
         for name in ('one', 'cpm', 'dynamics', 'variance',
-                     'temporal_diff', 'cross_head'):
+                     'temporal_diff', 'cross_head', 'temporal_pcc'):
             lam = float(getattr(self, f'lambda_{name}'))
             if lam <= 0:
                 continue
@@ -428,16 +553,9 @@ class TFMDualLoss(nn.Module):
             h = cpm_pred.shape[2]
             w = torch.ones(cpm_pred.shape[0], h, device=cpm_pred.device,
                            dtype=cpm_pred.dtype)
-            if self.cpm_horizon_weight == 'increasing':
-                # 远期递增：w_h = 1 + α·(h−1)/(H−1)（H=1 时退化为 1）
-                if h > 1:
-                    ramp = torch.arange(h, device=cpm_pred.device,
-                                        dtype=cpm_pred.dtype) / (h - 1)
-                    w = w * (1.0 + self.cpm_horizon_alpha * ramp).view(1, h)
-            elif self.cpm_gamma < 1.0:
-                gamma_pows = self.cpm_gamma ** torch.arange(
-                    h, device=cpm_pred.device, dtype=cpm_pred.dtype)
-                w = w * gamma_pows.view(1, h)
+            w = w * horizon_weights(
+                h, cpm_pred, self.cpm_horizon_weight, self.cpm_gamma,
+                self.cpm_horizon_alpha, self.horizon_weight_power).view(1, h)
             if cpm_mask is not None:
                 if tuple(cpm_mask.shape) != (cpm_pred.shape[0], h):
                     raise ValueError(
@@ -505,6 +623,11 @@ class TFMDualLoss(nn.Module):
                     f"dynamics_mask 形状 {tuple(dyn_w.shape)} 与 "
                     f"[B,{h_dyn}] 不一致")
             if h_dyn > 1:
+                if self.dynamics_horizon_weight:
+                    dyn_w = dyn_w * horizon_weights(
+                        h_dyn, dynamics_pred, self.cpm_horizon_weight,
+                        self.cpm_gamma, self.cpm_horizon_alpha,
+                        self.horizon_weight_power).view(1, h_dyn)
                 mask2 = dyn_w[:, 1:]                                   # [B, H-1]
                 w2 = mask2.view(dynamics_pred.shape[0], 1, h_dyn - 1)
                 hub_dyn = _huber_elementwise(dynamics_pred[:, :, 1:],
@@ -586,12 +709,14 @@ class TFMDualLoss(nn.Module):
                 td_cpm = temporal_difference_huber(
                     cpm_pred, cpm_target, mask=cpm_mask,
                     context_last=context_last,
-                    huber_delta=self.huber_delta, eps=self.eps)
+                    huber_delta=self.huber_delta, eps=self.eps,
+                    **self.temporal_kwargs)
             if dynamics_pred is not None and dynamics_pred.shape[0] > 0:
                 td_dyn = temporal_difference_huber(
                     dynamics_pred, dynamics_target, mask=dynamics_mask,
                     context_last=None,
-                    huber_delta=self.huber_delta, eps=self.eps)
+                    huber_delta=self.huber_delta, eps=self.eps,
+                    **self.temporal_kwargs)
             total = total + self.lambda_temporal_diff * (td_cpm + td_dyn)
         stats['loss_temporal_diff'] = (td_cpm + td_dyn).detach()
         stats['loss_temporal_diff_cpm'] = td_cpm.detach()
@@ -620,6 +745,19 @@ class TFMDualLoss(nn.Module):
                                            mask=cons_mask, eps=self.eps)
             total = total + self.lambda_cross_head * cross
         stats['loss_cross_head'] = cross.detach()
+
+        # Temporal PCC is a separate auxiliary objective; retain all E2 terms.
+        tp_cpm, tp_dyn = pred.new_zeros(()), pred.new_zeros(())
+        if self.lambda_temporal_pcc > 0:
+            if cpm_pred.shape[0] > 0:
+                tp_cpm = temporal_pcc_loss(cpm_pred, cpm_target, cpm_mask, self.eps)
+            if dynamics_pred is not None and dynamics_pred.shape[0] > 0:
+                tp_dyn = temporal_pcc_loss(
+                    dynamics_pred, dynamics_target, dynamics_mask, self.eps)
+            total = total + self.lambda_temporal_pcc * (tp_cpm + tp_dyn)
+        stats['loss_temporal_pcc'] = (tp_cpm + tp_dyn).detach()
+        stats['loss_temporal_pcc_cpm'] = tp_cpm.detach()
+        stats['loss_temporal_pcc_dyn'] = tp_dyn.detach()
 
         stats['loss_total'] = total.detach()
         return total, stats

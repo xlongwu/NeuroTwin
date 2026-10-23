@@ -4,7 +4,7 @@
 - :func:`ensemble_crps`：训练主损失。使用排序后的闭式经验 CRPS，避免
   ``K×K`` 两两差分矩阵的显存开销；
 - :func:`ensemble_energy_score` 与 :func:`temporal_variogram_score`：验证指标，
-  分别检查联合分布距离与时间依赖（第一轮不加入训练）。
+  分别检查联合分布距离与时间依赖；指定 lags 时提供 P1 的可微训练目标。
 
 样本形状统一为 ``[B,K,F,H]``（K 个轨迹样本），真值 ``[B,F,H]``，有效 mask
 ``[B,H]``；ROI/horizon 维度按有效元素数归一，batch 内不因缺测改变权重。
@@ -87,11 +87,15 @@ def ensemble_energy_score(samples: torch.Tensor, target: torch.Tensor,
 
 def temporal_variogram_score(samples: torch.Tensor, target: torch.Tensor,
                              mask: Optional[torch.Tensor] = None,
-                             eps: float = 1e-8) -> torch.Tensor:
+                             eps: float = 1e-8, *, lags=None, lag_weights=None,
+                             power: float = 0.5) -> torch.Tensor:
     """时间变差函数得分（H−1 个 lag 的平均平方差，越小越好）。
 
         γ_x(τ) = mean_t (x_{t+τ} − x_t)²
         score  = mean_{τ,f} (E_K[γ_sample(τ)] − γ_target(τ))²
+
+    lags=None 保留历史指标；指定 lags=(1,2,4) 时使用逐时间点/ROI 的
+    E|delta|**power 与真实 |delta|**power 的平方差，用于 P1 训练。
 
     只在 ``t`` 与 ``t+τ`` 都有效的元素上统计；样本维先取均值。该指标对
     “独立噪声放大方差但时间相关结构错误”敏感，作为 S4 的验证指标而非训练项。
@@ -100,6 +104,35 @@ def temporal_variogram_score(samples: torch.Tensor, target: torch.Tensor,
     b, k, f, h = samples.shape
     if h < 2:
         raise ValueError(f'变差函数需要 H>=2，收到 H={h}')
+    if lags is not None:
+        # P1: square each time/ROI discrepancy before averaging; the historical
+        # score below instead squares an already pooled second moment.
+        lags = tuple(lags)
+        if not lags:
+            raise ValueError('temporal variogram requires at least one lag')
+        weights = tuple(lag_weights) if lag_weights is not None else (1 / len(lags),) * len(lags)
+        import math
+        if (not lags or len(lags) != len(weights) or len(set(lags)) != len(lags)
+                or any(t not in (1, 2, 4) for t in lags)
+                or any(not math.isfinite(w) or w < 0 for w in weights)
+                or not math.isclose(sum(weights), 1.0, abs_tol=1e-7)
+                or not math.isfinite(power) or power <= 0):
+            raise ValueError('invalid temporal variogram lags/weights/power')
+        def moment(delta):
+            # Fractional powers have an infinite derivative at zero. Evaluate
+            # a safe inactive branch and use the zero subgradient there.
+            a = delta.float().abs()
+            safe = torch.where(a > 0, a, torch.ones_like(a))
+            return torch.where(a > 0, safe.pow(power), torch.zeros_like(a))
+        total = samples[..., :0].sum()
+        for tau, weight in zip(lags, weights):
+            if tau >= h:
+                continue
+            valid = (mask[:, tau:] * mask[:, :-tau])[:, None, :]
+            pm = moment(samples[..., tau:] - samples[..., :-tau]).mean(1)
+            tm = moment(target[..., tau:] - target[..., :-tau])
+            total = total + weight * ((pm - tm).square() * valid).sum() / (valid.sum() * f).clamp_min(eps)
+        return total
     pred_gamma = []
     true_gamma = []
     valid_lag = []

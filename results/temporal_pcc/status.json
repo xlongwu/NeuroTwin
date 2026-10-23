@@ -1,0 +1,7 @@
+{
+  "status": "complete",
+  "stage": "result_analysis_complete",
+  "updated_at": "2026-10-23T08:41:14.256877+08:00",
+  "decision": "retain E2; temporal PCC weight 0.05 not adopted",
+  "report": "results/temporal_pcc/RESULTS.md"
+}

@@ -1,17 +1,21 @@
 {
   "_meta": {
     "name": "neurotwin_baseline_s2_e2",
-    "description": "NeuroTwin 正式开发基线：S2 History Memory + Graph-ODE + CPM 架构，E2 损失（Temporal Difference + Cross-Head Consistency）。本文件是基线的唯一事实来源；历史各实验的差异一律通过环境变量/CLI 覆盖，不再散落在实验脚本中。",
+    "description": "NeuroTwin 正式开发基线：S2 History Memory + Graph-ODE + CPM 架构，E2 损失（Temporal Difference + Cross-Head Consistency）。本文件是基线训练配方的唯一事实来源；scripts/Pretrain_HC_tfm.sh 与 scripts/Finetune_MDD_tfm.sh 通过 scripts/_baseline_defaults.sh 读取，历史实验差异只允许通过环境变量/CLI 覆盖。",
     "created": "2026-10-22",
     "status": "official_baseline",
     "selection_basis": "见 docs/EXPERIMENTS.md：S2 相对 S0 多步 MAE -0.87%（p=2.1e-26）且单步不退化，优于 S1/S3 的精度/复杂度权衡。",
-    "known_limits": "单训练 seed（2024）；H≤8 硬限；结论为工程开发基线而非多 seed 统计定论。"
+    "stage_notes": "HC 预训练由 main.py 将 tfm_patho_mode 强制为 none；architecture.tfm_patho_mode=film 描述 MDD 微调模型。",
+    "known_limits": "单训练 seed（2024）；CPM 直接预测长度 H=8，Graph-ODE 可自由推进超过 8 步但 H>8 未经充分消融与验证；结论为工程开发基线而非多 seed 统计定论。"
   },
   "architecture": {
     "model_arch": "tfm",
     "task_mode": "next_timepoint",
     "num_rois": 116,
+    "context_min": 16,
     "context_max": 64,
+    "forecast_offsets": "1",
+    "calibration_length": 32,
     "tfm_dim": 256,
     "tfm_layers": 4,
     "tfm_heads": 4,
@@ -53,7 +57,8 @@
     "loss_weighting": "uncertainty",
     "cpm_gamma": 1.0,
     "cpm_huber_delta": 1.0,
-    "cpm_horizon_weight": "gamma"
+    "cpm_horizon_weight": "gamma",
+    "cpm_horizon_alpha": 0.5
   },
   "data_and_split": {
     "data_root": "data/",
@@ -61,18 +66,24 @@
     "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
     "val_ratio": 0.1,
     "test_ratio": 0.1,
-    "split": "被试级 8:1:1，优先 split_file > 版本化 manifest（subject_split_<mode>.json）> 现场 seed=42 生成",
+    "split": "被试级 8:1:1，优先 split_file > 版本化 manifest（subject_split_<mode>.json）> 现场按模型 seed 生成；当前 manifest 记录 seed=2024",
     "conditioning": {
-      "pretrain": {"condition_arm": "cat", "condition_group": "hc3"},
+      "pretrain": {"condition_arm": "demo", "condition_group": "hc3"},
       "finetune": {"condition_arm": "cat", "condition_group": "mdd8"},
       "cond_inject": "heads",
-      "cond_dim": 32
+      "cond_dim": 32,
+      "cond_d_demo": 16,
+      "cond_d_new": 16,
+      "cond_h_delta": 64,
+      "cond_delta_style": "mlp",
+      "cond_dropout_p": 0.0
     }
   },
   "training": {
     "seed": 2024,
-    "sampling_seed": 2024,
-    "split_seed": 42,
+    "sampling_seed": 20261009,
+    "cond_dropout_seed": 20261008,
+    "split_seed": 2024,
     "batch_size": 256,
     "train_epochs": 150,
     "lr_init": 5e-05,
@@ -106,7 +117,7 @@
       "sha256": "ff0b2d991dcad3c27d548837a4218a5f7521011b8477c8028784d377a2e0aada",
       "arch_version": 6,
       "params_total": 6244019,
-      "note": "2026-10-21 训练，epoch 22/23 早停，val ODE H1–H8 subject MAE=0.5329；完整 config.args 快照内嵌于 checkpoint。"
+      "note": "2026-10-21 训练，epoch 22/23 早停，val ODE H1–H8 subject MAE=0.5329；完整 config.args 快照内嵌于 checkpoint。该权重由学习率调度修复前的配方训练，修复仅对后续重训生效。"
     },
     "pretrain_source": {
       "role": "hc_pretrain",

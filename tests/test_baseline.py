@@ -3,10 +3,15 @@
 
 依赖真实权重的用例在 checkpoint 缺失时自动 skip。
 """
+import json
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from baseline import BASELINE_CONFIG, load_baseline_config
+from baseline import (BASELINE_CONFIG, CONTRACT_FIELDS, config_value,
+                      load_baseline_config, verify_checkpoint_contract)
+from utils.condition_schema import DROPOUT_SEED, MODEL_SEED, SAMPLING_SEED
 
 CKPT = BASELINE_CONFIG.parent.parent / 'checkpoints' / 'phase2_S2' \
     / 'neurotwin_tfm_finetune' / 'finetuned_best.pt'
@@ -22,10 +27,62 @@ def test_baseline_config_declares_contract():
     assert cfg['architecture']['s4_variant'] == 'off'
     assert cfg['loss']['lambda_temporal_diff'] == 0.05
     assert cfg['loss']['lambda_cross_head'] == 0.02
-    assert cfg['training']['seed'] == 2024
+    assert cfg['training']['seed'] == MODEL_SEED
+    assert cfg['training']['sampling_seed'] == SAMPLING_SEED
+    assert cfg['training']['cond_dropout_seed'] == DROPOUT_SEED
+    conditioning = cfg['data_and_split']['conditioning']
+    assert conditioning['pretrain'] == {
+        'condition_arm': 'demo', 'condition_group': 'hc3'}
+    assert conditioning['finetune'] == {
+        'condition_arm': 'cat', 'condition_group': 'mdd8'}
     main = cfg['weights']['main']
     assert main['path'].startswith('checkpoints/phase2_S2/')
     assert len(main['sha256']) == 64
+
+
+def test_baseline_split_manifest_matches_config():
+    """版本化划分清单是实际 split 的事实来源，必须与基线记录逐项一致。"""
+    cfg = load_baseline_config()
+    manifests = [BASELINE_CONFIG.parent.parent / 'data'
+                 / f'subject_split_{mode}.json'
+                 for mode in ('pretrain', 'finetune')]
+    manifests = [path for path in manifests if path.exists()]
+    if not manifests:
+        pytest.skip('版本化划分清单不在本机（data/ 不入版本库）')
+    for path in manifests:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        assert payload['seed'] == cfg['training']['split_seed'], path
+        assert payload['val_ratio'] == cfg['data_and_split']['val_ratio'], path
+        assert payload['test_ratio'] == cfg['data_and_split']['test_ratio'], path
+
+
+def _args_from_config(cfg):
+    return SimpleNamespace(**{
+        arg_key: config_value(cfg, path) for path, arg_key in CONTRACT_FIELDS})
+
+
+def test_checkpoint_contract_accepts_matching_snapshot():
+    cfg = load_baseline_config()
+    verify_checkpoint_contract(_args_from_config(cfg), cfg)
+
+
+def test_checkpoint_contract_rejects_seed_drift():
+    cfg = load_baseline_config()
+    args = _args_from_config(cfg)
+    args.sampling_seed = 2024
+    with pytest.raises(RuntimeError, match='sampling_seed'):
+        verify_checkpoint_contract(args, cfg)
+
+
+def test_checkpoint_contract_requires_all_but_legacy_s4_variant():
+    cfg = load_baseline_config()
+    args = _args_from_config(cfg)
+    del args.s4_variant
+    verify_checkpoint_contract(args, cfg)
+
+    del args.seed
+    with pytest.raises(RuntimeError, match='seed'):
+        verify_checkpoint_contract(args, cfg)
 
 
 def test_baseline_config_rejects_legacy_final_model():

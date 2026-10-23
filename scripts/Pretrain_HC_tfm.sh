@@ -51,57 +51,40 @@ DEVICE="${DEVICE:-}"
 # neurotwin_tfm_pretrain/finetune 产物混用。
 name="neurotwin_tfm_pretrain"
 
-# ---- 实验规模（方案 §17 首选起点：D=256, N=4, patch=4, heads=4）----
-# 随机来源（模型 seed / 采样 seed / Condition Dropout seed）只在
-# utils/condition_schema.py 登记一次，这里读出来用；脚本里抄字面量必然漂移。
-# 历史缺陷：本脚本曾把 --sampling_seed 直接写成 --seed 的同一个值（都是 2024），
-# 于是模型初始化流与采样流并成一条，方案 §四 的「分离」名存实亡。
-read -r seed sampling_seed cond_dropout_seed < <(
-  PYTHONPATH=. "$PYTHON_BIN" -c 'from utils.condition_schema import (DROPOUT_SEED, MODEL_SEED, SAMPLING_SEED); print(MODEL_SEED, SAMPLING_SEED, DROPOUT_SEED)') \
-  || { echo "[错误] $PYTHON_BIN 读取 utils.condition_schema 的随机来源常量失败（需 PYTHON=<≥3.10 且带 torch 的解释器>）" >&2; exit 1; }
+# ---- 基线配方（configs/baseline_s2_e2.json 是唯一来源）----
+# 模型/损失/优化/条件共享值由 helper 导出；随机种子在 helper 内与
+# utils/condition_schema.py 的登记值逐项核对；阶段特有的 HC 条件臂也在 JSON。
+source "$ROOT/scripts/_baseline_defaults.sh"
 if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
       || "$sampling_seed" == "$cond_dropout_seed" ]]; then
-  echo "[错误] 登记处自身的随机来源就不同值（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed），违反方案 §四" >&2
+  echo "[错误] 随机来源未分离（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed），违反方案 §四" >&2
   exit 1
 fi
-num_rois=116
-context_min=16
-context_max=64
+
+# ---- 评估协议（不属于训练配方，保持脚本内单点定义）----
 eval_context_length=64
 eval_anchors_per_subject=16
 eval_rollout_tasks_per_subject=2
 eval_rollout_horizons="1,2,4,8,16"
-tfm_dim=256
-tfm_layers=4
-tfm_heads=4
-tfm_patch_len=8                    # 方案 §4.3：{1,4,8} 消融，不用 TimesFM 的 32
-cpm_horizon=8                      # 方案 §8：首选 8，随后测 {4,8,16}
 
-# ---- P0 损失扩展（默认=E2 正式基线：Temporal Diff 0.05 + Cross-Head 0.02）----
-# 消融可经环境变量覆盖：
-#   E0: LAMBDA_TEMPORAL_DIFF=0 LAMBDA_CROSS_HEAD=0 bash scripts/Pretrain_HC_tfm.sh
-#   E1: LAMBDA_TEMPORAL_DIFF=0.05 bash scripts/Pretrain_HC_tfm.sh
+# ---- 环境变量覆盖（消融/排程用）----
+# E0: LAMBDA_TEMPORAL_DIFF=0 LAMBDA_CROSS_HEAD=0 bash scripts/Pretrain_HC_tfm.sh
+# E1: LAMBDA_TEMPORAL_DIFF=0.05 bash scripts/Pretrain_HC_tfm.sh
 # 说明：temporal_diff / cross_head 为固定权重项，不进入 uncertainty 聚合；
 #       cross_head_start_epoch 仅在 LAMBDA_CROSS_HEAD>0 时生效。
-lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-0.05}"
-lambda_cross_head="${LAMBDA_CROSS_HEAD:-0.02}"
-cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-5}"
-cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-gamma}"
-cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-0.5}"
+lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-$lambda_temporal_diff}"
+lambda_cross_head="${LAMBDA_CROSS_HEAD:-$lambda_cross_head}"
+cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-$cross_head_start_epoch}"
+cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-$cpm_horizon_weight}"
+cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-$cpm_horizon_alpha}"
 # ---- S2 历史记忆（正式基线默认开启）----
-dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-True}"
+dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-$dynamics_history_memory}"
+train_epochs="${TRAIN_EPOCHS:-$train_epochs}"
 
-train_epochs="${TRAIN_EPOCHS:-150}"
-warmup_epochs=15
 # 数据加载并发（只影响吞吐，不影响训练结果）：默认关闭 pin_memory 以避免长时
 # 运行中 resource_sharer/pin-memory 线程因临时 socket 消失而中断训练。
 num_workers="${NUM_WORKERS:-6}"
 pin_memory="${PIN_MEMORY:-False}"
-batch_size=256
-patience=20
-lr_init=5e-5
-lr_peak=1e-4
-lr_final=5e-5
 
 # ---- 预检查 ----
 # graph_ode 路线用 raw + history_fc：只要求 Raw 目录，不要求 Mask（图来自
@@ -121,7 +104,7 @@ ARGS=(
   --task_mode next_timepoint
   --context_min "$context_min"
   --context_max "$context_max"
-  --forecast_offsets 1               # TFM 的 one-step 头只建模 +1 偏移（方案 §10）
+  --forecast_offsets "$forecast_offsets"   # 基线只建模 +1 偏移（方案 §10）
   --eval_context_length "$eval_context_length"
   --eval_anchors_per_subject "$eval_anchors_per_subject"
   --eval_rollout_tasks_per_subject "$eval_rollout_tasks_per_subject"
@@ -134,32 +117,33 @@ ARGS=(
   --tfm_layers "$tfm_layers"
   --tfm_heads "$tfm_heads"
   --tfm_patch_len "$tfm_patch_len"
-  --tfm_ff_ratio 4
-  --tfm_one_step_hidden_dim 256
+  --tfm_ff_ratio "$tfm_ff_ratio"
+  --tfm_one_step_hidden_dim "$tfm_one_step_hidden_dim"
   --cpm_horizon "$cpm_horizon"
-  --cpm_layers 2
-  --cpm_intervention False           # V1 仅预留接口，不做干预预测（方案 §13.1/§30）
+  --cpm_layers "$cpm_layers"
+  --cpm_intervention "$cpm_intervention"   # V1 仅预留接口（方案 §13.1/§30）
   # ---- SC 软先验（A_eff 一次计算全层共享，方案 §7）----
-  --sc_prior_mode soft_prior
-  --sc_lambda_mode global
-  --sc_lambda_init 0.7
-  --sc_prior_rank 12
-  --sc_delta_a True
-  --sc_sinkhorn_iters 64
+  --sc_prior_mode "$sc_prior_mode"
+  --sc_lambda_mode "$sc_lambda_mode"
+  --sc_lambda_init "$sc_lambda_init"
+  --sc_prior_rank "$sc_prior_rank"
+  --sc_delta_a "$sc_delta_a"
+  --sc_sinkhorn_iters "$sc_sinkhorn_iters"
   # ---- TFM 损失权重（方案 §20；λ_cpm=0 可退化 Stage 0 基线）----
-  --lambda_one 1.0
-  --lambda_cpm 1.0
-  --lambda_pcc 0.1
-  --cpm_gamma 1.0                    # 1=逐 horizon 均匀权重
-  --cpm_huber_delta 1.0
-  # ---- P0 损失扩展（默认关；见文件顶部环境变量说明）----
+  --lambda_one "$lambda_one"
+  --lambda_cpm "$lambda_cpm"
+  --lambda_pcc "$lambda_pcc"
+  --loss_weighting "$loss_weighting"
+  --cpm_gamma "$cpm_gamma"           # 1=逐 horizon 均匀权重
+  --cpm_huber_delta "$cpm_huber_delta"
+  # ---- P0 损失扩展（默认=E2；见文件顶部环境变量说明）----
   --lambda_temporal_diff "$lambda_temporal_diff"
   --lambda_cross_head "$lambda_cross_head"
   --cross_head_start_epoch "$cross_head_start_epoch"
   --cpm_horizon_weight "$cpm_horizon_weight"
   --cpm_horizon_alpha "$cpm_horizon_alpha"
-  --norm True                        # Context-only RevIN（方案 §15）
-  --dropout 0.1
+  --norm "$norm"                     # Context-only RevIN（方案 §15）
+  --dropout "$dropout"
   # ---- 优化与训练规模 ----
   --train_epochs "$train_epochs"
   --warmup_epochs "$warmup_epochs"
@@ -168,40 +152,47 @@ ARGS=(
   --lr_init "$lr_init"
   --lr_peak "$lr_peak"
   --lr_final "$lr_final"
-  --weight_decay 0.01
-  --grad_clip 1.0
-  --use_ema True
-  --amp True
+  --weight_decay "$weight_decay"
+  --grad_clip "$grad_clip"
+  --use_ema "$use_ema"
+  --ema_decay "$ema_decay"
+  --amp "$amp"
   --num_workers "$num_workers"       # 见文件顶部 PIN_MEMORY/NUM_WORKERS 说明
   --pin_memory "$pin_memory"
   --eval_batch_size "${EVAL_BATCH_SIZE:-512}"  # 仅影响验证吞吐；降低 Val 峰值内存
   --subject_cache_size 4096         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
   --train_samples_per_subject 0    # 0=auto（每被试每 epoch min(合法组合数, 12)）
   --sampling_seed "$sampling_seed"
+  --val_ratio "$val_ratio"
+  --test_ratio "$test_ratio"
   # --refresh_split_manifest 是 store_true 开关（不接受取值），默认 False 不刷新
 )
 
 # ---- 本轮条件注入（选定方案：hc3 + demo）----
 ARGS+=(
-  --condition_group hc3 --condition_arm demo     # hc3 无新增字段，结构上只能用 demo
+  --condition_group "$cond_group_pretrain" --condition_arm "$cond_arm_pretrain"
+  --cond_inject "$cond_inject" --cond_dim "$cond_dim"
+  --cond_d_demo "$cond_d_demo" --cond_d_new "$cond_d_new"
+  --cond_h_delta "$cond_h_delta" --cond_delta_style "$cond_delta_style"
+  --cond_dropout_p "$cond_dropout_p"
   --cond_dropout_seed "$cond_dropout_seed"
 )
 # ---- graph_ode 动态路线（方案 §2 默认参数；twin 家族固定口径）----
 ARGS+=(
-  --dynamics_mode graph_ode        # 受控条件图 ODE（Heun RK2 同步 z/q）
-  --graph_source history_fc        # 功能耦合图来自当前可见历史，不要求 Mask
-  --bold_source raw                # Raw/HC/ROISignals_<id>.mat，前 32 TR 校准
-  --personalized True              # 固定基线个体 profile
-  --profile_dim 32
-  --calibration_length 32          # Raw 标准化与 profile 用同一前缀
-  --ode_steps 2
-  --dynamics_dt 1.0
-  --lambda_dynamics 0.5
-  --lambda_variance 0.05
+  --dynamics_mode "$dynamics_mode"  # 受控条件图 ODE（Heun RK2 同步 z/q）
+  --graph_source "$graph_source"    # 功能耦合图来自当前可见历史，不要求 Mask
+  --bold_source "$bold_source"      # Raw/HC/ROISignals_<id>.mat，前 32 TR 校准
+  --personalized "$personalized"    # 固定基线个体 profile
+  --profile_dim "$profile_dim"
+  --calibration_length "$calibration_length"  # Raw 标准化与 profile 用同一前缀
+  --ode_steps "$ode_steps"
+  --dynamics_dt "$dynamics_dt"
+  --lambda_dynamics "$lambda_dynamics"
+  --lambda_variance "$lambda_variance"
   --dynamics_history_memory "$dynamics_history_memory"
 )
-# 宽度不在这里重复字面量：main.py 的 argparse 默认就是锚点
-# (d_demo=16, d_new=16, C=32, H_delta=64, delta_style=mlp, dropout_p=0, inject=heads)。
+# 条件宽度来自 JSON；HC 预训练由 main.py 将 tfm_patho_mode 强制置为 none，
+# JSON 的 film 只描述 MDD 微调阶段，因此这里不传 --tfm_patho_mode。
 # HC 侧**不带** --pretrained_weight：主干从随机初始化训练（方案 §一.1）。
 if [[ -n "$DEVICE" ]]; then
   ARGS+=(--device "$DEVICE")

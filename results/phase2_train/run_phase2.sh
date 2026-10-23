@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# S2 正式基线复训脚本（S0 = E2 对照；S1/S3 路线已随 2026-10-22 定型淘汰，如需
-# 复现见 git 历史）。每臂训练结束后自动跑 next-state 评估与 D1/D2 状态刷新诊断。
-# 与 E2 同口径：LAMBDA_TEMPORAL_DIFF=0.05、LAMBDA_CROSS_HEAD=0.02、相同 seed。
+# S2 正式基线复训脚本：训练结束后自动跑 next-state 评估与 D1/D2 状态刷新诊断。
+# 历史 S0（=E2）/S1/S3 的配置与结果见 docs/EXPERIMENTS.md §4；当前只复现 S2。
+# 训练配方由 configs/baseline_s2_e2.json 提供；PYTHON 可指向项目 mamba 解释器。
 set -u
-ROOT=/data3/Digital_Brain/NeuroTwin
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-export PYTHON=/home/user/anaconda3/envs/mamba/bin/python
+export PYTHON="${PYTHON:-python}"
 export PYTHONIOENCODING=utf-8
-export LAMBDA_TEMPORAL_DIFF=0.05
-export LAMBDA_CROSS_HEAD=0.02
+"$PYTHON" -c 'import torch' 2>/dev/null || {
+  echo "[错误] $PYTHON 无法导入 torch；请用 PYTHON=<项目环境解释器> 指定" >&2
+  exit 1
+}
 # 数据加载：关闭 pin_memory、降低 worker 数，规避长任务中 pin-memory/resource_sharer
 # 线程在临时 socket 消失后中断训练（只影响吞吐，不影响结果）。
 export NUM_WORKERS="${NUM_WORKERS:-6}"
@@ -36,12 +38,12 @@ eval_arm () {  # $1=arm, $2=device
       || echo "[phase2] $arm refresh FAILED"
 }
 
-run_arm () {  # $1=arm, $2=device, $3=history_memory（S1 反馈已随 2026-10-22 定型移除）
-  local arm="$1" dev="$2" hmem="$3"
+run_arm () {  # $1=arm, $2=device（训练配方来自 baseline JSON；S1 反馈已移除）
+  local arm="$1" dev="$2"
   export CHECKPOINT_DIR="$ROOT/checkpoints/phase2_$arm"
-  export DEVICE="$dev" DYNAMICS_HISTORY_MEMORY="$hmem"
+  export DEVICE="$dev"
   mkdir -p "$CHECKPOINT_DIR" "$LOG" "$ROOT/results/phase2"
-  echo "[phase2] $arm start $(date -Is) device=$dev hmem=$hmem workers=$NUM_WORKERS pin=$PIN_MEMORY"
+  echo "[phase2] $arm start $(date -Is) device=$dev workers=$NUM_WORKERS pin=$PIN_MEMORY"
   bash scripts/Pretrain_HC_tfm.sh > "$LOG/${arm}_pretrain.log" 2>&1 \
     && bash scripts/Finetune_MDD_tfm.sh > "$LOG/${arm}_finetune.log" 2>&1 \
     || { echo "[phase2] $arm TRAIN FAILED $(date -Is)"; return 1; }
@@ -50,14 +52,9 @@ run_arm () {  # $1=arm, $2=device, $3=history_memory（S1 反馈已随 2026-10-2
   echo "[phase2] $arm done $(date -Is)"
 }
 
-run_arm S2 cuda:1 True & P2=$!
-wait "$P2"
-# 等前两臂的 CUDA 上下文与共享内存完全释放后再启动 S3，避免残留显存导致 OOM
-sleep 120
-for _ in $(seq 1 30); do
-  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0)
-  [ "$used" -lt 3000 ] && break
-  echo "[phase2] waiting cuda:0 release: ${used} MiB"
-  sleep 20
-done
+run_arm S2 cuda:1 & P2=$!
+if ! wait "$P2"; then
+  echo "[phase2] S2 FAILED $(date -Is)" >&2
+  exit 1
+fi
 echo "[phase2] all done $(date -Is)"

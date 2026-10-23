@@ -987,6 +987,7 @@ def write_csvs(report: Dict, test: Dict[str, np.ndarray], subj_idx,
 
     ``metrics`` 为 ``evaluate_arrays`` 已算好的逐元素指标（集合模式必须传入，因为
     经验 CRPS/分位数区间无法由 mean+std 重算）；缺省时按解析高斯重新计算。
+    CSV 与 JSON 均先逐锚点归一化，再被试内平均，最后跨被试等权平均。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     mean = np.asarray(test['ode_pred'], dtype=np.float64)
@@ -1017,13 +1018,13 @@ def write_csvs(report: Dict, test: Dict[str, np.ndarray], subj_idx,
         for name in method_names:
             m = metrics[name]
             for key in _metric_keys(m):
-                row[f'{name}_{key}'] = _nanmean_or_nan(m[key][sel])
+                row[f'{name}_{key}'] = _nanmean_or_nan(reduce_tasks(m[key][sel]))
             for level in REPORT_LEVELS:
                 tag = f'{int(round(level * 100))}'
                 row[f'{name}_coverage{tag}'] = _nanmean_or_nan(
-                    m['coverage'][level][sel])
+                    reduce_tasks(m['coverage'][level][sel]))
                 row[f'{name}_width{tag}'] = _nanmean_or_nan(
-                    m['width'][level][sel])
+                    reduce_tasks(m['width'][level][sel]))
         if 'constant_roi_h' in method_names:
             row['delta_nll_model_minus_constant_roi_h'] = (
                 row['model_nll'] - row['constant_roi_h_nll'])
@@ -1068,13 +1069,14 @@ def write_csvs(report: Dict, test: Dict[str, np.ndarray], subj_idx,
                 row = {'subject_id': s, 'horizon': label, 'method': name,
                        'n_tasks': int(sel.sum())}
                 for key in _metric_keys(m):
-                    row[key] = _nanmean_or_nan(m[key][sel][:, :, hi:hi + 1])
+                    row[key] = _nanmean_or_nan(
+                        reduce_tasks(m[key][sel][:, :, hi:hi + 1]))
                 for level in REPORT_LEVELS:
                     tag = f'{int(round(level * 100))}'
                     row[f'coverage{tag}'] = _nanmean_or_nan(
-                        m['coverage'][level][sel][:, :, hi:hi + 1])
+                        reduce_tasks(m['coverage'][level][sel][:, :, hi:hi + 1]))
                     row[f'width{tag}'] = _nanmean_or_nan(
-                        m['width'][level][sel][:, :, hi:hi + 1])
+                        reduce_tasks(m['width'][level][sel][:, :, hi:hi + 1]))
                 long_rows.append(row)
     long_csv = out_dir / f'{prefix}_subject_horizon_metrics_test.csv'
     with long_csv.open('w', newline='', encoding='utf-8') as f:

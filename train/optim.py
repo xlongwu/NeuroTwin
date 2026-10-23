@@ -1,12 +1,13 @@
 # coding=utf-8
 """优化器、调度器、EMA 与预训练权重加载等训练基础设施。"""
+import math
 import os
 from copy import deepcopy
 from typing import List
 
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 
 from models import ARCH_VERSION
 from models.tfm import NeuroTwinTFM
@@ -589,6 +590,10 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
         for module in backbone_modules:
             for p in module.parameters():
                 p.requires_grad = True
+        if getattr(model, '_orig_mod', None) is not None:
+            # 冻结期编译的反向图可能继续省略主干梯度，即使 requires_grad 已改为 True。
+            # 清理缓存后由同一包装器重新编译；参数对象及 optimizer/EMA 状态保持不变。
+            torch.compiler.reset()
 
 
 def get_param_groups(model: NeuroTwinTFM, args):
@@ -643,18 +648,56 @@ def build_optimizer(model, criterion, args):
     return AdamW(groups, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
 
+class _RelativeCosineLR(LambdaLR):
+    """相对余弦调度；同时覆盖训练中途追加的参数组。
+
+    finetune 的 backbone 组在冻结期结束后才加入 optimizer，构造 scheduler 时
+    还不存在。只按 ``base_lrs`` 调度的实现会漏掉它，使其学习率保持恒定。
+    """
+
+    def sync_param_groups(self) -> None:
+        """把新增 optimizer 组纳入当前进度，并立即按当前因子设置学习率。"""
+        while len(self.base_lrs) < len(self.optimizer.param_groups):
+            group = self.optimizer.param_groups[len(self.base_lrs)]
+            base_lr = float(group['lr'])
+            self.base_lrs.append(base_lr)
+            self.lr_lambdas.append(self.lr_lambdas[0])
+            group['lr'] = base_lr * self.lr_lambdas[0](self.last_epoch)
+
+    def step(self, epoch=None):
+        self.sync_param_groups()
+        return super().step(epoch)
+
+
 def build_scheduler(optimizer, args):
-    """Linear Warmup + CosineAnnealing；无 warmup 时直接余弦。"""
-    if args.warmup_epochs > 0:
-        start_factor = max(1e-4, args.lr_init / args.lr_peak)
-        return SequentialLR(optimizer, schedulers=[
-            LinearLR(optimizer, start_factor=start_factor, end_factor=1.0,
-                     total_iters=args.warmup_epochs),
-            CosineAnnealingLR(optimizer,
-                              T_max=max(1, args.train_epochs - args.warmup_epochs),
-                              eta_min=args.lr_final),
-        ], milestones=[args.warmup_epochs])
-    return CosineAnnealingLR(optimizer, T_max=max(1, args.train_epochs), eta_min=args.lr_final)
+    """Linear warmup + cosine decay with a per-group relative final LR.
+
+    ``CosineAnnealingLR`` applies one absolute ``eta_min`` to every group.  A
+    group whose base LR is below ``eta_min`` (e.g. the backbone at
+    ``lr_peak * backbone_lr_scale``) would then be pushed *up* during decay.
+    Using a relative factor keeps every group on its own peak-to-final path.
+    """
+    if args.lr_peak <= 0:
+        raise ValueError(f'lr_peak 必须 > 0，收到 {args.lr_peak}')
+    if not 0 <= args.lr_final <= args.lr_peak:
+        raise ValueError(
+            f'lr_final 必须位于 [0, lr_peak]（lr_peak={args.lr_peak}，'
+            f'lr_final={args.lr_final}）')
+
+    total_epochs = max(1, int(args.train_epochs))
+    warmup_epochs = max(0, int(args.warmup_epochs))
+    start_factor = max(1e-4, args.lr_init / args.lr_peak)
+    final_factor = args.lr_final / args.lr_peak
+
+    def lr_lambda(epoch: int) -> float:
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return start_factor + (1.0 - start_factor) * (epoch / warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return final_factor + (1.0 - final_factor) * cosine
+
+    return _RelativeCosineLR(optimizer, lr_lambda=lr_lambda)
 
 
 def count_trainable_params(model):

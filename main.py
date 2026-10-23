@@ -551,6 +551,11 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                 if hp >= 2:
                     meters['metric_variogram_dynamics'].append(
                         temporal_variogram_score(ps, ft, fm).detach())
+                    tv = temporal_variogram_score(ps, ft, fm, lags=(1, 2, 4), power=0.5)
+                    meters['metric_temporal_variogram_p05'].append(tv.detach())
+                    meters['metric_probability_joint'].append((
+                        args.s4_crps_weight * ensemble_crps(ps, ft, fm)
+                        + getattr(args, 's4_variogram_weight', 0.0) * tv).detach())
         graph_reg, graph_stats = compute_graph_regularization(
             aux_info, device,
             sparsity_weight=args.sc_sparsity_weight,
@@ -1057,6 +1062,62 @@ def main(args):
 
     # TFM 双目标损失（方案 §20）：L_one = Huber + λ_pcc(1-PCC)；
     # L_CPM = γ 加权逐 horizon Huber。不再使用数学等价的 abs+delta 双计。
+    if args.s4_variogram_weight == -1:
+        # A small, train-only pilot fixes lambda before any optimizer update.
+        # Separate zero-worker loader plus RNG restoration preserves the P0/P1
+        # initialization and subsequent training sampling sequence.
+        import random
+        import numpy as np
+        import itertools
+        np_state, py_state = np.random.get_state(), random.getstate()
+        was_training = model.training
+        pilot = torch.utils.data.DataLoader(
+            train_data.dataset, batch_sampler=train_data.batch_sampler,
+            collate_fn=train_data.collate_fn, num_workers=0)
+        crps_sum, tv_sum, n_pilot = 0.0, 0.0, 0
+        try:
+            with torch.random.fork_rng(), torch.no_grad():
+                model.eval()
+                for batch in itertools.islice(pilot, 4):
+                    bx, _, _, _, bs, bp = next_point_batch(batch, device)
+                    bcal, bctl = dynamics_extras(batch, device)
+                    _, aux = model(bx, bs, bp, condition=condition_batch(batch, device),
+                                   controls=bctl, calibration_bold=bcal)
+                    ps = aux['dynamics_samples']
+                    target = batch['future'].to(device)
+                    mask = batch['future_mask'].to(device)
+                    crps_sum += float(ensemble_crps(ps, target, mask))
+                    tv_sum += float(temporal_variogram_score(
+                        ps, target, mask, lags=(1, 2, 4), power=0.5))
+                    n_pilot += 1
+        finally:
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+            model.train(was_training)
+        if not n_pilot or not math.isfinite(tv_sum) or tv_sum <= 0:
+            raise ValueError('P1 pilot has no finite positive temporal variogram')
+        args.s4_variogram_weight = 0.05 * crps_sum / tv_sum
+        args.s4_variogram_calibration = dict(
+            batches=n_pilot, crps=crps_sum/n_pilot, variogram=tv_sum/n_pilot,
+            target_loss_ratio=0.05, source='train-only initialization; no optimizer updates')
+        print(f'[P1] fixed train-only lambda_v={args.s4_variogram_weight:.8g}; '
+              f'pilot={args.s4_variogram_calibration}')
+
+    if args.temporal_mode == 'adaptive' and args.adaptive_delta_scale <= 0:
+        # Read only MDD-train subjects, in the calibrated data space used by loss.
+        # This does not iterate the random training sampler or consume its RNG.
+        import numpy as np
+        delta_sum, delta_count = 0.0, 0
+        for subject_id in dl.get_train_subjects():
+            series = dl.base_dataset.get_series(subject_id)
+            differences = np.abs(np.diff(series, axis=-1))
+            delta_sum += float(differences.sum(dtype=np.float64))
+            delta_count += differences.size
+        if not delta_count or delta_sum <= 0:
+            raise ValueError('train-only delta scale is empty or zero')
+        args.adaptive_delta_scale = delta_sum / delta_count
+        print(f'[loss] train-only mean absolute delta scale={args.adaptive_delta_scale:.8g}')
+
     criterion = TFMDualLoss(
         lambda_one=args.lambda_one, lambda_cpm=args.lambda_cpm,
         lambda_pcc=args.lambda_pcc, cpm_gamma=args.cpm_gamma,
@@ -1065,10 +1126,19 @@ def main(args):
         lambda_variance=args.lambda_variance,
         weighting=getattr(args, 'loss_weighting', 'fixed'),
         lambda_temporal_diff=args.lambda_temporal_diff,
+        lambda_temporal_pcc=getattr(args, 'lambda_temporal_pcc', 0.0),
         lambda_cross_head=args.lambda_cross_head,
         cpm_horizon_weight=args.cpm_horizon_weight,
         cpm_horizon_alpha=args.cpm_horizon_alpha,
         cross_head_start_epoch=args.cross_head_start_epoch,
+        temporal_mode=args.temporal_mode,
+        temporal_lags=tuple(map(int, args.temporal_lags.split(','))),
+        temporal_scale_weights=tuple(map(float, args.temporal_scale_weights.split(','))),
+        adaptive_delta_alpha=args.adaptive_delta_alpha,
+        adaptive_delta_clip=args.adaptive_delta_clip,
+        adaptive_delta_scale=args.adaptive_delta_scale,
+        dynamics_horizon_weight=args.dynamics_horizon_weight,
+        horizon_weight_power=args.horizon_weight_power,
     ).to(device)
     print(f"[TFM] 损失: lambda_one={args.lambda_one} "
           f"lambda_cpm={args.lambda_cpm} lambda_pcc={args.lambda_pcc} "
@@ -1076,6 +1146,7 @@ def main(args):
           f"lambda_dynamics={args.lambda_dynamics} "
           f"lambda_variance={args.lambda_variance} | "
           f"lambda_temporal_diff={args.lambda_temporal_diff} "
+          f"lambda_temporal_pcc={args.lambda_temporal_pcc} "
           f"lambda_cross_head={args.lambda_cross_head} "
           f"cpm_horizon_weight={args.cpm_horizon_weight}（α={args.cpm_horizon_alpha}）| "
           f"cpm_horizon={args.cpm_horizon}（One-Step + CPM 双头，方案 §9/§20）")
@@ -1159,6 +1230,7 @@ def main(args):
             backbone_unfrozen = True
             # 解冻只追加新可训练参数：已训练条件参数的 Adam 状态与 LR 进度必须保留
             added, names = unfreeze_while_preserving_state(model, optimizer, args)
+            scheduler.sync_param_groups()
             print(f"Epoch {epoch+1}: 已解冻主干，新增可训练参数 numel={added} "
                   f"groups={names}，可训练参数量 = {count_trainable_params(model)}"
                   f"（沿用现有 optimizer 状态与 scheduler 进度）")
@@ -1210,6 +1282,7 @@ def main(args):
                             model, by_roll, aux_info.get('norm_stats', None)),
                     )
                 prob_loss = None
+                variogram_loss = outputs.new_zeros(())
                 if s4_active:
                     prob_samples = aux_info.get('dynamics_samples', None)
                     if not torch.is_tensor(prob_samples):
@@ -1224,6 +1297,10 @@ def main(args):
                     prob_loss = ensemble_crps(
                         prob_samples[:, :, :, :hp], by_roll[:, :, :hp],
                         bm_roll[:, :hp])
+                    if args.s4_variogram_weight > 0:
+                        variogram_loss = temporal_variogram_score(
+                            prob_samples[:, :, :, :hp], by_roll[:, :, :hp],
+                            bm_roll[:, :hp], lags=(1, 2, 4), power=0.5)
                 if s4_active and args.s4_stage == 'head' and not backbone_unfrozen:
                     # stage 1：只回传 CRPS，不计算/不反传 S2 点预测损失与损失权重参数
                     zero = outputs.new_zeros(())
@@ -1246,6 +1323,13 @@ def main(args):
                     if prob_loss is not None:
                         total_loss = total_loss + args.s4_crps_weight * prob_loss
                         loss_stats['loss_crps'] = prob_loss.detach()
+
+                if prob_loss is not None:
+                    total_loss = total_loss + args.s4_variogram_weight * variogram_loss
+                    loss_stats['loss_temporal_variogram'] = variogram_loss.detach()
+                    loss_stats['loss_probability_joint'] = (
+                        args.s4_crps_weight * prob_loss
+                        + args.s4_variogram_weight * variogram_loss).detach()
 
             scaler.scale(total_loss).backward()
 
@@ -1423,6 +1507,14 @@ def main(args):
         if 'metric_variogram_dynamics' in val_metrics:
             tb_scalars.append(('Val/Dynamics_VariogramScore',
                                val_metrics['metric_variogram_dynamics']))
+        for key in ('metric_temporal_variogram_p05', 'metric_probability_joint'):
+            if key in val_metrics:
+                tb_scalars.append((f'Val/{key}', val_metrics[key]))
+        if 'loss_temporal_pcc' in train_metrics:
+            writer.add_scalar('Train/Temporal_PCC', train_metrics['loss_temporal_pcc'], epoch)
+        for key in ('loss_temporal_variogram', 'loss_probability_joint'):
+            if key in train_metrics:
+                writer.add_scalar(f'Train/{key}', train_metrics[key], epoch)
         for h, key in sorted((h, f'rollout_mae_H{h}')
                              for h in (eval_rollout_horizons or [])):
             if key in val_metrics:
@@ -1833,6 +1925,21 @@ def parse_args():
     # ---- P0 损失扩展：时间差分 / 双头一致性 / horizon 权重策略 ----
     # 默认 λ=0、策略=gamma，与既有训练行为逐位一致；启用后为固定权重项，
     # 不进入 weighting='uncertainty' 聚合（只作用于 one/CPM/dynamics/variance）。
+    p.add_argument('--loss_experiment_id', default='')
+    p.add_argument('--temporal_mode', choices=['standard', 'adaptive', 'multiscale'], default='standard')
+    p.add_argument('--temporal_lags', default='1')
+    p.add_argument('--temporal_scale_weights', default='1.0')
+    p.add_argument('--adaptive_delta_alpha', type=float, default=0.5)
+    p.add_argument('--adaptive_delta_clip', type=float, default=3.0)
+    p.add_argument('--adaptive_delta_scale', type=float, default=0.0,
+                   help='Positive fixed train-only scale; 0 estimates mean absolute delta on train subjects.')
+    p.add_argument('--dynamics_horizon_weight', type=str2bool, default=False)
+    p.add_argument('--horizon_weight_power', type=float, default=1.0)
+    p.add_argument('--s4_variogram_weight', type=float, default=0.0,
+                   help='0=CRPS only; -1=fix lambda from four train pilot batches at 5% CRPS scale.')
+    p.add_argument('--lambda_temporal_pcc', type=float, default=0.0,
+                   help='Fixed weight for CPM+ODE future-trajectory temporal PCC; 0 disables. '
+                        'At least 3 valid future points and nonconstant targets are required.')
     p.add_argument('--lambda_temporal_diff', type=float, default=0.0,
                    help='P0 一阶时间差分 Huber 权重（CPM + graph_ode 轨迹，'
                         '第一步参考真值历史末帧 x_t；0=禁用）。')
@@ -1885,6 +1992,10 @@ def parse_args():
                         '避免把采样运气当成模型改进；非 S4 运行不生效。')
 
     args = p.parse_args()
+    if not math.isfinite(args.s4_variogram_weight) or (args.s4_variogram_weight < 0 and args.s4_variogram_weight != -1):
+        p.error('--s4_variogram_weight must be nonnegative or -1 (train-only calibration)')
+    if args.s4_variogram_weight != 0 and args.s4_variant != 's4_1':
+        p.error('P1 temporal variogram requires the existing s4_1 head')
     if args.s4_variant != 'off':
         if args.dynamics_mode != 'graph_ode':
             p.error('--s4_variant 仅支持 --dynamics_mode graph_ode')

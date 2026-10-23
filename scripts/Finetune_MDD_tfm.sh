@@ -79,41 +79,34 @@ if [[ -z "$HC_WEIGHT" ]]; then
 fi
 pretrained_weight="$HC_WEIGHT"
 
-# ---- 实验规模（与预训练保持一致的任务口径） ----
-# 随机来源只在 utils/condition_schema.py 登记一次（与 Pretrain 脚本同源，不抄字面量）
-read -r seed sampling_seed cond_dropout_seed < <(
-  PYTHONPATH=. "$PYTHON_BIN" -c 'from utils.condition_schema import (DROPOUT_SEED, MODEL_SEED, SAMPLING_SEED); print(MODEL_SEED, SAMPLING_SEED, DROPOUT_SEED)') \
-  || { echo "[错误] $PYTHON_BIN 读取 utils.condition_schema 的随机来源常量失败" >&2; exit 1; }
+# ---- 基线配方（configs/baseline_s2_e2.json 是唯一来源）----
+# 模型/损失/优化/条件共享值由 helper 导出；随机种子在 helper 内与
+# utils/condition_schema.py 的登记值逐项核对；阶段特有的 MDD 条件臂也在 JSON。
+source "$ROOT/scripts/_baseline_defaults.sh"
 if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
       || "$sampling_seed" == "$cond_dropout_seed" ]]; then
   echo "[错误] 随机来源未分离（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed）" >&2
   exit 1
 fi
-num_rois=116
-context_min=16
-context_max=64
+
+# ---- 评估协议（不属于训练配方，保持脚本内单点定义）----
 eval_context_length=64
 eval_anchors_per_subject=16
 eval_rollout_tasks_per_subject=2
 eval_rollout_horizons="1,2,4,8,16"
-tfm_dim=256
-tfm_layers=4
-tfm_heads=4
-tfm_patch_len=8
-cpm_horizon=8
 
-# ---- P0 损失扩展（默认=E2 正式基线；必须与预训练同口径）----
+# ---- 环境变量覆盖（消融/排程用）----
 # 微调启用时间差分/一致性时，HC 预训练也应使用相同开关，
 # 否则微调起点缺少对应监督。消融覆盖方式同 Pretrain_HC_tfm.sh：
 #   E0: LAMBDA_TEMPORAL_DIFF=0 LAMBDA_CROSS_HEAD=0 bash scripts/Finetune_MDD_tfm.sh
 #   E1: LAMBDA_TEMPORAL_DIFF=0.05 bash scripts/Finetune_MDD_tfm.sh
-lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-0.05}"
-lambda_cross_head="${LAMBDA_CROSS_HEAD:-0.02}"
-cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-5}"
-cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-gamma}"
-cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-0.5}"
+lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-$lambda_temporal_diff}"
+lambda_cross_head="${LAMBDA_CROSS_HEAD:-$lambda_cross_head}"
+cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-$cross_head_start_epoch}"
+cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-$cpm_horizon_weight}"
+cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-$cpm_horizon_alpha}"
 # ---- S2 历史记忆（正式基线默认开启；必须与预训练同口径）----
-dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-True}"
+dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-$dynamics_history_memory}"
 
 # ---- S4 概率轨迹（默认全部不追加，脚本行为与 S2 逐位一致）----
 #   S4-1 输出端相关残差：S4_VARIANT=s4_1 HC_WEIGHT=<S2 finetuned_best.pt> \
@@ -133,18 +126,11 @@ s4_noise_rank="${S4_NOISE_RANK:-8}"
 s4_noise_scale="${S4_NOISE_SCALE:-1e-2}"
 s4_ckpt_metric="${S4_CKPT_METRIC:-point}"
 
-train_epochs="${TRAIN_EPOCHS:-150}"
-warmup_epochs=15
+train_epochs="${TRAIN_EPOCHS:-$train_epochs}"
 # 数据加载并发（只影响吞吐，不影响训练结果）
 num_workers="${NUM_WORKERS:-6}"
 pin_memory="${PIN_MEMORY:-False}"
-batch_size=256
-patience=20
-lr_init=5e-5
-lr_peak=1e-4
-lr_final=5e-5
-freeze_backbone_epochs="${FREEZE_BACKBONE_EPOCHS:-10}"
-backbone_lr_scale=0.2
+freeze_backbone_epochs="${FREEZE_BACKBONE_EPOCHS:-$freeze_backbone_epochs}"
 
 # ---- 预检查 ----
 # graph_ode 路线用 raw + history_fc：只要求 Raw 目录与临床表，不要求 Mask，
@@ -171,7 +157,7 @@ ARGS=(
   --task_mode next_timepoint
   --context_min "$context_min"
   --context_max "$context_max"
-  --forecast_offsets 1
+  --forecast_offsets "$forecast_offsets"
   --eval_context_length "$eval_context_length"
   --eval_anchors_per_subject "$eval_anchors_per_subject"
   --eval_rollout_tasks_per_subject "$eval_rollout_tasks_per_subject"
@@ -184,32 +170,34 @@ ARGS=(
   --tfm_layers "$tfm_layers"
   --tfm_heads "$tfm_heads"
   --tfm_patch_len "$tfm_patch_len"
-  --tfm_ff_ratio 4
-  --tfm_one_step_hidden_dim 256
+  --tfm_ff_ratio "$tfm_ff_ratio"
+  --tfm_one_step_hidden_dim "$tfm_one_step_hidden_dim"
+  --tfm_patho_mode "$tfm_patho_mode"
   --cpm_horizon "$cpm_horizon"
-  --cpm_layers 2
-  --cpm_intervention False
+  --cpm_layers "$cpm_layers"
+  --cpm_intervention "$cpm_intervention"
   # ---- SC 软先验（与预训练一致）----
-  --sc_prior_mode soft_prior
-  --sc_lambda_mode global
-  --sc_lambda_init 0.7
-  --sc_prior_rank 12
-  --sc_delta_a True
-  --sc_sinkhorn_iters 64
+  --sc_prior_mode "$sc_prior_mode"
+  --sc_lambda_mode "$sc_lambda_mode"
+  --sc_lambda_init "$sc_lambda_init"
+  --sc_prior_rank "$sc_prior_rank"
+  --sc_delta_a "$sc_delta_a"
+  --sc_sinkhorn_iters "$sc_sinkhorn_iters"
   # ---- TFM 损失权重 ----
-  --lambda_one 1.0
-  --lambda_cpm 1.0
-  --lambda_pcc 0.1
-  --cpm_gamma 1.0
-  --cpm_huber_delta 1.0
-  # ---- P0 损失扩展（默认关；见文件顶部环境变量说明）----
+  --lambda_one "$lambda_one"
+  --lambda_cpm "$lambda_cpm"
+  --lambda_pcc "$lambda_pcc"
+  --loss_weighting "$loss_weighting"
+  --cpm_gamma "$cpm_gamma"
+  --cpm_huber_delta "$cpm_huber_delta"
+  # ---- P0 损失扩展（默认=E2；见文件顶部环境变量说明）----
   --lambda_temporal_diff "$lambda_temporal_diff"
   --lambda_cross_head "$lambda_cross_head"
   --cross_head_start_epoch "$cross_head_start_epoch"
   --cpm_horizon_weight "$cpm_horizon_weight"
   --cpm_horizon_alpha "$cpm_horizon_alpha"
-  --norm True
-  --dropout 0.1
+  --norm "$norm"
+  --dropout "$dropout"
   # ---- 两阶段冻结（前期只训条件模块，后期解冻主干）----
   --freeze_backbone_epochs "$freeze_backbone_epochs"
   --backbone_lr_scale "$backbone_lr_scale"
@@ -221,21 +209,28 @@ ARGS=(
   --lr_init "$lr_init"
   --lr_peak "$lr_peak"
   --lr_final "$lr_final"
-  --weight_decay 0.01
-  --grad_clip 1.0
-  --use_ema True
-  --amp True
+  --weight_decay "$weight_decay"
+  --grad_clip "$grad_clip"
+  --use_ema "$use_ema"
+  --ema_decay "$ema_decay"
+  --amp "$amp"
   --num_workers "$num_workers"       # 见文件顶部 PIN_MEMORY/NUM_WORKERS 说明
   --pin_memory "$pin_memory"
   --eval_batch_size "${EVAL_BATCH_SIZE:-512}"  # 仅影响验证吞吐；降低 Val 峰值内存
   --subject_cache_size 4096         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
   --train_samples_per_subject 0
   --sampling_seed "$sampling_seed"
+  --val_ratio "$val_ratio"
+  --test_ratio "$test_ratio"
 )
 
 # ---- 本轮条件注入（选定方案：mdd8 + cat）----
 ARGS+=(
-  --condition_group mdd8 --condition_arm cat   # 选定方案：逐字段独立编码 + cat 融合
+  --condition_group "$cond_group_finetune" --condition_arm "$cond_arm_finetune"
+  --cond_inject "$cond_inject" --cond_dim "$cond_dim"
+  --cond_d_demo "$cond_d_demo" --cond_d_new "$cond_d_new"
+  --cond_h_delta "$cond_h_delta" --cond_delta_style "$cond_delta_style"
+  --cond_dropout_p "$cond_dropout_p"
   --cond_dropout_seed "$cond_dropout_seed"
   # 统计量快照直接取自同一个 HC 起点权重文件：共享三字段的 median/IQR/类别词表逐位继承，
   # 不重新拟合（方案 §四）。
@@ -243,16 +238,16 @@ ARGS+=(
 )
 # ---- graph_ode 动态路线（与预训练严格同口径；twin 家族固定参数）----
 ARGS+=(
-  --dynamics_mode graph_ode
-  --graph_source history_fc        # 功能耦合图来自当前可见历史，不要求 Mask
-  --bold_source raw                # Raw/MDD/ROISignals_<id>.mat，前 32 TR 校准
-  --personalized True
-  --profile_dim 32
-  --calibration_length 32
-  --ode_steps 2
-  --dynamics_dt 1.0
-  --lambda_dynamics 0.5
-  --lambda_variance 0.05
+  --dynamics_mode "$dynamics_mode"
+  --graph_source "$graph_source"    # 功能耦合图来自当前可见历史，不要求 Mask
+  --bold_source "$bold_source"      # Raw/MDD/ROISignals_<id>.mat，前 32 TR 校准
+  --personalized "$personalized"
+  --profile_dim "$profile_dim"
+  --calibration_length "$calibration_length"
+  --ode_steps "$ode_steps"
+  --dynamics_dt "$dynamics_dt"
+  --lambda_dynamics "$lambda_dynamics"
+  --lambda_variance "$lambda_variance"
   --dynamics_history_memory "$dynamics_history_memory"
 )
 # ---- S4 概率轨迹参数（仅 S4_VARIANT!=off 时追加）----
