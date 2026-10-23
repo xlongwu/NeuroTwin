@@ -92,7 +92,7 @@ fi
 # ---- 评估协议（不属于训练配方，保持脚本内单点定义）----
 eval_context_length=64
 eval_anchors_per_subject=16
-eval_rollout_tasks_per_subject=2
+eval_rollout_tasks_per_subject="${EVAL_ROLLOUT_TASKS_PER_SUBJECT:-2}"
 eval_rollout_horizons="1,2,4,8,16"
 
 # ---- 环境变量覆盖（消融/排程用）----
@@ -131,6 +131,8 @@ train_epochs="${TRAIN_EPOCHS:-$train_epochs}"
 num_workers="${NUM_WORKERS:-6}"
 pin_memory="${PIN_MEMORY:-False}"
 freeze_backbone_epochs="${FREEZE_BACKBONE_EPOCHS:-$freeze_backbone_epochs}"
+cpm_horizon="${CPM_HORIZON:-$cpm_horizon}"
+batch_size="${BATCH_SIZE:-$batch_size}"
 
 # ---- 预检查 ----
 # graph_ode 路线用 raw + history_fc：只要求 Raw 目录与临床表，不要求 Mask，
@@ -174,6 +176,11 @@ ARGS=(
   --tfm_one_step_hidden_dim "$tfm_one_step_hidden_dim"
   --tfm_patho_mode "$tfm_patho_mode"
   --cpm_horizon "$cpm_horizon"
+  --dynamics_metric_horizon "${DYNAMICS_METRIC_HORIZON:-8}"
+  --train_anchor_max_offset "${TRAIN_ANCHOR_MAX_OFFSET:-0}"
+  --eval_anchor_min_future_steps "${EVAL_ANCHOR_MIN_FUTURE_STEPS:-0}"
+  --pretrained_horizon_policy "${PRETRAINED_HORIZON_POLICY:-require_match}"
+  --split_file "${SPLIT_FILE:-}"
   --cpm_layers "$cpm_layers"
   --cpm_intervention "$cpm_intervention"
   # ---- SC 软先验（与预训练一致）----
@@ -268,6 +275,9 @@ if [[ "$s4_variant" != "off" ]]; then
 fi
 if [[ -n "$DEVICE" ]]; then
   ARGS+=(--device "$DEVICE")
+fi
+if [[ "${EVAL_AFTER_TRAIN:-True}" == "False" ]]; then
+  ARGS+=(--no_eval_after_train)
 fi
 
 # 生效参数已随 checkpoint 的 config.args 快照保存，完整命令行只在 PRINT_CMD=1 时打印。

@@ -1057,7 +1057,9 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
             getattr(args, 'eval_rollout_tasks_per_subject', 2)),
         eval_rollout_steps=eval_rollout_steps(args, horizons),
         train_rollout_steps=0,
-        eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
+        eval_all_future_steps=max(int(getattr(args, 'cpm_horizon', 0) or 0),
+                                  int(getattr(args, 'dynamics_metric_horizon', 0) or 0)),
+        eval_anchor_min_future_steps=int(getattr(args, 'eval_anchor_min_future_steps', 0)),
         # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
         num_rois=int(getattr(args, 'num_rois', 116)),
         graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
@@ -1078,7 +1080,8 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
             context_length=loader.eval_context_length,
             anchors_per_subject=loader.eval_anchors_per_subject,
             rollout_tasks_per_subject=0, rollout_steps=0,
-            all_future_steps=loader.eval_all_future_steps)
+            all_future_steps=loader.eval_all_future_steps,
+            anchor_min_future_steps=loader.eval_anchor_min_future_steps)
         kwargs = dict(batch_size=loader.eval_batch_size, shuffle=False,
                       num_workers=loader.num_workers,
                       pin_memory=loader.pin_memory)
@@ -1091,7 +1094,8 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
 
 @torch.no_grad()
 def run_inference(model, data_loader, device, offsets, rollout_steps,
-                  ar1=None, eval_rollout=True, collect_cpm=False):
+                  ar1=None, eval_rollout=True, collect_cpm=False,
+                  dynamics_horizon=None):
     """跑一遍 next_state 评估集，收集模型/基线预测与 rollout 子集。
 
     返回 dict（numpy）：
@@ -1112,7 +1116,7 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
     """
     model.eval()
     from main import _index_condition, dynamics_extras
-    dyn_h = int(getattr(model, 'cpm_horizon', 0) or 0) or 8
+    dyn_h = int(dynamics_horizon or getattr(model, 'cpm_horizon', 0) or 8)
     chunk = defaultdict(list)
     for batch in tqdm(data_loader, desc='[NextPoint eval]', leave=False):
         x = batch['x'].to(device, non_blocking=True)              # [B,F,1,K]
@@ -1140,7 +1144,9 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
 
         pred, aux_info = model(x, sc, pathology, condition=cond,
                                controls=(bctl[:, :dyn_h] if bctl is not None else None),
-                               calibration_bold=bcal)                  # [B,F,H,1]
+                               calibration_bold=bcal,
+                               **({'dynamics_horizon': dyn_h}
+                                  if dynamics_horizon is not None else {}))
         pred = pred[:, :, :, 0]                                   # [B,F,H]
         bases = baseline_next_state(x_last, x_prev, offsets, ar1=ar1)
 

@@ -500,6 +500,8 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
     cpm_acc = defaultdict(lambda: [0.0, 0, 0])       # h -> [Σ|err|, Σw, n_elem]
     rollout_hs = [int(h) for h in (rollout_horizons or []) if int(h) <= int(rollout_steps)]
     horizon = int(getattr(model, 'cpm_horizon', 0) or args.cpm_horizon)
+    dyn_horizon = (max(horizon, dyn_metric_horizon)
+                   if getattr(model, 'dynamics_mode', 'discrete') == 'graph_ode' else horizon)
     pbar = make_pbar(data_loader, len(data_loader), '[Val-TFM]')
 
     for batch in pbar:
@@ -512,8 +514,10 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                                   pathology_epoch=pathology_epoch,
                                   condition=cond,
                                   condition_epoch=None,              # 验证：关闭随机 Dropout
-                                  controls=(bctl[:, :horizon] if bctl is not None else None),
-                                  calibration_bold=bcal)
+                                  controls=(bctl[:, :dyn_horizon] if bctl is not None else None),
+                                  calibration_bold=bcal,
+                                  **({'dynamics_horizon': dyn_horizon}
+                                     if dyn_horizon > horizon else {}))
         cpm_pred = aux_info['cpm_pred']                              # [B,F,H]
         cpm_target = fut[:, :, :horizon]                             # [B,F,H]
         if bctl is not None:
@@ -525,13 +529,14 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
         if aux_info.get('dynamics_pred', None) is not None:
             norm_stats = aux_info.get('norm_stats', None)
             dyn_kwargs = dict(
-                dynamics_pred=aux_info['dynamics_pred'],
+                dynamics_pred=aux_info['dynamics_pred'][:, :, :horizon],
                 dynamics_target=cpm_target,                          # 数据尺度 [B,F,H]
                 dynamics_mask=fmask[:, :horizon],                    # 完整 future_mask
-                dynamics_mean_norm=aux_info.get('dynamics_mean_norm', None),
-                dynamics_logvar_norm=aux_info.get('dynamics_logvar_norm', None),
                 dynamics_target_norm=_normalized_future(model, cpm_target, norm_stats),
             )
+            for key in ('dynamics_mean_norm', 'dynamics_logvar_norm'):
+                value = aux_info.get(key)
+                dyn_kwargs[key] = value[:, :, :horizon] if value is not None else None
         total_loss, loss_stats = criterion(outputs, by, cpm_pred,
                                            cpm_target, cpm_mask,
                                            context_last=bl, epoch=loss_epoch,
@@ -833,6 +838,10 @@ def main(args):
           f"锚点/被试={args.eval_rollout_tasks_per_subject}")
 
     cond_enabled = bool(getattr(args, 'condition_arm', None) not in (None, '', 'none'))
+    if args.pretrained_horizon_policy != 'require_match' and (
+            args.mode != 'finetune' or not cond_enabled or args.load_backbone_only
+            or args.s4_variant != 'off' or args.pretrained_arch_policy != 'require_match'):
+        raise ValueError('CPM horizon 扩展仅支持确定性条件微调的严格显式迁移路径')
     condition_group = (str(args.condition_group) if getattr(args, 'condition_group', None)
                        else CONDITION_GROUP_BY_MODE.get(args.mode)) if cond_enabled else None
     if cond_enabled:
@@ -889,8 +898,9 @@ def main(args):
         eval_rollout_tasks_per_subject=args.eval_rollout_tasks_per_subject,
         eval_rollout_steps=eval_rollout_steps,
         train_rollout_steps=dims['cpm_horizon'],
-        train_anchor_max_offset=dims['cpm_horizon'],
-        eval_all_future_steps=dims['cpm_horizon'],
+        train_anchor_max_offset=(args.train_anchor_max_offset or dims['cpm_horizon']),
+        eval_all_future_steps=max(dims['cpm_horizon'], resolve_dynamics_metric_horizon(args)),
+        eval_anchor_min_future_steps=args.eval_anchor_min_future_steps,
         # graph_ode 动态路线的数据参数（方案 §4）：raw 源、可见历史 FC、
         # 校准前缀与控制 manifest；旧默认值下这些参数不改变任何行为
         num_rois=args.num_rois,
@@ -963,6 +973,7 @@ def main(args):
         s4_train_samples=args.s4_train_samples,
     ).to(device)
     s4_active = args.s4_variant != 'off'
+    migration_report = None
 
     if args.mode == 'finetune':
         if not os.path.exists(args.pretrained_weight):
@@ -1000,10 +1011,12 @@ def main(args):
             # 条件注入路径必须走**显式迁移器**：逐键归类并汇报，未分类键报错，
             # 不允许 strict=False + shape 过滤的静默忽略（方案 §8）
             check_pretrain_config_compat(args.pretrained_weight, dims,
-                                         arch_policy=args.pretrained_arch_policy)
-            migrate_pretrained_checkpoint(
+                                         arch_policy=args.pretrained_arch_policy,
+                                         horizon_policy=args.pretrained_horizon_policy)
+            migration_report = migrate_pretrained_checkpoint(
                 model, args.pretrained_weight, device,
                 arch_policy=args.pretrained_arch_policy,
+                horizon_policy=args.pretrained_horizon_policy,
                 # 同组同臂才比较完整 layout_hash；跨组（hc3→mdd8）的完整哈希本就
                 # 不同，上面已用 demo 子集哈希做过共享前缀校验
                 layout_expect=(model.conditioner.layout()['layout_hash']
@@ -1193,7 +1206,7 @@ def main(args):
         ckpt_metric_key = 'metric_crps_dynamics'
         ckpt_metric_name = 'val dynamics CRPS'
     elif args.dynamics_mode == 'graph_ode':
-        if dyn_metric_horizon > int(dims['cpm_horizon']):
+        if s4_active and dyn_metric_horizon > int(dims['cpm_horizon']):
             raise ValueError(
                 f'--dynamics_metric_horizon={dyn_metric_horizon} 超出模型的 '
                 f'--cpm_horizon={dims["cpm_horizon"]}：多步判据无法覆盖到第 '
@@ -1441,6 +1454,8 @@ def main(args):
                     'ckpt_metric_key': selector.metric_key,
                     'ckpt_metric_name': selector.metric_name,
                     'backbone_unfrozen': bool(backbone_unfrozen)}
+            if migration_report is not None:
+                meta['pretrained_migration'] = migration_report
             meta['condition'] = {
                 'config': condition_cfg_dict,
                 'stats': (dl.get_condition_stats().to_dict()
@@ -1624,6 +1639,10 @@ def parse_args():
     p.add_argument('--pretrained_skip_pattern', default='',
                    help='fnmatch 模式，命中的预训练键不加载（保留随机初始化），'
                          '用于受控消融对照，如 one_step_head.*')
+    p.add_argument('--pretrained_horizon_policy', default='require_match',
+                   choices=['require_match', 'repeat_last'],
+                   help='显式条件迁移的 CPM horizon 策略；repeat_last 复制已有行，'
+                        '新增行重复最后一行，其余形状冲突仍报错。')
     p.add_argument('--refresh_split_manifest', action='store_true',
                    help='重新生成 subject_split_<mode>.json 切分 manifest'
                         '（默认存在且配置一致时复用，配置不一致时报错）')
@@ -1876,6 +1895,10 @@ def parse_args():
                         '评估协议对每个被试使用同一 K_eval 与确定性 anchor，禁止随机位置。')
     p.add_argument('--eval_anchors_per_subject', type=int, default=16,
                    help='每个被试评估的 next-state 预测点数量（等间隔确定性选取；0=枚举全部）。')
+    p.add_argument('--eval_anchor_min_future_steps', type=int, default=0,
+                   help='评估锚点必须拥有的完整未来步数；0 保持原 H8 协议。')
+    p.add_argument('--train_anchor_max_offset', type=int, default=0,
+                   help='训练锚点所需未来长度；0 使用 cpm_horizon，对照可统一为 32。')
     p.add_argument('--eval_rollout_tasks_per_subject', type=int, default=2,
                    help='每个被试参与 free rollout / FC / 频谱评估的 anchor 数（0=不做 rollout）。')
     p.add_argument('--eval_rollout_horizons', default='1,2,4,8,16',
@@ -1958,7 +1981,8 @@ def parse_args():
                    default=DYNAMICS_CKPT_HORIZON,
                    help='graph_ode 选优指标覆盖的预测步数 N（H1..N，默认 8）；'
                         '指标键名随 N 变化（metric_mae_dynamics_h1_N_subject），'
-                        '且只纳入具备完整 N 步真值的锚点。必须 <= --cpm_horizon。')
+                        '且只纳入具备完整 N 步真值的锚点。确定性 Graph-ODE 可自由推进'
+                        '超过 cpm_horizon，训练监督范围仍由 cpm_horizon 决定。')
 
     # ---------- S4 概率轨迹（默认 off；开启时才构建新模块） ----------
     p.add_argument('--s4_variant', default='off', choices=['off', 's4_1', 's4_2'],

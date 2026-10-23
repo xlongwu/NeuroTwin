@@ -121,7 +121,8 @@ def saved_forecast_offsets(saved_args: dict) -> list:
 
 
 def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
-                                 arch_policy: str = 'require_match') -> None:
+                                 arch_policy: str = 'require_match',
+                                 horizon_policy: str = 'require_match') -> None:
     """校验预训练权重与当前运行的任务口径是否一致。
 
     不同 context_max / 预测偏移数对应的输入/输出 shape 不同；若直接交给
@@ -130,10 +131,14 @@ def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
     """
     if arch_policy not in ARCH_POLICIES:
         raise ValueError(f"Unsupported arch_policy '{arch_policy}', expected one of {ARCH_POLICIES}")
+    if horizon_policy not in ('require_match', 'repeat_last'):
+        raise ValueError(f'Unsupported horizon_policy {horizon_policy!r}')
     ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
     _, _, config = unwrap_state_dict(ckpt)
     saved_args = (config or {}).get('args', None) if isinstance(config, dict) else None
     if not isinstance(saved_args, dict):
+        if horizon_policy != 'require_match':
+            raise RuntimeError('CPM horizon 迁移需要 checkpoint config.args 快照')
         print(f"提示: {os.path.basename(str(pretrained_path))} 无 config.args 快照，"
               "跳过任务口径校验（仅按 shape 过滤加载权重）。")
         return
@@ -148,6 +153,12 @@ def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
         expected['cpm_horizon'] = int(expected_dims['cpm_horizon'])
     mismatch = {k: (saved.get(k), expected[k]) for k in expected
                 if saved.get(k) != expected[k]}
+    if horizon_policy == 'repeat_last' and 'cpm_horizon' in mismatch:
+        src_h, dst_h = mismatch['cpm_horizon']
+        if not 0 < src_h < dst_h:
+            raise RuntimeError(f'repeat_last 只允许扩展 CPM horizon：{src_h}→{dst_h}')
+        del mismatch['cpm_horizon']
+        print(f'[pretrain 兼容性] 显式 CPM horizon 迁移：{src_h}→{dst_h} (repeat_last)')
     if not mismatch:
         print(f"[pretrain 兼容性] 任务口径一致: {expected}")
         return
@@ -446,7 +457,7 @@ def classify_checkpoint_keys(model_state, ckpt_state, conditioning_prefixes):
 def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
                                   arch_policy='require_match',
                                   zero_expanded_keys=(), layout_expect=None,
-                                  layout_saved=None):
+                                  layout_saved=None, horizon_policy='require_match'):
     r"""显式迁移器：旧 checkpoint → 新结构，逐键归类并汇报（方案 §8）。
 
     与「``strict=False`` + shape 过滤」不同，本函数把每个键归入
@@ -463,6 +474,10 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
 
     ``layout_expect`` / ``layout_saved``：条件向量的 ``layout_hash``。**字段顺序
     参与哈希**，因此「同宽度但字段顺序变化」也会被拒绝（验收 K）。
+
+    ``horizon_policy='repeat_last'`` 仅显式扩展 CPM horizon embedding：保留
+    原有行并重复最后一行填充新步数；报告写入 ``horizon_expanded``，其余冲突
+    仍然报错。
     """
     if arch_policy not in ARCH_POLICIES:
         raise ValueError(f"Unsupported arch_policy '{arch_policy}'")
@@ -498,7 +513,30 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
                 | set(s4_module_prefixes(model)))
     cond_prefixes = tuple(sorted(prefixes))
     model_state = model.state_dict()
+    horizon_expanded = []
+    if horizon_policy not in ('require_match', 'repeat_last'):
+        raise ValueError(f'Unsupported horizon_policy {horizon_policy!r}')
+    if horizon_policy == 'repeat_last':
+        key = 'cpm_head.horizon_embed'
+        src, dst = state.get(key), model_state.get(key)
+        if src is None or dst is None or src.ndim != 2 or dst.ndim != 2:
+            raise RuntimeError(f'CPM horizon 迁移需要二维 {key}')
+        if src.shape != dst.shape:
+            saved_h = ((config or {}).get('args') or {}).get('cpm_horizon')
+            if (src.shape[1] != dst.shape[1] or not 0 < src.shape[0] < dst.shape[0]
+                    or saved_h != src.shape[0]):
+                raise RuntimeError(f'CPM horizon 无法扩展：{tuple(src.shape)}→{tuple(dst.shape)}')
+            expanded = src[-1:].expand_as(dst).clone()
+            expanded[:src.shape[0]].copy_(src)
+            state = dict(state)
+            state[key] = expanded
+            horizon_expanded.append({'key': key, 'source_steps': src.shape[0],
+                                     'target_steps': dst.shape[0], 'policy': horizon_policy})
+            print(f'[migrate] {key}: 复制 H1–{src.shape[0]}，'
+                  f'H{src.shape[0]+1}–{dst.shape[0]} 重复最后一行（无随机丢弃）')
     cls = classify_checkpoint_keys(model_state, state, cond_prefixes)
+    if horizon_policy != 'require_match' and cls['skipped']:
+        raise RuntimeError(f'CPM horizon 迁移存在无法加载的源参数：{cls["skipped"]}')
     zero_expanded = [k for k in cls['new_initialized'] if k in set(zero_expanded_keys)]
     plain_new = [k for k in cls['new_initialized'] if k not in set(zero_expanded_keys)]
     # zero_expanded 键允许在 checkpoint 中存在但形状不同（按零填充扩展）
@@ -527,6 +565,7 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
         'new_initialized': plain_new, 'zero_expanded': zero_expanded,
         'skipped': cls['skipped'], 'missing': cls['missing'],
         'arch_version': arch_version, 'file': fname,
+        'horizon_expanded': horizon_expanded,
     }
     print(f"[migrate] {fname}（arch_version={arch_version}）| loaded/copied="
           f"{report['loaded']} | new_initialized={len(plain_new)} | "

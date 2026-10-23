@@ -1,0 +1,23 @@
+{
+  "pid": 3547125,
+  "device": "physical GPU0 / cuda:0",
+  "config": "results/long_horizon/h32_supervision/run_20261023_103300/run_config.json",
+  "completed": [],
+  "phase": "failed",
+  "updated_at": "2026-10-23T10:37:45.849063+08:00",
+  "command": [
+    "/home/user/anaconda3/envs/DiffNext/bin/python",
+    "-u",
+    "-m",
+    "experiments.long_horizon.train_supervision",
+    "--config",
+    "/data3/Digital_Brain/NeuroTwin/results/long_horizon/h32_supervision/run_20261023_103300/run_config.json",
+    "--arm",
+    "h32",
+    "--device",
+    "cuda:0",
+    "--execute"
+  ],
+  "child_pid": null,
+  "error": "train_h32 exited with code 1; see train_h32.log"
+}
