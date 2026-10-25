@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NeuroTwin-TFM 预训练（HC 队列，graph_ode 动态路线，方案 docs/Version4_docs_1012）
+# NeuroTwin-TFM 预训练（HC 队列，graph_ode 动态路线，方案 docs/EXPERIMENTS.md）
 #
 # 任务口径（graph_ode twin 家族 hc_demo_twin）：Raw BOLD（前 32 TR 固定 mu0/s0 校准）
 #   → 可见历史 FC → SoftAnatomicalPrior → TFM 四层主干
@@ -16,9 +16,10 @@
 #   #   CHECKPOINT_DIR=<输出目录>  默认 $ROOT/checkpoints（想隔离本轮产物就指到本轮目录）
 #   #   DEVICE=cuda:1              不给则沿用 main.py 的设备默认
 #   #   DATA_ROOT=<数据根目录>      默认 $ROOT/data
+#   #   SAVE_TRAINING_STATE=True   保存完整 epoch 状态；RESUME_TRAINING_STATE=<文件> 恢复
 #   #   PRINT_CMD=1                打印完整命令行（默认只打印关键参数摘要）
 #
-# 条件注入（2026-10-10 选定方案，见 TASK_HANDOFF §0.26）：HC 侧固定
+# 条件注入（2026-10-10 选定方案，见 docs/EXPERIMENTS.md）：HC 侧固定
 #   ``--condition_group hc3 --condition_arm demo``。hc3 只有共享三字段
 #   （Sex/Age/education），结构上不可能用融合臂（``build_condition_encoder`` 会直接拒），
 #   所以「cat」落在下游的 MDD 微调脚本里；两者共用同一个锚点宽度 C=32。
@@ -45,6 +46,8 @@ PYTHON_BIN="${PYTHON:-python}"
 data_root="${DATA_ROOT:-$ROOT/data}"
 checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
+RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-}"
+SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-False}"
 # 预训练产物的固定目录名：下游 scripts/Finetune_MDD_tfm.sh 按
 # ${name}*/base_best.pt 找起点，两处改名必须同步。
 # twin 家族命名（方案 §2.1）：hc_demo_twin / mdd_cat_twin，不与旧
@@ -196,6 +199,13 @@ ARGS+=(
 # HC 侧**不带** --pretrained_weight：主干从随机初始化训练（方案 §一.1）。
 if [[ -n "$DEVICE" ]]; then
   ARGS+=(--device "$DEVICE")
+fi
+if [[ "$SAVE_TRAINING_STATE" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ \
+      || -n "$RESUME_TRAINING_STATE" ]]; then
+  ARGS+=(--save_training_state)
+fi
+if [[ -n "$RESUME_TRAINING_STATE" ]]; then
+  ARGS+=(--resume_training_state "$RESUME_TRAINING_STATE")
 fi
 
 # 生效参数已随 checkpoint 的 config.args 快照保存，完整命令行只在 PRINT_CMD=1 时打印。

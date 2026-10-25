@@ -1,127 +1,90 @@
 # NeuroTwin
 
-基于个体化脑数字孪生的 BOLD 神经动力学预测模型：以连续 BOLD context 预测下一
-TR 全脑状态（116 ROI），支持多步自由推进、病理条件注入与概率轨迹预测研究。
+以可见 BOLD 历史预测未来 116 ROI 状态。当前保留的最优长程模型为
+**S2 History Memory + Graph-ODE + CPM，完整 H32 监督、原分组 E2 目标**。
 
-- 项目背景与设计溯源：`docs/Version3_docs_1003/`、`docs/Version4_docs_1012/`。
-- 正式实验记录与结论：`docs/EXPERIMENTS.md`。
-- 研究状态：任务 A 首轮研究完成、E2 保留；后续长时域研究见 `docs/RESEARCH_PLAN.md`。
+## 保留的模型与结果
 
-## 正式基线（2026-10-22 定型）
-
-**架构 = S2 History Memory + Graph-ODE + CPM；损失 = E2。**
-
-- TFM 主干（`models/tfm_backbone.py`、`models/tfm.py`）：patch=8、dim=256、
-  4 层 SC-guided encoder。
-- 受控 Graph-ODE 动力学头（`models/tfm_dynamics.py`）：Laplacian 扩散 +
-  FiLM 残差 + 控制门，Heun RK2 积分，附 S2 历史记忆 FiLM。
-- CPM 全 horizon 头：ROI × Horizon 查询一次输出 H=8。
-- 条件注入：HC `hc3/demo`、MDD `mdd8/cat`，双头 FiLM。
-- 损失：one/CPM/dynamics/variance（uncertainty 加权）+ Temporal Diff 0.05 +
-  Cross-Head Consistency 0.02（`train/losses.py`）。
-
-基线契约（结构/损失/种子/划分/权重 SHA256）唯一事实来源：
-`configs/baseline_s2_e2.json`。自检与加载入口：
-
-```bash
-python baseline.py                 # 构建 + strict 加载 + SHA256 校验
-python baseline.py --device cuda:0
-```
-
-## 环境与数据
-
-- Python 环境：带 PyTorch 的解释器（项目历史使用 mamba 环境），通过 `PYTHON=<path>` 指定。
-- 数据：REST-meta-MDD（`data/`，不入版本库），116 ROI BOLD + 临床表
-  `Rest-meta-MDD-V1V2-Merged-MDD.xlsx`；被试级 8:1:1 划分（manifest 记录
-  seed=2024，版本化 `data/subject_split_*.json`）。
-- 随机种子：模型 2024、采样 20261009、划分 2024（manifest 冻结）、
-  Condition Dropout 20261008（三条训练随机流互斥校验）。
-
-## 训练与推理
-
-```bash
-# 正式基线口径（两脚本从 configs/baseline_s2_e2.json 读取共享配方；
-# 消融用环境变量覆盖）
-bash scripts/Pretrain_HC_tfm.sh        # HC 预训练
-bash scripts/Finetune_MDD_tfm.sh       # MDD 微调（起点为本目录 HC 权重）
-
-# 完整编排（S2 臂复现入口，训练后自动评估+刷新诊断）
-# 若 `python` 不在 PATH，先指定项目解释器：PYTHON=<path-to-python>
-bash results/phase2_train/run_phase2.sh
-```
-
-> `data/` 与 `checkpoints/` 不入版本库；远程复现需先放置数据，并按
-> `configs/baseline_s2_e2.json` 的 SHA256 校验基线权重。
-
-评估与诊断：
-
-```bash
-# 统一评估入口（ckpt → 重建模型 → 指标/图落盘）
-python -m experiments.evaluate_variant --ckpt <ckpt> --out_dir <dir> --splits test
-
-# D1/D2 状态刷新诊断（长时域路线标准工具）
-python -m experiments.long_horizon.refresh_rollout --ckpt <ckpt> --split test --steps 8
-
-# S4 概率评估（K 集合 CRPS/Energy/Variogram/coverage/PIT）
-python -m analysis.s4_probabilistic_eval ...
-```
-
-历史冻结推理入口（V4 discrete 时代契约，独立于 S2 基线）：
-`python inference.py`（配置 `configs/final_model.json`，原始权重在
-`checkpoints/Version3_weights_and_results_1003/`）；当前 graph_ode 推理：
-`python inference_twin.py`。
-
-## Checkpoint
-
-| 位置 | 内容 |
+| 用途 | 路径 |
 |---|---|
-| `checkpoints/phase2_S2/` | **正式基线**（finetuned_best + HC pretrain，SHA256 见基线契约） |
-| `checkpoints/phase1_E2/` | E2 损失 / S0 对照臂 |
-| `checkpoints/phase4_S4_1/` | S4-1 概率头（历史对照） |
-| `checkpoints/Version*_*/` | 各版本冻结历史工件（勿动） |
-| `checkpoints/archive_e0_graph_ode_*` | E0 消融臂归档 |
+| 最优 H32 推理权重 | `checkpoints/final/h32_best.pt` |
+| H32 的 HC 预训练起点 | `checkpoints/phase2_S2/neurotwin_tfm_pretrain/base_best.pt` |
+| 现有 H8 基线契约所需权重 | `checkpoints/phase2_S2/neurotwin_tfm_finetune/finetuned_best.pt` |
+| 正式 val/test 结果、逐被试表与图 | [results/final](results/final/README.md) |
+| 权重 SHA256 与结果来源 | [manifest.json](results/final/manifest.json) |
 
-## 主要结果（225 test 被试；完整记录见 `docs/EXPERIMENTS.md`）
+H8 权重仅用于保持 `baseline.py` 及已有基线契约可用，不作为本轮最优长程模型。
+所有未采用候选、旧版本权重、长任务目录、重复日志和缓存已按清理要求移除。
+原始数据及 `data/` 中的划分清单保持不变。
 
-| 指标 | S2 基线 |
-|---|---:|
-| t+1 MAE / PCC | 0.08067 / 0.9945 |
-| ODE MAE（H1–8 / H8） | 0.5329 / 0.8025 |
-| Free rollout H8 MAE | 0.8106 |
+## 最优模型结果
 
-> 现有 S2 权重由学习率调度修复前的配方训练（详见 `docs/EXPERIMENTS.md` §9.5）；
-> 调度修复仅对后续重训生效，不应把现有指标当作修复后配方的复现结果。
-> 2026-10-23 又确认冻结期编译缓存会使解冻后的主干梯度继续缺失，现已在阶段切换时
-> 清理缓存（详见 `docs/EXPERIMENTS.md` §9 第 6 项）。现有 S2 指标属于历史条件适配器
-> 微调结果，不能作为有效解冻全模型的实验结论；修复后效果需重新训练评估。
+下表为同协议的 225 名被试、每人 16 个完整 K64/H32 锚点，被试等权 ODE MAE。
 
-关键结论：S2 相对 S0 多步 MAE −0.87%（p=2.1e-26）且单步不退化；E2 损失小幅
-稳定改善；多步退化主因是状态误差累积（D1 真值刷新后 H8 ≈ 0.081 平稳）；
-S4-1 改善概率边际但未超常数方差高斯基线（未合入主干）。
+| Split | H1–8 | H9–16 | H17–32 | H1–32 |
+|---|---:|---:|---:|---:|
+| val | 0.519091 | 0.857499 | 0.898595 | 0.793445 |
+| test | 0.518049 | 0.856258 | 0.896604 | 0.791879 |
 
-## 目录结构
+同 H32 网络、同预算监督对照确认长程监督的收益；但远期时间相关仍约 0.18，
+相对历史均值只改善约 3%。当前结果不证明临床病理因果、稳定跨访视个体机制或真实刺激响应。
+实验结论和负结果摘要见 [EXPERIMENTS.md](docs/EXPERIMENTS.md)。
 
+## 运行
+
+使用带 PyTorch、NumPy、pandas、SciPy 等项目依赖的 Python 环境。
+数据与权重不入 Git；远程运行需另行准备，权重按 manifest 校验。
+
+```bash
+# 单被试自然轨迹推理：替换 SUBJECT 为实际文件/临床表中的 ID
+python inference_twin.py \
+  --checkpoint checkpoints/final/h32_best.pt \
+  --raw data/Raw/MDD/ROISignals_SUBJECT.mat --subject_id SUBJECT \
+  --condition_file Rest-meta-MDD-V1V2-Merged-MDD.xlsx \
+  --horizon 32 --device cpu
+
+# 统一评价入口：这是重新评价命令，已有正式结果直接读取 results/final 即可
+python -m experiments.evaluate_variant \
+  --ckpt checkpoints/final/h32_best.pt --out_dir results/h32_eval --splits val
+
+# 旧 H8 基线的配置/strict 加载自检
+python baseline.py
 ```
-models/        正式模型（tfm 主干、graph_ode 动力学、概率头、条件机制）
-train/         损失与优化（losses、prob_losses、optim）
-utils/         数据加载与通用工具
-analysis/      统一分析评估（next_point_eval、s4_probabilistic_eval、metrics）
-configs/       baseline_s2_e2.json（正式基线）+ final_model.json（历史冻结契约）
-scripts/       正式训练入口（Pretrain_HC / Finetune_MDD）+ 基线配方 helper
-experiments/   evaluate_variant（统一评估）+ loss/ + long_horizon/（两条研究路线）
-results/       baseline/ + phase1-4（历史证据）+ loss/ + long_horizon/
-checkpoints/   正式权重与历史冻结工件
-tests/         当前有效实现的测试
-docs/          EXPERIMENTS.md、RESEARCH_PLAN.md、版本归档
+
+训练入口保留，不在清理或收尾时自动执行：
+
+```bash
+# 最优 H32 配方，保留原 run 的 BS64/eval128、种子、划分和其余科学参数
+# --execute 才会正式训练；默认仅打印命令
+python -m experiments.long_horizon.train_supervision --arm h32 --device cuda:0
+
+# 预训练与微调的通用入口
+bash scripts/Pretrain_HC_tfm.sh
+HC_WEIGHT=checkpoints/phase2_S2/neurotwin_tfm_pretrain/base_best.pt \
+  bash scripts/Finetune_MDD_tfm.sh
 ```
 
-## 后续开发
+`configs/long_horizon_h32.json` 来自所保留最优 run，未来输出写入
+`checkpoints/h32_runs/`、`results/h32_runs/`，不会覆盖 `final/`。
+完整 epoch 状态保存与恢复仍由 `SAVE_TRAINING_STATE` / `RESUME_TRAINING_STATE` 控制。
+旧最佳推理权重不能恢复历史 optimizer/RNG；worker 增强 RNG 与 CUDA/compile 逐位续接未验证。
 
-两条独立研究路线（互不合并中间状态，建议独立分支/worktree）：
+## 目录
 
-- **任务 A 损失函数优化：首轮研究完成，E2 保留**。L1–L3 不采用、P1 不定型；结果归档见 `docs/EXPERIMENTS.md` §6.1，不再追加 Loss 消融或多 seed。
-- **任务 B 长时域预测优化**：从 `experiments/long_horizon/` 与
-  `models/tfm_dynamics.py` 开始。
+```text
+main.py, models/, train/, utils/   训练与模型实现
+inference_twin.py                 Graph-ODE 持续状态推理
+baseline.py                      保留的 H8 契约入口
+analysis/                        公共评价与分析工具
+experiments/evaluate_variant.py  checkpoint 严格重建与统一评价
+experiments/long_horizon/         H32 训练/配对评价与状态刷新工具
+configs/, scripts/, tests/       配方、启动脚本和对应测试
+data/                            原始数据与划分，清理不修改
+checkpoints/final/                最优 H32 权重
+checkpoints/phase2_S2/            必需的 HC 起点与 H8 契约权重
+results/final/                   最优结果和压缩后的总实验数值摘要
+docs/                            实验结论、未解问题和清理说明
+```
 
-两者共用 S2 + E2 基线（`python baseline.py` 验证）与统一评估协议；范围边界与
-候选方案见 `docs/RESEARCH_PLAN.md`。
+[未解决问题](docs/RESEARCH_PLAN.md)仅作后续另行立项记录，不自动追加训练。
+[清理范围与检查](docs/CLEANUP.md)说明本次保留和删除内容。

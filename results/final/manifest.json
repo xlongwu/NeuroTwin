@@ -1,0 +1,66 @@
+{
+  "selected_model": "S2 History Memory + Graph-ODE + CPM, full H32 supervision, original split objective",
+  "status": "closed",
+  "cleanup_requested_by_user": true,
+  "created_at_utc": "2026-10-25T03:43:18.649860+00:00",
+  "weights": {
+    "selected_h32": {
+      "path": "checkpoints/final/h32_best.pt",
+      "sha256": "2645079664d7c399a29fb8bee44cbe26baa6cce6757e7691458ac10138d4d78b",
+      "bytes": 25078334
+    },
+    "hc_initialization": {
+      "path": "checkpoints/phase2_S2/neurotwin_tfm_pretrain/base_best.pt",
+      "sha256": "0e252be1af1750b35bd26a2112f66f6a0cb2ad6fa4249b7334d9cffdbb78d255",
+      "bytes": 24998842
+    },
+    "h8_baseline_contract": {
+      "path": "checkpoints/phase2_S2/neurotwin_tfm_finetune/finetuned_best.pt",
+      "sha256": "ff0b2d991dcad3c27d548837a4218a5f7521011b8477c8028784d377a2e0aada",
+      "bytes": 25052158
+    }
+  },
+  "results": {
+    "experiments_summary.json": {
+      "sha256": "d16f691a4007f239fe682c1a8eb6e87dd15b7d2795a6bf2f52c25b30d80f208e",
+      "bytes": 141685
+    },
+    "h8_baseline_metrics_test.json": {
+      "sha256": "b75efde1f2aa2bbd1f1eec604606901f552d0aac5b051e8ae1e9190de5d589ba",
+      "bytes": 126822
+    },
+    "metrics_test.json": {
+      "sha256": "fdc12462add03aa4996cab6be3112e2abf62aa727352017e0a97ce644a8e1105",
+      "bytes": 1020
+    },
+    "metrics_val.json": {
+      "sha256": "d3f9577efc058fe4395742fbe03587113bf7e1a18746a7a6fdfb9eadb1c5e263",
+      "bytes": 1019
+    },
+    "per_subject_test.csv": {
+      "sha256": "6f0ce0e4e632279bf74831b56b472f228f0bfb27c247730da15be05f5a41228a",
+      "bytes": 33314
+    },
+    "per_subject_val.csv": {
+      "sha256": "1a9a977e46cb2a131a27ff71af694df9162aec6144fba07fd5efdda30d925d6f",
+      "bytes": 33386
+    },
+    "source_run_config.json": {
+      "sha256": "82a95511986305ba9174d0ec98991cb89addb7f2cf9002692fe4cabcf2e86dc7",
+      "bytes": 1297
+    },
+    "trajectory_examples.png": {
+      "sha256": "85a4a77096bd4a269e4d19cef6afd23a8cbfde1138fcc2af32249d0dbfb24c7f",
+      "bytes": 518578
+    },
+    "trajectory_metrics.png": {
+      "sha256": "18f1380646ffa22c3d9296c8b999db273ec506aaab5e3bc71cc66f7b94480633",
+      "bytes": 140934
+    }
+  },
+  "limitations": [
+    "One seed; weak far-horizon tracking remains.",
+    "H8 retained only to keep the existing baseline contract and entry point usable.",
+    "No model retraining, weight changes or metric recalculation during cleanup."
+  ]
+}

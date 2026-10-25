@@ -8,6 +8,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+.pytest_cache/
 .venv/
 venv/
 env/
@@ -42,6 +43,7 @@ data/
 .trae/
 .vscode/
 .idea/
+.qoder/
 *.swp
 *.swo
 

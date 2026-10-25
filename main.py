@@ -44,6 +44,9 @@ from train.optim import (ModelEMA, build_optimizer, build_scheduler,
                          migrate_pretrained_checkpoint, param_report,
                          save_backbone_weights, set_finetune_stage,
                          unfreeze_while_preserving_state)
+from train.training_state import (TrainingState, load_training_state,
+                                  read_training_state_metadata,
+                                  restore_rng_state, save_training_state)
 
 
 FILE = Path(__file__).resolve()
@@ -319,6 +322,32 @@ def dynamics_metric_name(horizon: int) -> str:
     if int(horizon) < 1:
         raise ValueError(f'horizon 必须 >= 1，收到 {horizon}')
     return f'val graph-ODE H1-{int(horizon)} subject MAE'
+
+
+def apply_train_supervision_horizon(mask: torch.Tensor, horizon: int):
+    """Intersect a training loss mask with the configured H1..H cutoff.
+
+    ``horizon=0`` preserves the existing full-mask behavior. This only changes
+    loss validity; prediction tensors and future targets remain full length.
+    """
+    horizon = int(horizon)
+    if horizon < 0:
+        raise ValueError(f'train_supervision_horizon 不能为负数：{horizon}')
+    if horizon == 0:
+        return mask
+    if mask is None:
+        raise ValueError('设置训练监督截止步时需要显式的 future mask')
+    if mask.ndim != 2:
+        raise ValueError(
+            f'训练监督 mask 期望 [B,H]，收到 {tuple(mask.shape)}')
+    full_horizon = mask.shape[1]
+    if horizon > full_horizon:
+        raise ValueError(
+            f'train_supervision_horizon={horizon} 超过当前 future H={full_horizon}')
+    if horizon == full_horizon:
+        return mask
+    horizon_mask = (torch.arange(full_horizon, device=mask.device) < horizon)
+    return mask * horizon_mask.to(mask.dtype).unsqueeze(0)
 
 
 def resolve_dynamics_metric_horizon(args) -> int:
@@ -750,10 +779,44 @@ def check_seed_separation(args):
         seen[value] = flag
 
 
+def _resume_argument_mismatches(saved_args: dict, current_args: dict) -> dict:
+    """Compare effective training arguments, ignoring path/entry-point-only values."""
+    ignored = {
+        'checkpoint_dir', 'name', 'pretrained_weight', 'condition_inherit_stats',
+        'resume_training_state', 'save_training_state', 'eval_after_train',
+        's4_variogram_calibration',
+    }
+    keys = (set(saved_args) | set(current_args)) - ignored
+    return {key: (saved_args.get(key, '<missing>'), current_args.get(key, '<missing>'))
+            for key in sorted(keys)
+            if saved_args.get(key, '<missing>') != current_args.get(key, '<missing>')}
+
+
 def main(args):
     # checkpoint config.args 快照保留 model_arch 键：evaluate_variant 重建与
     # pretrain 签名校验依赖它（TFM 已是唯一主干，CLI 不再暴露该开关）
     args.model_arch = 'tfm'
+    resume_metadata = None
+    resume_progress_data = None
+    if args.resume_training_state:
+        args.save_training_state = True
+        args.resume_training_state = str(
+            Path(args.resume_training_state).expanduser().resolve())
+        resume_metadata = read_training_state_metadata(args.resume_training_state)
+        resume_progress_data = resume_metadata['progress']
+        saved_study = resume_progress_data.get('study')
+        if not isinstance(saved_study, dict):
+            raise ValueError('完整训练状态缺少运行元数据，不能安全恢复')
+        saved_args = saved_study.get('args')
+        if not isinstance(saved_args, dict):
+            raise ValueError('完整训练状态缺少原始 args 快照，不能安全恢复')
+        if (saved_study.get('mode') != args.mode
+                or saved_args.get('mode') != args.mode):
+            raise ValueError('训练状态 mode 与当前入口不一致')
+        if (args.s4_variogram_weight == -1
+                and isinstance(saved_args.get('s4_variogram_calibration'), dict)):
+            args.s4_variogram_weight = float(saved_args['s4_variogram_weight'])
+            args.s4_variogram_calibration = saved_args['s4_variogram_calibration']
     # DataLoader 共享内存策略：默认的 file_descriptor 依赖 TMPDIR 下的
     # resource_sharer socket；Qoder/GUI 会话切换会清理该临时目录，导致长训练在
     # worker 交接时抛 FileNotFoundError。file_system 走 /dev/shm 文件描述符，
@@ -817,12 +880,6 @@ def main(args):
               '[NeuroTwinTFM FiLM]')
     print('=' * 50)
 
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_dir = os.path.join(args.checkpoint_dir, 'runs', f"{args.name}_{ts}")
-    os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=log_dir)
-    print(f"TensorBoard 日志已开启，保存路径: {log_dir}")
-
     print(f"[next_timepoint] 模型维度映射: in_window←1（整段 context 作为单窗口） | "
           f"pred_window←len(forecast_offsets)={dims['pred_window']} | "
           f"seq_len←context_max={dims['seq_len']} | "
@@ -849,7 +906,16 @@ def main(args):
               f'| merged 文件={args.condition_file or CONDITION_FILE_BY_MODE.get(args.mode)} '
               f'（条件数据**只**来自该 merged 表）')
     cond_base_stats = None
-    if cond_enabled and getattr(args, 'condition_inherit_stats', ''):
+    condition_stats_mode = 'fit'
+    if cond_enabled and resume_metadata is not None:
+        saved_stats = resume_progress_data.get('study', {}).get('condition_stats')
+        if not isinstance(saved_stats, dict):
+            raise ValueError('续训状态缺少条件统计量快照，不能重建条件编码器')
+        from utils.condition_schema import ConditionStats, schema_for
+        cond_base_stats = ConditionStats.from_dict(
+            schema_for(condition_group or 'mdd8'), saved_stats)
+        condition_stats_mode = 'inherit'
+    elif cond_enabled and getattr(args, 'condition_inherit_stats', ''):
         from utils.condition_schema import (DEMO_GROUP, load_inherited_stats,
                                             schema_for)
         payload = load_condition_stats_payload(args.condition_inherit_stats)
@@ -868,6 +934,7 @@ def main(args):
         split_file=args.split_file or None,
         stratify_key=(args.stratify_key or None),
         condition_base_stats=cond_base_stats,
+        condition_stats_mode=condition_stats_mode,
         condition_extra_codes=parse_extra_codes(args.condition_extra_codes)
         if args.condition_extra_codes else None,
         condition_control=args.cond_control,
@@ -921,7 +988,25 @@ def main(args):
             dropout_p=args.cond_dropout_p,
             dropout_seed=args.cond_dropout_seed).to_dict()
         condition_stats_payload = dl.get_condition_stats().to_dict()
+        if resume_metadata is not None:
+            saved_stats = resume_progress_data['study'].get('condition_stats')
+            if condition_stats_payload != saved_stats:
+                raise ValueError(
+                    '续训时重建的条件统计量与 checkpoint 不一致；'
+                    '请检查 cohort、split、条件表及其配置')
         print(f'[condition] 编码器配置 {condition_cfg_dict}')
+
+    if resume_metadata is not None:
+        saved_study = resume_progress_data['study']
+        current_condition_meta = dl.get_condition_meta()
+        if saved_study.get('condition_meta') != current_condition_meta:
+            raise ValueError(
+                '续训时条件来源/布局元数据与 checkpoint 不一致；'
+                '请检查 merged 条件文件及其列映射')
+        current_split_hash = split_hash(dl, args)
+        if saved_study.get('split_hash') != current_split_hash:
+            raise ValueError(
+                '续训时 train/val/test subject split 与 checkpoint 不一致')
 
     model = NeuroTwinTFM(
         features=args.num_rois, context_max=dims['seq_len'],
@@ -973,17 +1058,18 @@ def main(args):
         s4_train_samples=args.s4_train_samples,
     ).to(device)
     s4_active = args.s4_variant != 'off'
-    migration_report = None
+    migration_report = (resume_progress_data.get('study', {}).get('pretrained_migration')
+                        if resume_progress_data is not None else None)
 
     if args.mode == 'finetune':
-        if not os.path.exists(args.pretrained_weight):
+        if resume_metadata is None and not os.path.exists(args.pretrained_weight):
             raise FileNotFoundError(f"未找到预训练权重: {args.pretrained_weight}")
         # 跨阶段迁移守卫：HC（hc3）与 MDD（mdd8）的完整 layout_hash 天然不同
         # （K=3 vs K=8），但**共享前三字段必须逐位一致**，否则 E_demo / 特征编码器 /
         # FiLM 会挂到语义不同的列上（方案 §8：同宽度但字段顺序变化也必须拒绝）。
         saved_layout = None
         same_group_arm = False
-        if cond_enabled:
+        if cond_enabled and resume_metadata is None:
             from experiments.evaluate_variant import load_condition_bundle
             bundle = load_condition_bundle(args.pretrained_weight)
             if bundle is not None:
@@ -1001,13 +1087,13 @@ def main(args):
                         f'HC→MDD 共享三字段布局不一致：HC 权重 layout_hash={saved_layout}，'
                         f'当前 mdd8 的 demo 子集哈希={now.get("demo_layout_hash")}。'
                         'Sex/Age/education 的顺序、类型或词表必须逐位一致才能继承。')
-        if args.load_backbone_only:
+        if resume_metadata is None and args.load_backbone_only:
             # 显式模式：只加载主干、头部/条件模块重新初始化（prompt §三十六）。
             # 任务口径闸门降级为 warn：口径差异只提示，主干按 shape 逐键加载并汇报。
             check_pretrain_config_compat(args.pretrained_weight, dims,
                                          arch_policy='warn')
             load_backbone_only(model, args.pretrained_weight, device)
-        elif cond_enabled:
+        elif resume_metadata is None and cond_enabled:
             # 条件注入路径必须走**显式迁移器**：逐键归类并汇报，未分类键报错，
             # 不允许 strict=False + shape 过滤的静默忽略（方案 §8）
             check_pretrain_config_compat(args.pretrained_weight, dims,
@@ -1023,7 +1109,7 @@ def main(args):
                                if (getattr(model, 'conditioner', None) and same_group_arm)
                                else None),
                 layout_saved=saved_layout if same_group_arm else None)
-        else:
+        elif resume_metadata is None:
             # 任务口径闸门：不同任务的目标/输入 shape 语义不同，
             # 不允许静默按 shape 过滤加载（形状对不上时会静默跳过大量键）
             check_pretrain_config_compat(args.pretrained_weight, dims,
@@ -1058,7 +1144,7 @@ def main(args):
             print(f'已进入分阶段微调: 前期仅训练条件适配器'
                   f'（{ "+ ".join(stage1_trainables) }），后期逐步解冻主干。')
 
-    if args.mode == 'finetune':
+    if args.mode == 'finetune' and resume_metadata is None:
         fit_pathology_normalizer(model, dl, args)
 
     print(f"Total Model Parameters: {sum(p.numel() for p in model.parameters())}")
@@ -1131,6 +1217,21 @@ def main(args):
         args.adaptive_delta_scale = delta_sum / delta_count
         print(f'[loss] train-only mean absolute delta scale={args.adaptive_delta_scale:.8g}')
 
+    if resume_metadata is not None:
+        saved_args = resume_progress_data['study']['args']
+        mismatches = _resume_argument_mismatches(saved_args, vars(args))
+        if mismatches:
+            details = '\n'.join(
+                f'  {key}: checkpoint={old!r}, current={new!r}'
+                for key, (old, new) in mismatches.items())
+            raise ValueError(
+                '续训配置与保存状态不一致；模型、数据或训练配方必须保持原值，'
+                'train_epochs 也不能在续训时改变：\n' + details)
+        if resume_progress_data.get('epoch', 0) < 1:
+            raise ValueError('训练状态没有任何已完成 epoch，无法按 epoch 边界续训')
+        if resume_progress_data.get('study', {}).get('mode') != args.mode:
+            raise ValueError('训练状态 mode 与当前入口不一致')
+
     criterion = TFMDualLoss(
         lambda_one=args.lambda_one, lambda_cpm=args.lambda_cpm,
         lambda_pcc=args.lambda_pcc, cpm_gamma=args.cpm_gamma,
@@ -1179,8 +1280,21 @@ def main(args):
           f" | CPM FiLM: {'on' if getattr(model.cpm_head, 'film', None) is not None else 'off'}"
           f" | 主干条件 RMSNorm: {'on' if getattr(model, 'cond_norm', None) is not None else 'off'}")
 
+    backbone_unfrozen = ((args.mode == 'pretrain')
+                         or (s4_active and args.s4_stage == 'joint'))
     optimizer = build_optimizer(model, criterion, args)
     scheduler = build_scheduler(optimizer, args)
+    if resume_metadata is not None:
+        saved_unfrozen = bool(resume_progress_data.get('backbone_unfrozen', False))
+        if saved_unfrozen and not backbone_unfrozen:
+            set_finetune_stage(model, backbone_unfrozen=True)
+            added, names = unfreeze_while_preserving_state(model, optimizer, args)
+            scheduler.sync_param_groups()
+            print(f'[resume] 重建已解冻 optimizer 拓扑：新增参数 numel={added} '
+                  f'groups={names}')
+        elif backbone_unfrozen and not saved_unfrozen:
+            raise ValueError('checkpoint 冻结阶段与当前训练模式冲突，拒绝恢复')
+        backbone_unfrozen = saved_unfrozen
     _report_conditioning(
         model, optimizer, args, dl,
         allow_frozen_conditioning=(s4_active and args.s4_stage == 'head'))
@@ -1218,15 +1332,26 @@ def main(args):
         ckpt_metric_name = 'val next-state MAE'
     selector = CheckpointSelector(ckpt_metric_key, ckpt_metric_name,
                                   patience=args.patience)
-    backbone_unfrozen = ((args.mode == 'pretrain')
-                         or (s4_active and args.s4_stage == 'joint'))
     print(f"[next_timepoint] checkpoint 选择判据: {ckpt_metric_name}"
           f"（dynamics_mode={args.dynamics_mode}, metric_key={ckpt_metric_key}）| "
           f"单步 MAE 继续记录为观察指标（metric_mae_next）| "
           f"最终说明见训练日志/评估报告")
 
-    save_dir = os.path.join(args.checkpoint_dir, args.name)
-    if os.path.exists(save_dir):
+    if resume_metadata is not None:
+        save_dir = str(Path(args.resume_training_state).expanduser().resolve().parent)
+        saved_study = resume_progress_data['study']
+        saved_run_dir = saved_study.get('run_dir')
+        if saved_run_dir and Path(saved_run_dir).resolve() != Path(save_dir):
+            raise ValueError(
+                f'续训状态登记的 run 目录 {saved_run_dir} 与状态文件位置 {save_dir} 不一致')
+        best_name = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
+        if not (Path(save_dir) / best_name).is_file():
+            raise FileNotFoundError(
+                f'续训目录缺少既有最佳权重 {Path(save_dir) / best_name}；'
+                '为避免丢失 best/selector 语义，拒绝继续。')
+    else:
+        save_dir = os.path.join(args.checkpoint_dir, args.name)
+    if resume_metadata is None and os.path.exists(save_dir):
         import glob, re
         p = Path(save_dir)
         dirs = glob.glob(f"{p}*")
@@ -1235,7 +1360,108 @@ def main(args):
         save_dir = f"{p}{max(idx)+1 if idx else 2}"
     os.makedirs(save_dir, exist_ok=True)
 
-    for epoch in range(args.train_epochs):
+    if resume_metadata is not None:
+        state = load_training_state(
+            args.resume_training_state, model=model, criterion=criterion,
+            optimizer=optimizer, scheduler=scheduler, scaler=scaler, ema=ema,
+            loader_generator=dl.loader_generator, restore_rng=False)
+        if state.to_dict() != resume_progress_data:
+            raise ValueError('读取到的训练进度与预检查元数据不一致')
+        selector_meta = state.study.get('selector', {})
+        expected_selector = {
+            'metric_key': ckpt_metric_key, 'metric_name': ckpt_metric_name,
+            'patience': int(args.patience),
+        }
+        if selector_meta != expected_selector:
+            raise ValueError(
+                f'checkpoint 选优/早停设置不匹配：'
+                f'{selector_meta} != {expected_selector}')
+        selector.best = float(state.best_metric)
+        selector.counter = int(state.patience_counter)
+        if state.best_metric_name != ckpt_metric_key:
+            raise ValueError('checkpoint best metric key 与当前 selector 不一致')
+        if not math.isfinite(float(state.best_metric)):
+            raise ValueError('训练状态 best metric 非有限值，不能恢复 selector')
+        if bool(state.early_stopped) != bool(selector.should_stop):
+            raise ValueError('训练状态 early-stop 标记与 patience counter 不一致')
+        if state.epoch > args.train_epochs:
+            raise ValueError(
+                f'checkpoint 已完成 {state.epoch} epoch，超过原预算 {args.train_epochs}')
+        start_epoch = int(state.epoch)
+        global_step = int(state.global_step)
+        early_stopped = bool(state.early_stopped)
+        log_dir = state.study.get('log_dir')
+        if not log_dir:
+            raise ValueError('完整训练状态缺少 TensorBoard log_dir')
+        print(f'[resume] 恢复 {save_dir}：完成 epoch={start_epoch}/'
+              f'{args.train_epochs}，global_step={global_step}，'
+              f'best={selector.best:.6g}，patience counter={selector.counter}')
+        if args.num_workers > 0 and args.persistent_workers:
+            print('[resume] 提示：persistent_workers 的 worker-local NumPy/Python '
+                  '增强随机流不能由主进程 checkpoint；恢复后的样本随机序列不逐位连续，'
+                  '但仍沿用当前 DataLoader 的同一随机采样与增强分布。')
+        if device.type == 'cuda' and args.compile:
+            print('[resume] CUDA RNG 状态会恢复；torch.compile/autocast/kernel '
+                  '执行跨进程逐 bit 等价未验证。')
+    else:
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_dir = os.path.join(args.checkpoint_dir, 'runs', f"{args.name}_{ts}")
+        start_epoch = 0
+        global_step = 0
+        early_stopped = False
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir,
+                           purge_step=start_epoch if resume_metadata is not None else None)
+    print(f"TensorBoard 日志已开启，保存路径: {log_dir}"
+          + ('（从已完成 epoch 后续接）' if resume_metadata is not None else ''))
+
+    # Restore process RNG after model/data/optimizer construction and metadata checks.
+    # A completed or early-stopped run does no more training, so no RNG restore is needed.
+    if resume_metadata is not None and not early_stopped and start_epoch < args.train_epochs:
+        restore_rng_state(resume_metadata['rng'])
+
+    training_state_path = (args.resume_training_state if resume_metadata is not None
+                           else os.path.join(save_dir, 'training_state.pt'))
+
+    def persist_training_state(completed_epoch, stopped):
+        progress = TrainingState(
+            epoch=completed_epoch,
+            global_step=global_step,
+            best_metric=float(selector.best),
+            best_metric_name=selector.metric_key,
+            patience_counter=int(selector.counter),
+            backbone_unfrozen=bool(backbone_unfrozen),
+            early_stopped=bool(stopped),
+            study={
+                'mode': args.mode,
+                'args': dict(vars(args)),
+                'selector': {
+                    'metric_key': selector.metric_key,
+                    'metric_name': selector.metric_name,
+                    'patience': selector.patience,
+                },
+                'run_dir': str(Path(save_dir).resolve()),
+                'log_dir': str(Path(log_dir).resolve()),
+                'condition_config': condition_cfg_dict,
+                'condition_stats': condition_stats_payload,
+                'condition_meta': dl.get_condition_meta(),
+                'split_hash': split_hash(dl, args),
+                'pretrained_migration': migration_report,
+                'loader': {
+                    'num_workers': int(args.num_workers),
+                    'persistent_workers': bool(args.persistent_workers),
+                },
+            },
+        )
+        save_training_state(
+            training_state_path, model=model, criterion=criterion,
+            optimizer=optimizer, scheduler=scheduler, scaler=scaler, ema=ema,
+            loader_generator=dl.loader_generator, progress=progress)
+        tqdm.write(f'[training state] epoch={completed_epoch} global_step={global_step} '
+                   f'→ {training_state_path}')
+
+    epoch_limit = start_epoch if early_stopped else args.train_epochs
+    for epoch in range(start_epoch, epoch_limit):
         if (args.mode == 'finetune'
                 and not backbone_unfrozen
                 and epoch >= args.freeze_backbone_epochs):
@@ -1283,12 +1509,16 @@ def main(args):
                 cpm_mask_train = bm_roll
                 if bctl is not None and bm_roll is not None:
                     cpm_mask_train = compute_cpm_mask(bctl, bm_roll)
+                cpm_mask_train = apply_train_supervision_horizon(
+                    cpm_mask_train, args.train_supervision_horizon)
+                dynamics_mask_train = apply_train_supervision_horizon(
+                    bm_roll, args.train_supervision_horizon)
                 dyn_kwargs = {}
                 if aux_info.get('dynamics_pred', None) is not None and by_roll is not None:
                     dyn_kwargs = dict(
                         dynamics_pred=aux_info['dynamics_pred'],
                         dynamics_target=by_roll,                     # 数据尺度 [B,F,H]
-                        dynamics_mask=bm_roll,                       # 完整 future_mask
+                        dynamics_mask=dynamics_mask_train,
                         dynamics_mean_norm=aux_info.get('dynamics_mean_norm', None),
                         dynamics_logvar_norm=aux_info.get('dynamics_logvar_norm', None),
                         dynamics_target_norm=_normalized_future(
@@ -1356,6 +1586,8 @@ def main(args):
             scaler.step(optimizer)
             scaler.update()
             if ema is not None: ema.update(model)
+            # Counts batches that invoked scaler/optimizer step, including AMP-skipped updates.
+            global_step += 1
 
             for k, v in {**loss_stats, **graph_stats,
                          'metric_total': total_loss.detach()}.items():
@@ -1475,22 +1707,22 @@ def main(args):
                             if isinstance(v, dict)},
             }
             return meta
+        early_stopped_now = selector.should_stop
         if is_best:
             best_name = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
             save_backbone_weights(os.path.join(save_dir, best_name), eval_model,
                                   meta=_ckpt_meta())
             tqdm.write(f"New Best Model Saved! (Best {ckpt_metric_name}: "
                        f"{selector.best:.4f})")
-        elif selector.should_stop:
+        elif early_stopped_now:
             tqdm.write(f"\nEarly Stopping! 连续 {selector.patience} epoch 未改善。"
                        f"\n最佳 {ckpt_metric_name}: {selector.best:.4f}")
             last_name = 'base_last.pt' if args.mode == 'pretrain' else 'finetuned_last.pt'
             save_backbone_weights(os.path.join(save_dir, last_name),
                                   ema.ema if ema else model,
                                   meta=_ckpt_meta())
-            break
 
-        if epoch == args.train_epochs - 1:
+        if epoch == args.train_epochs - 1 and not early_stopped_now:
             last_name = 'base_last.pt' if args.mode == 'pretrain' else 'finetuned_last.pt'
             save_backbone_weights(os.path.join(save_dir, last_name),
                                   ema.ema if ema else model,
@@ -1567,13 +1799,22 @@ def main(args):
                 if isinstance(v, dict):
                     writer.add_scalar(f'LossW/{name}', v['weight'], epoch)
 
+        if args.save_training_state:
+            writer.flush()
+            persist_training_state(epoch + 1, early_stopped_now)
+
+        if early_stopped_now:
+            break
+
     writer.close()
     best_n = 'base_best.pt' if args.mode == 'pretrain' else 'finetuned_best.pt'
     best_path = os.path.join(save_dir, best_n)
     print(f"\n训练完成！最佳权重已保存至: {best_path}")
 
-    if args.mode == 'finetune' and getattr(args, 'eval_after_train', True) \
-            and os.path.exists(best_path):
+    if (args.mode == 'finetune' and getattr(args, 'eval_after_train', True)
+            and os.path.exists(best_path)
+            and not (resume_metadata is not None
+                     and (early_stopped or start_epoch >= args.train_epochs))):
         # 训练结束自动评 test（闭环）：复用版本化切分 manifest。评估失败不影响训练产物。
         from experiments.evaluate_variant import evaluate as _eval_variant
         eval_dir = os.path.join(save_dir, 'eval')
@@ -1586,6 +1827,10 @@ def main(args):
         except Exception as e:
             print(f"[post-train eval] 自动评估失败（训练产物不受影响）: {type(e).__name__}: {e}\n"
                   f"可手动复评: python -m experiments.evaluate_variant --ckpt {best_path} --out_dir {eval_dir}")
+    elif (args.mode == 'finetune' and resume_metadata is not None
+          and (early_stopped or start_epoch >= args.train_epochs)):
+        print('[post-train eval] 续训状态已早停或达到原预算，跳过重复的自动 test；'
+              'best 权重仍可手动复评。')
 
 
 #: 历史入口的默认预训练权重：**只在 finetune 省略 --pretrained_weight 时回填**
@@ -1607,8 +1852,10 @@ def parse_args():
                         '省略时按历史入口回填 '
                         f'{LEGACY_PRETRAINED_WEIGHT}。')
     p.add_argument('--save_training_state', action='store_true',
-                   help='工程恢复接口：额外落盘 optimizer/scheduler/scaler/EMA/随机状态。'
-                        '本轮正式从头实验不使用。')
+                   help='每个完整 epoch 后原子保存可续训状态 training_state.pt。')
+    p.add_argument('--resume_training_state', default='',
+                   help='从完整 training_state.pt 恢复，并继续写回同一 run；'
+                        '旧 best/last 推理权重不能用于断点恢复。')
     p.add_argument('--pathology_input_dim', type=int, default=1)
     p.add_argument('--seed', type=int, default=2024)
     p.add_argument('--data_root', default='./data')
@@ -1669,7 +1916,7 @@ def parse_args():
                    help='条件适配器（adapter）参数组的学习率缩放（历史键；'
                         '未设 --condition_lr_scale 时作为其回退值）。')
 
-    # ---------- 条件注入（docs/Version3_docs_1003/NeuroTwin_条件注入实验方案.md）----------
+    # ---------- 条件注入（docs/EXPERIMENTS.md）----------
     # default=None 是「未声明」哨兵，与显式 ``--condition_arm none`` 语义不同：
     # 未声明保持 legacy 行为（tfm_patho_mode 决定要不要建 HAMD FiLM），显式 none
     # 是「结构性地不建条件通路」，必须连 legacy FiLM 一起关掉（§三）。
@@ -1808,6 +2055,9 @@ def parse_args():
     p.add_argument('--cpm_horizon', type=int, default=8,
                    help='CPM 全 horizon 预测步数 H（方案 §8：推荐 {4,8,16}，'
                         '首选 8）。')
+    p.add_argument('--train_supervision_horizon', type=int, default=0,
+                   help='仅限制训练 loss 的有效 horizon；0 保持完整输入范围，'
+                        '正数只监督 H1..Hn，不截短 CPM/ODE 前向、未来数据或验证。')
     p.add_argument('--cpm_layers', type=int, default=2,
                    help='CPM ROI×Horizon 查询解码器的交叉注意力层数。')
     p.add_argument('--cpm_intervention', type=str2bool, default=False,

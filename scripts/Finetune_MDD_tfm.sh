@@ -10,14 +10,15 @@
 #   #   HC_WEIGHT=<权重路径>    覆盖自动查找，显式指定起点
 #   #   DEVICE=cuda:1           不给则沿用 main.py 的设备默认
 #   #   DATA_ROOT=<数据根目录>   默认 $ROOT/data
+#   #   SAVE_TRAINING_STATE=True   保存完整 epoch 状态；RESUME_TRAINING_STATE=<文件> 恢复
 #   #   PRINT_CMD=1             打印完整命令行（默认只打印关键参数摘要）
 #
-# 条件注入（2026-10-10 选定方案，见 TASK_HANDOFF §0.26）：
+# 条件注入（2026-10-10 选定方案，见 docs/EXPERIMENTS.md）：
 #   ``--condition_group mdd8 --condition_arm cat`` —— 八个字段各自独立编码，
 #   新增五字段按 ``d_new`` 拼接成 Φ 后过**零初始化** DeltaE，因此训练起点的条件向量
 #   与 HC 侧的 c_demo 逐位相同；条件经双头独立 FiLM 注入 One-Step 与 CPM 两头。
 #
-# graph_ode 动态路线（方案 docs/Version4_docs_1012）：twin 家族 mdd_cat_twin，
+# graph_ode 动态路线（方案 docs/EXPERIMENTS.md）：twin 家族 mdd_cat_twin，
 #   与预训练同口径（raw + history_fc + personalized + graph_ode），动态 H 复用
 #   cpm_horizon=8；起点权重默认只在 hc_demo_twin 家族内匹配，不混选旧
 #   neurotwin_tfm_pretrain 的 discrete 产物。
@@ -51,6 +52,8 @@ data_root="${DATA_ROOT:-$ROOT/data}"
 checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
 HC_WEIGHT="${HC_WEIGHT:-}"
+RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-}"
+SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-False}"
 # 概率化实验一般从 S2 微调权重继续，而不是同目录的 HC base_best.pt。该覆盖必须发生在
 # 下面的 HC 起点候选检查之前，否则会被"找不到 HC 起点"提前拦停。
 if [[ "${S4_VARIANT:-off}" != "off" && -n "${S4_INIT_WEIGHT:-}" ]]; then
@@ -62,7 +65,7 @@ hc_name="neurotwin_tfm_pretrain"   # 与 Pretrain_HC_tfm.sh 的 name 同步（tw
 # 起点权重：hc_demo_twin 试次目录下的 base_best.pt。找到 0 个→还没训；
 # 找到多个→必须显式指定，绝不静默挑一个（一个融合家族只能共享一个起点）。
 # 只匹配 twin 家族：旧 neurotwin_tfm_pretrain 的 discrete 产物不会被混选。
-if [[ -z "$HC_WEIGHT" ]]; then
+if [[ -z "$HC_WEIGHT" && -z "$RESUME_TRAINING_STATE" ]]; then
   mapfile -t hc_cands < <(compgen -G "$checkpoint_dir/$hc_name*/base_best.pt" || true)
   [[ ${#hc_cands[@]} -gt 0 ]] || {
     echo "[错误] 找不到 HC 起点（$checkpoint_dir/$hc_name*/base_best.pt 不存在）；" \
@@ -105,6 +108,7 @@ lambda_cross_head="${LAMBDA_CROSS_HEAD:-$lambda_cross_head}"
 cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-$cross_head_start_epoch}"
 cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-$cpm_horizon_weight}"
 cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-$cpm_horizon_alpha}"
+train_supervision_horizon="${TRAIN_SUPERVISION_HORIZON:-0}"
 # ---- S2 历史记忆（正式基线默认开启；必须与预训练同口径）----
 dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-$dynamics_history_memory}"
 
@@ -127,6 +131,7 @@ s4_noise_scale="${S4_NOISE_SCALE:-1e-2}"
 s4_ckpt_metric="${S4_CKPT_METRIC:-point}"
 
 train_epochs="${TRAIN_EPOCHS:-$train_epochs}"
+patience="${PATIENCE:-$patience}"
 # 数据加载并发（只影响吞吐，不影响训练结果）
 num_workers="${NUM_WORKERS:-6}"
 pin_memory="${PIN_MEMORY:-False}"
@@ -141,10 +146,12 @@ batch_size="${BATCH_SIZE:-$batch_size}"
   echo "[错误] 缺少 MDD Raw 目录（$data_root/Raw/MDD/ROISignals_<id>.mat，[T,F] 布局）"; exit 1; }
 [ -f "$data_root/Rest-meta-MDD-V1V2-Merged-MDD.xlsx" ] || {
   echo "[错误] 缺少临床评分表：$data_root/Rest-meta-MDD-V1V2-Merged-MDD.xlsx"; exit 1; }
-[ -f "$pretrained_weight" ] || {
-  echo "[错误] 起点权重文件不存在：$pretrained_weight"
-  echo "        它应当是 scripts/Pretrain_HC_tfm.sh 在同一个 CHECKPOINT_DIR 下产出的" \
-       "base_best.pt；请先跑预训练，或用 HC_WEIGHT=<完整路径> 指定真实存在的路径" >&2; exit 1; }
+if [[ -z "$RESUME_TRAINING_STATE" ]]; then
+  [ -f "$pretrained_weight" ] || {
+    echo "[错误] 起点权重文件不存在：$pretrained_weight"
+    echo "        它应当是 scripts/Pretrain_HC_tfm.sh 在同一个 CHECKPOINT_DIR 下产出的" \
+         "base_best.pt；请先跑预训练，或用 HC_WEIGHT=<完整路径> 指定真实存在的路径" >&2; exit 1; }
+fi
 
 ARGS=(
   # ---- 基础与路径 ----
@@ -153,7 +160,6 @@ ARGS=(
   --data_root "$data_root"
   --checkpoint_dir "$checkpoint_dir"
   --name "$name"
-  --pretrained_weight "$pretrained_weight"
   --num_rois "$num_rois"
   # ---- Next-Timepoint 任务口径（与预训练严格一致）----
   --task_mode next_timepoint
@@ -197,6 +203,7 @@ ARGS=(
   --loss_weighting "$loss_weighting"
   --cpm_gamma "$cpm_gamma"
   --cpm_huber_delta "$cpm_huber_delta"
+  --train_supervision_horizon "$train_supervision_horizon"
   # ---- P0 损失扩展（默认=E2；见文件顶部环境变量说明）----
   --lambda_temporal_diff "$lambda_temporal_diff"
   --lambda_cross_head "$lambda_cross_head"
@@ -230,6 +237,9 @@ ARGS=(
   --val_ratio "$val_ratio"
   --test_ratio "$test_ratio"
 )
+if [[ -z "$RESUME_TRAINING_STATE" ]]; then
+  ARGS+=(--pretrained_weight "$pretrained_weight")
+fi
 
 # ---- 本轮条件注入（选定方案：mdd8 + cat）----
 ARGS+=(
@@ -239,10 +249,11 @@ ARGS+=(
   --cond_h_delta "$cond_h_delta" --cond_delta_style "$cond_delta_style"
   --cond_dropout_p "$cond_dropout_p"
   --cond_dropout_seed "$cond_dropout_seed"
-  # 统计量快照直接取自同一个 HC 起点权重文件：共享三字段的 median/IQR/类别词表逐位继承，
-  # 不重新拟合（方案 §四）。
-  --condition_inherit_stats "$pretrained_weight"
 )
+if [[ -z "$RESUME_TRAINING_STATE" ]]; then
+  # 统计量快照直接取自同一个 HC 起点权重文件：共享三字段的 median/IQR/类别词表逐位继承。
+  ARGS+=(--condition_inherit_stats "$pretrained_weight")
+fi
 # ---- graph_ode 动态路线（与预训练严格同口径；twin 家族固定参数）----
 ARGS+=(
   --dynamics_mode "$dynamics_mode"
@@ -275,6 +286,13 @@ if [[ "$s4_variant" != "off" ]]; then
 fi
 if [[ -n "$DEVICE" ]]; then
   ARGS+=(--device "$DEVICE")
+fi
+if [[ "$SAVE_TRAINING_STATE" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ \
+      || -n "$RESUME_TRAINING_STATE" ]]; then
+  ARGS+=(--save_training_state)
+fi
+if [[ -n "$RESUME_TRAINING_STATE" ]]; then
+  ARGS+=(--resume_training_state "$RESUME_TRAINING_STATE")
 fi
 if [[ "${EVAL_AFTER_TRAIN:-True}" == "False" ]]; then
   ARGS+=(--no_eval_after_train)

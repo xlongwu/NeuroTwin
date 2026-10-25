@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(echo \"HOME=$HOME\"; echo \"CODEX_HOME=${CODEX_HOME-<unset>}\"; echo \"PATH=$PATH\"; echo \"--- type -a codex ---\"; type -a codex; echo \"--- command -v ---\"; command -v codex; echo \"--- readlink -f ---\"; readlink -f \"$\\(command -v codex\\)\")"
-    ]
-  }
-}
