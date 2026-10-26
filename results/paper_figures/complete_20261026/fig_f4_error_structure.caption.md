@@ -1,0 +1,1 @@
+F4｜滚动误差结构（T3）。冻结 HC base、K64、全部合法锚点，HC val 222 人/MDD val 225 人；逐被试逐 ROI 改善度先计算 1−MAE_model/MAE_persistence，再对被试等权平均。两脑图共享对称色阶；网络条形先按 ROI 汇总，不作组间显著性推断。散点每点为一个 ROI 的被试均值，幅度为真实下一步信号的 RMS，单位沿用每人前 32 TR 固定校准；不等同去均值后时间标准差。站点箱线保留全部实际被试点，两个面板共享横纵轴。展示预测 QC，不代表疾病效应。逐被试/ROI 原数值另存 f4_subject_metrics.csv、f4_roi_metrics.csv。

@@ -1,0 +1,62 @@
+{
+  "analysis": "B5 FiLM 条件使用量（v2 §6.6）",
+  "checkpoint": "checkpoints/phase2_S2/neurotwin_tfm_pretrain/base_best.pt",
+  "group": "hc",
+  "split": "val",
+  "n_subjects": 222,
+  "zero_condition_def": "全缺失编码：cond_z=0、cond_code=Unknown(0)、cond_mask=0",
+  "summary": {
+    "ode_film_gamma": {
+      "mean": 2.689270971447046,
+      "median": 2.6855252731678094,
+      "max": 2.790529827638106,
+      "n_valid": 222
+    },
+    "ode_film_beta": {
+      "mean": 0.9821331101327992,
+      "median": 0.9727159601929276,
+      "max": 1.094745331340366,
+      "n_valid": 222
+    },
+    "encoder_adarms_gamma": {
+      "mean": NaN,
+      "median": NaN,
+      "max": NaN,
+      "n_valid": 0
+    },
+    "encoder_adarms_beta": {
+      "mean": NaN,
+      "median": NaN,
+      "max": NaN,
+      "n_valid": 0
+    },
+    "delta_pred_abs": {
+      "mean": 0.0027021713282402698,
+      "median": 0.002673065060510594,
+      "max": 0.004971699005672856,
+      "n_valid": 222
+    },
+    "delta_pred_relative": {
+      "mean": 0.004528808014399762,
+      "median": 0.004582001138859983,
+      "max": 0.008213140230442976,
+      "n_valid": 222
+    },
+    "mae_cond": {
+      "mean": 0.08142789081535814,
+      "median": 0.07526972359236832,
+      "max": 0.20700515650732573,
+      "n_valid": 222
+    },
+    "mae_zero_cond": {
+      "mean": 0.08135439086021568,
+      "median": 0.07515183532700301,
+      "max": 0.2073246380963991,
+      "n_valid": 222
+    }
+  },
+  "near_zero_threshold": 0.01,
+  "condition_usage_near_zero": true,
+  "conclusion": "条件使用近零（Δpred/信号尺度 中位数 < 1%）→ 按 v2 §6.6 为最终结论，不再开敏感性分析支线",
+  "interpretation_note": "Δpred 是条件通路的输出贡献（描述性），不是临床效应方向或因果证据。"
+}

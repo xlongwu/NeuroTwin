@@ -5,7 +5,7 @@ ProfileEncoder 从同一扫描最早 ``calibration_length``（默认 32）TR 的
 ``calibration_bold`` 出发，经**共享** TFM 编码器得到基线 tokens 后，沿 ROI 和
 patch 双均值池化，经两层 MLP + tanh 得到固定维（默认 32）的个体校准码 p。
 
-- 基线编码不注入当前临床 FiLM / AdaRMSNorm（cond_mods=None 路径），临床影响
+- 基线编码不注入当前临床 FiLM，临床影响
   留给向量场的 c，避免把同一份当前评分再编码进 profile；
 - 不创建 ID embedding 或逐人训练参数；
 - 训练时前向保留梯度，不跨 optimizer step 缓存 detached tokens；

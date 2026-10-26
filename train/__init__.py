@@ -14,7 +14,7 @@ from train.optim import (
     get_param_groups,
     load_backbone_weights,
     save_backbone_weights,
-    set_finetune_stage,
+    set_finetune_trainability,
     unwrap_state_dict,
 )
 
@@ -27,7 +27,7 @@ __all__ = [
     'load_backbone_weights',
     'save_backbone_weights',
     'unwrap_state_dict',
-    'set_finetune_stage',
+    'set_finetune_trainability',
     'get_param_groups',
     'build_optimizer',
     'build_scheduler',

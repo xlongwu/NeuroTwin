@@ -10,8 +10,8 @@ import torch
 
 from analysis.checkpoint import load_checkpoint_compat
 from analysis.next_point_eval import build_next_point_loader, run_inference
-from baseline import CONTRACT_FIELDS
-from experiments.evaluate_variant import (build_model_from_args, load_condition_bundle,
+from model import CONTRACT_FIELDS
+from analysis.evaluate import (build_model_from_args, load_condition_bundle,
                                           load_train_args)
 from experiments.long_horizon.train_supervision import DEFAULT_CONFIG
 from main import split_hash
@@ -64,7 +64,7 @@ def validate_pair(left_args, right_args, left_meta: dict, right_meta: dict) -> N
             raise ValueError(f'对照配置不一致：{name}={left!r}/{right!r}')
     for args, meta, horizon in ((left_args, left_meta, 8), (right_args, right_meta, 32)):
         if (args.cpm_horizon != horizon or args.dynamics_mode != 'graph_ode'
-                or not args.dynamics_history_memory or args.s4_variant != 'off'):
+                or not args.dynamics_history_memory):
             raise ValueError('需要 S2 Graph-ODE 确定性 H8/H32 两臂')
         if (args.train_anchor_max_offset != 32 or args.eval_anchor_min_future_steps != 32
                 or args.dynamics_metric_horizon != 32 or args.freeze_backbone_epochs != 0

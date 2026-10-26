@@ -298,7 +298,7 @@ def compute_calibration_metrics(
     upper: np.ndarray = None,
     alpha: float = 0.1,
 ) -> Dict[str, float]:
-    """概率预测的校准指标（Phase 7.1 概率头评估）。
+    """概率预测的校准指标（方差读出评估）。
 
     Args:
         pred: 点预测（高斯/分位头的均值或中位数），与 ``target`` 同形。

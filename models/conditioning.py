@@ -1,11 +1,10 @@
 # coding=utf-8
-"""条件注入的独立特征编码、融合候选与 Condition Dropout。
+"""字段条件编码、拼接增量融合与 Condition Dropout。
 
 本模块只负责「临床条件 → 条件向量 :math:`c \\in \\mathbb{R}^C`」，不涉及 BOLD
-主干；注入位置（双头 FiLM / 条件 RMSNorm / 门控残差 / 条件低秩）由
-``models/tfm.py`` 与 ``models/tfm_backbone.py`` 消费本模块的输出。
+主干；条件向量由 ``models/tfm.py`` 的预测头 FiLM 消费。
 
-协议（docs/Version3_docs_1003/NeuroTwin_条件注入实验方案.md §4–§6、§8）：
+当前字段条件协议：
 
 - 每个字段拥有**独立**编码参数，连续与类别走不同编码：
 
@@ -42,7 +41,7 @@ from utils.condition_schema import (DROPOUT_SEED, ConditionStats, FieldSpec,
                                     categorical_indices, continuous_indices,
                                     field_names, group_indices, layout_hash)
 
-#: 候选臂（阶段 2 的对比矩阵；见方案 §10）
+#: 支持健康共享字段、临床增量字段和显式无条件对照。
 #: 本轮选定的条件注入方式（2026-10-10 决定）：
 #:   ``none`` = 不注入（非条件路径与旧权重的 strict 重建需要它继续可表达）；
 #:   ``demo`` = HC 预训练侧的唯一可行臂（hc3 分组只有共享三字段，没有新增组可融合）；
@@ -53,12 +52,12 @@ ARMS = ('none', 'demo', 'cat')
 #: MDD 新增组的融合算子（只剩选定值；保留 tuple 以便校验口径不变）
 FUSIONS = ('cat',)
 #: 增量生成器结构
-DELTA_STYLES = ('linear', 'mlp')
+DELTA_STYLES = ('mlp',)
 
 
 @dataclass
 class ConditioningConfig:
-    """条件模块的结构配置（搜索空间的显式载体）。
+    """当前字段编码与增量融合配置。
 
     Args:
         group: ``hc3`` / ``mdd8``，决定字段白名单与 K。
@@ -67,10 +66,9 @@ class ConditioningConfig:
         d_new: MDD 新增五字段的独立编码宽度。
         cond_dim: 融合后条件向量宽度 C。
         h_delta: 增量 MLP 的隐藏宽度 H。
-        delta_style: ``linear`` 或 ``mlp``。
+        delta_style: 固定为 ``mlp``。
         dropout_p: Condition Dropout 的遮蔽概率 :math:`p_j`（标量=全字段同值）。
         dropout_seed: 与模型 seed / split seed **分离**的 Dropout 种子。
-        direct_hidden: ``direct`` 基线保留的规范向量拼接细节开关（仅用于审计）。
     """
 
     group: str = 'hc3'
@@ -339,7 +337,7 @@ class DemoEncoder(nn.Module):
 class DeltaEncoder(nn.Module):
     r"""MDD 新增组的增量 :math:`\Delta E_f([c_{demo}, \Phi_f, m_N])`。
 
-    末层（``mlp`` 的第二层 / ``linear`` 的唯一一层）**零初始化**，使训练起点
+    MLP 末层零初始化，使训练起点
     :math:`c_{MDD}=c_{demo}`，从而在同一 HC checkpoint 下比较融合方式时初始输出
     与 HC 共同起点等价（验收 K）。
     """
@@ -352,18 +350,12 @@ class DeltaEncoder(nn.Module):
             raise ValueError(f"style 必须是 {DELTA_STYLES}，收到 '{style}'")
         self.in_dim, self.cond_dim, self.hidden, self.style = (
             int(in_dim), int(cond_dim), int(hidden), str(style))
-        if style == 'mlp':
-            self.net = nn.Sequential(
-                nn.Linear(self.in_dim, self.hidden), nn.GELU(),
-                nn.Linear(self.hidden, self.cond_dim))
-            nn.init.zeros_(self.net[-1].weight)
-            nn.init.zeros_(self.net[-1].bias)
-            self.out = self.net[-1]
-        else:
-            self.net = nn.Linear(self.in_dim, self.cond_dim)
-            nn.init.zeros_(self.net.weight)
-            nn.init.zeros_(self.net.bias)
-            self.out = self.net
+        self.net = nn.Sequential(
+            nn.Linear(self.in_dim, self.hidden), nn.GELU(),
+            nn.Linear(self.hidden, self.cond_dim))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        self.out = self.net[-1]
 
     def forward(self, c_demo: torch.Tensor, phi: torch.Tensor,
                 mask: torch.Tensor) -> torch.Tensor:
@@ -375,11 +367,9 @@ class DeltaEncoder(nn.Module):
         return self.net(h)
 
     def n_params_formula(self) -> int:
-        """:math:`N_{delta}`：MLP 为 :math:`IH+H+HC+C`；linear 为 :math:`IC+C`。"""
+        """增量 MLP 的实际参数量。"""
         I, H, C = self.in_dim, self.hidden, self.cond_dim
-        if self.style == 'mlp':
-            return I * H + H + H * C + C
-        return I * C + C
+        return I * H + H + H * C + C
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -596,211 +586,3 @@ def build_condition_encoder(specs: Sequence[FieldSpec], stats: ConditionStats,
         raise ValueError(
             f"hc3 分组没有新增字段，arm='{cfg.arm}' 需要 mdd8 分组")
     return ConditionEncoder(specs, stats, cfg, demo_group=demo, new_group=new)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  注入位置扩展候选（阶段 4+）：条件 RMSNorm / 门控残差 / 条件门控低秩
-# ══════════════════════════════════════════════════════════════════════════
-
-BACKBONE_SCOPES = ('last1', 'last2', 'all')
-NORM_GENERATORS = ('per_layer', 'shared')
-#: 每个 block 内被调制的 norm 槽位数（temporal / roi / ffn）
-NORM_SLOTS_PER_BLOCK = 3
-
-
-def selected_block_indices(num_layers: int, scope: str) -> List[int]:
-    """按注入范围选出 block 下标（先稀疏后扩展，方案 §7/§11.3）。"""
-    n = int(num_layers)
-    if scope == 'last1':
-        return [n - 1]
-    if scope == 'last2':
-        return list(range(max(0, n - 2), n))
-    if scope == 'all':
-        return list(range(n))
-    raise ValueError(f"scope 必须是 {BACKBONE_SCOPES}，收到 '{scope}'")
-
-
-class ConditionNormGenerator(nn.Module):
-    r"""条件 RMSNorm（AdaRMSNorm）的调制生成器。
-
-    :math:`\operatorname{AdaRMSNorm}(h,c)=(1+\gamma(c))\odot\operatorname{RMSNorm}(h)+\beta(c)`。
-
-    命名说明：主干使用 RMSNorm，因此本候选是**条件 RMSNorm**，不是 AdaLN。真正的
-    :math:`\operatorname{AdaLN}` 需要把归一化换成 LayerNorm，那会同时改变两种东西，
-    必须另配「非条件 LayerNorm」对照并单独报告（方案 §7），本类不做该替换。
-
-    Args:
-        mode: ``per_layer`` = 每个被选中 block 独立的生成器；
-            ``shared`` = 共享主干 + **层身份嵌入**。身份表只为 :attr:`blocks` 里被选中的
-            block 建行（升序一一对应，见 :attr:`ident_row`），因此换 ``scope`` 会改变表形状、
-            权重不跨范围复用；按绝对层下标建 ``num_layers`` 行会让未选中的行**永远拿不到
-            梯度**，却仍被 :meth:`n_params` 计入条件参数预算（实测 ``num_layers=4`` +
-            ``scope='last1'`` 时 32 个身份元素里 24 个是死参数）。
-        两种模式的额外参数数量都由 :meth:`n_params` 实际登记，不预设谁更优。
-    """
-
-    is_conditioning_adapter = True
-
-    def __init__(self, cond_dim: int, dim: int, num_layers: int,
-                 scope: str = 'last1', mode: str = 'per_layer',
-                 ident_dim: int = 8):
-        super().__init__()
-        if mode not in NORM_GENERATORS:
-            raise ValueError(f"mode 必须是 {NORM_GENERATORS}，收到 '{mode}'")
-        self.cond_dim = int(cond_dim)
-        self.dim = int(dim)
-        self.num_layers = int(num_layers)
-        self.scope = str(scope)
-        self.mode = str(mode)
-        self.out_dim = NORM_SLOTS_PER_BLOCK * 2 * self.dim
-        self.blocks = selected_block_indices(self.num_layers, self.scope)
-        if self.mode == 'per_layer':
-            self.gen = nn.ModuleDict({
-                f'L{i}': nn.Linear(self.cond_dim, self.out_dim)
-                for i in self.blocks})
-            self.ident = None
-            self.ident_row = None
-            self.shared = None
-        else:
-            self.ident_dim = int(ident_dim)
-            #: 绝对 block 下标 → 身份表行号（升序）；表只建被选中的行，见类文档。
-            self.ident_row = {int(b): r for r, b in enumerate(self.blocks)}
-            self.ident = nn.Embedding(len(self.blocks), self.ident_dim)
-            nn.init.trunc_normal_(self.ident.weight, std=0.02)
-            self.shared = nn.Linear(self.cond_dim + self.ident_dim, self.out_dim)
-            self.gen = None
-        # 零初始化 → 起点等于无条件主干（恒等调制）
-        mods = list(self.gen.values()) if self.mode == 'per_layer' else [self.shared]
-        for m in mods:
-            nn.init.zeros_(m.weight)
-            nn.init.zeros_(m.bias)
-
-    def n_params(self) -> int:
-        return int(sum(p.numel() for p in self.parameters()))
-
-    def forward(self, cond: torch.Tensor) -> Dict[int, Tuple[tuple, tuple, tuple]]:
-        """cond [B, C] → {block 下标: ((s,sh)_temporal, (s,sh)_roi, (s,sh)_ffn)}。
-
-        调制在 ROI / patch 轴上广播（``[B, 1, 1, D]``），不向时间序列拼接任何
-        未来临床 token。
-        """
-        if cond is None:
-            raise ValueError('ConditionNormGenerator 需要条件向量；'
-                             'arm=none 时不应构建本模块。')
-        b = int(cond.shape[0])
-        out: Dict[int, Tuple[tuple, tuple, tuple]] = {}
-        for i in self.blocks:
-            if self.mode == 'per_layer':
-                y = self.gen[f'L{i}'](cond)
-            else:
-                ident = self.ident(torch.full((b,), self.ident_row[int(i)],
-                                              dtype=torch.long, device=cond.device))
-                y = self.shared(torch.cat([cond, ident], dim=-1))
-            parts = y.view(b, NORM_SLOTS_PER_BLOCK, 2, self.dim)
-            mods = tuple((parts[:, s, 0, :].view(b, 1, 1, self.dim),
-                          parts[:, s, 1, :].view(b, 1, 1, self.dim))
-                         for s in range(NORM_SLOTS_PER_BLOCK))
-            out[i] = mods
-        return out
-
-
-class ConditionalGatedResidual(nn.Module):
-    r"""条件门控残差（扩展候选）：:math:`h' = h + g(h,c)\odot R(h,c)`。
-
-    - :math:`R` 为小型分支（``Linear→GELU→Linear``），**末层零初始化**，因此
-      初始 :math:`R\equiv 0`、行为与原残差一致；
-    - :math:`g=\sigma(\cdot)` 用 sigmoid；
-    - :math:`R=0` 会让 gate 的首步梯度为 0，这是**预期的零初始化起步**，不是缺陷；
-      只要 :math:`R` 的输入侧参数非零，第二步起 :math:`R` 获得梯度后 gate 随即被
-      激活（验收 L 检查后续激活，而不是要求首步全部非零）。
-    """
-
-    is_conditioning_adapter = True
-
-    def __init__(self, dim: int, cond_dim: int, hidden: int = 64):
-        super().__init__()
-        self.dim = int(dim)
-        self.cond_dim = int(cond_dim)
-        self.body = nn.Sequential(nn.Linear(self.dim + self.cond_dim, int(hidden)),
-                                  nn.GELU())
-        self.head = nn.Linear(int(hidden), self.dim)
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
-        self.gate = nn.Linear(self.dim + self.cond_dim, self.dim)
-
-    def forward(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """h [B, F, D]，cond [B, C] → [B, F, D]。
-
-        ``cond`` 沿 ROI 轴广播后与 h 在**通道维拼接**，因此 C 与 D 可以不同
-        （早期实现直接 ``expand_as(h)``，隐含要求 C==D，会在 D!=C 时广播失败）。
-        """
-        if h.ndim != 3:
-            raise ValueError(f'ConditionalGatedResidual 期望 h 为 [B,F,D]，收到 {tuple(h.shape)}')
-        if cond.shape[0] != h.shape[0] or cond.shape[1] != self.cond_dim:
-            raise ValueError(
-                f'条件向量期望 [B={h.shape[0]}, {self.cond_dim}]，收到 {tuple(cond.shape)}')
-        b, f, _ = h.shape
-        c = cond.unsqueeze(1).expand(b, f, self.cond_dim)
-        hc = torch.cat([h, c], dim=-1)
-        r = self.head(self.body(hc))
-        g = torch.sigmoid(self.gate(hc))
-        return h + g * r
-
-    def n_params(self) -> int:
-        return int(sum(p.numel() for p in self.parameters()))
-
-
-class ConditionedLowRankLinear(nn.Module):
-    r"""条件门控低秩（扩展候选）：:math:`W(c) = W_0 + B\operatorname{diag}(g(c))A`。
-
-    :math:`g(c)=1+\tanh(G(c))`；:math:`A` 正常初始化、:math:`B=0`，因此起点等于
-    :math:`W_0`（无条件行为）。``conditional=False`` 时 :math:`g\equiv 1`，即
-    **同秩无条件 LoRA 对照**——比较必须区分「额外适配容量」与「条件信息」，
-    不能只报告条件低秩优于「没有任何 adapter」（方案 §7/§11.6）。
-    """
-
-    is_conditioning_adapter = True
-
-    def __init__(self, base: nn.Linear, cond_dim: int, rank: int,
-                 conditional: bool = True):
-        super().__init__()
-        if rank < 1:
-            raise ValueError(f'rank 必须 >= 1，收到 {rank}')
-        if not isinstance(base, nn.Linear):
-            raise TypeError('ConditionedLowRankLinear 只能包装 nn.Linear')
-        self.base = base
-        self.cond_dim = int(cond_dim)
-        self.rank = int(rank)
-        self.conditional = bool(conditional)
-        in_f, out_f = int(base.in_features), int(base.out_features)
-        self.A = nn.Parameter(torch.randn(self.rank, in_f) * (1.0 / (in_f ** 0.5)))
-        self.B = nn.Parameter(torch.zeros(out_f, self.rank))
-        self.G = (nn.Linear(self.cond_dim, self.rank) if self.conditional else None)
-        if self.G is not None:
-            nn.init.zeros_(self.G.weight)
-            nn.init.zeros_(self.G.bias)
-
-    def forward(self, x: torch.Tensor,
-                cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x ``[..., in]``，cond ``[B, C]``（B == x.shape[0]）→ ``[..., out]``。
-
-        :math:`g(c)` 只依赖 batch，因此在低秩支路上按 ROI/token 轴广播；早期写法
-        直接 ``a * g`` 隐含要求 token 轴长度为 B，会在 ``[B, F, r]`` 上广播失败。
-        """
-        y = self.base(x)
-        a = x @ self.A.t()                                   # [..., r]
-        if self.conditional:
-            if cond is None:
-                raise ValueError('条件低秩需要条件向量；无条件对照请设 conditional=False')
-            if cond.shape[0] != x.shape[0]:
-                raise ValueError(
-                    f'条件 batch={cond.shape[0]} 与输入 batch={x.shape[0]} 不一致')
-            g = 1.0 + torch.tanh(self.G(cond))               # [B, r]
-            for _ in range(x.ndim - 2):
-                g = g.unsqueeze(1)                            # [B, 1, ..., r]
-            a = a * g
-        return y + a @ self.B.t()
-
-    def n_params(self) -> int:
-        return int(self.A.numel() + self.B.numel()
-                   + (sum(p.numel() for p in self.G.parameters()) if self.G else 0))

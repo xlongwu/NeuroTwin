@@ -226,7 +226,7 @@ def temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
                               adaptive_delta_alpha: float = 0.5,
                               adaptive_delta_clip: float = 3.0,
                               adaptive_delta_scale: float = 1.0) -> torch.Tensor:
-    """E2-compatible temporal Huber; each lag is independently normalized.
+    """Temporal-difference-compatible temporal Huber; each lag is independently normalized.
 
     Only the observed final context frame is available: lag k starts at h=k
     with context_last, or h=k+1 without it. Validity requires both endpoints.
@@ -346,7 +346,7 @@ class TFMDualLoss(nn.Module):
     （prediction_target=delta 时二者数值重合），改为单一 Huber + spatial PCC；
     CPM 项逐 horizon 加权（§20.2，γ=1 即均匀，<1 时对远期 horizon 降权；
     cpm_horizon_weight='increasing' 时改为远期递增 w_h=1+α(h−1)/(H−1)）。
-    λ_cpm=0 可退化为纯 one-step 的 Stage 0 基线。
+    λ_cpm=0 可退化为纯 one-step 的 单步目标。
 
     P0 新增（默认 λ=0，不改变既有行为）：
       - ``lambda_temporal_diff``：一阶时间差分 Huber（CPM + 动力学轨迹，见
@@ -501,7 +501,7 @@ class TFMDualLoss(nn.Module):
             cpm_target:  [B, F, H]   t+1..t+H 真值（原始空间，序列末尾截断补零）
             cpm_mask:    [B, H]      各 horizon 是否有真值（None = 全有效）；
                                      graph_ode 路线传入 compute_cpm_mask 的结果
-            ---- 以下为 graph_ode 动态可选输入（discrete 路线不传，行为不变）----
+            ---- 以下为 graph_ode 动态可选输入----
             dynamics_pred/target:  [B, F, H] 动态轨迹预测与真值（数据尺度）
             dynamics_mask:         [B, H]    future_mask（**不是** cpm_mask）
             dynamics_mean_norm:    [B, F, H] 归一化空间动态均值（方差损失用，内部 detach）
@@ -746,7 +746,7 @@ class TFMDualLoss(nn.Module):
             total = total + self.lambda_cross_head * cross
         stats['loss_cross_head'] = cross.detach()
 
-        # Temporal PCC is a separate auxiliary objective; retain all E2 terms.
+        # Temporal PCC is a separate auxiliary objective; retain all existing loss terms.
         tp_cpm, tp_dyn = pred.new_zeros(()), pred.new_zeros(())
         if self.lambda_temporal_pcc > 0:
             if cpm_pred.shape[0] > 0:

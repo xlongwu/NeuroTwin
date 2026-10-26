@@ -1,5 +1,5 @@
 # coding=utf-8
-"""S2（历史记忆）状态耦合的最小验证。
+"""历史记忆状态耦合的最小验证。
 
 关注两点：
 1. 零初始化 ⇒ 启用开关的模型在起点与 baseline 逐位等价；
@@ -63,7 +63,7 @@ def _tfm(**kw):
 
 
 def test_history_memory_does_not_shift_downstream_rng():
-    """同一 seed 下，S2 新模块不得改变共享参数的初始化（消融无初始化混杂）。"""
+    """同一 seed 下，历史记忆模块不得改变共享参数的初始化（消融无初始化混杂）。"""
     kw = dict(personalized=True, profile_dim=8)
     base = _tfm(**kw).state_dict()
     other = _tfm(**kw, dynamics_history_memory=True).state_dict()

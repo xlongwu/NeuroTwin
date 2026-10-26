@@ -1,0 +1,20 @@
+{
+  "gate": "B4 校准质量门槛（v2 §7 触发器 T1）",
+  "split": "val",
+  "group": "hc",
+  "n_subjects": 222,
+  "criteria": {
+    "min_improvement": 0.01,
+    "alpha": 0.01,
+    "n_perm": 10000,
+    "seed": 2024,
+    "test": "被试级配对符号翻转置换（单侧，H1: 模型 MAE 更低）"
+  },
+  "mae_model_subject_equal_weight": 0.08142789099175968,
+  "mae_persistence_subject_equal_weight": 0.6048402589297084,
+  "improvement": 0.8653728983982483,
+  "permutation_p": 9.999000099990002e-05,
+  "passed": true,
+  "action_on_fail": "停止 Phase 1，回到方向重议（唯一预登记例外）；不得继续 fit/score 与组间检验。",
+  "source": "results/rolling_eval/hc/per_subject_roi_mae_val.npz"
+}

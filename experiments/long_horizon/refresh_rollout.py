@@ -15,8 +15,8 @@ ROI latent 同质化程度（平均两两 cosine），用于检查 H5–H8 是�
 用法::
 
     python -m experiments.long_horizon.refresh_rollout \
-        --ckpt checkpoints/phase1_E2/neurotwin_tfm_finetune/finetuned_best.pt \
-        --out_dir results/phase1/refresh_E2 --split test --steps 8 --device cuda:0
+        --ckpt checkpoints/neurotwin_finetune/finetuned_best.pt \
+        --out_dir results/refresh_diagnostic --split test --steps 8 --device cuda:0
 """
 import argparse
 import csv
@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 from analysis import next_point_eval as npe
 from analysis.checkpoint import load_checkpoint_compat
-from experiments.evaluate_variant import (
+from analysis.evaluate import (
     build_model_from_args, load_condition_bundle, load_train_args,
 )
 from main import _index_condition, dynamics_extras

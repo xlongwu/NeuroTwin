@@ -124,7 +124,7 @@ class TwinSession:
 
     def __init__(self, checkpoint: str, device: str = '',
                  condition_file: Optional[str] = None):
-        from experiments.evaluate_variant import (build_model_from_args,
+        from analysis.evaluate import (build_model_from_args,
                                                   load_condition_bundle,
                                                   load_train_args)
         from analysis.checkpoint import load_checkpoint_compat
@@ -386,6 +386,9 @@ class TwinSession:
         差值由两条数据尺度轨迹相减；未经真实受控数据训练时只能称
         **未校准的模拟响应**。
         """
+        # v2 §8（B8）：运行时显式声明边界，防止模拟差值被当作结论引用
+        log.warning('simulate(): 干预通路未经真实受控数据校准，输出仅是未校准的'
+                    '模拟响应，不可用于模拟结论或因果解释')
         u = np.asarray(controls, dtype=np.float64)
         if u.ndim != 2 or u.shape[1] != self.num_rois:
             raise ValueError(f'controls 期望 [H,{self.num_rois}]，收到 {u.shape}')

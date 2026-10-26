@@ -1,26 +1,8 @@
 # coding=utf-8
-"""SC 软解剖先验（Soft Anatomical Prior）。
+"""历史功能图与学习功能图的软先验。
 
-把“静态 SC 硬掩码 + 永久切断非 SC 边”替换为随输入自适应的软图先验：
-
-    A_eff = λ · A_SC + (1 - λ) · A_func(h)
-
-- ``A_SC``：由 :func:`models.common.prepare_sc_matrix` 的度归一化给出（直接复用，
-  不重复实现），是静态结构先验；
-- ``A_func(h) = row_softmax(sym(U Vᵀ) / √rank)``：由当前输入特征导出的功能图，
-  使 DTI 假阴性边在数据支持下可以“复活”；
-- ``λ``：全局 / 样本级 / ROI 级可学习混合系数（``--sc_lambda_mode``）；
-- 可选低秩 subject-specific 邻接残差 ΔA（``--sc_delta_a``，零初始化 → 初始无影响）；
-- 可选可学习概率掩码（``--sc_prob_mask``，straight-through；初始化保留约 95% 边）；
-- 最后用**对称 Sinkhorn** 迭代把矩阵投影为双随机矩阵，使 ``A_eff`` 同时满足
-  “行归一”与“对称”（单纯的度归一化只能满足其一）。
-
-``functional_only`` 模式跳过 Sinkhorn，返回 row_softmax 语义的纯功能注意力图。
-
-窗口维说明：``A_func`` 由节点特征在窗口维池化后导出，因此 ``A_eff`` 为
-``[B, F, F]`` 的样本级矩阵，可在 ODE 与 refiner 之间“一次计算、多处共享”。
-当需要时间一致性正则（``--sc_temporal_weight > 0``）时，额外导出逐窗功能图
-``A_seq``（``[B, W, F, F]``），此时池化后的 ``A_func`` 取逐窗结果的均值以保持一致。
+保留当前训练结构：全局可学习混合系数、低秩邻接残差、自环和对称 Sinkhorn。
+输入图在模型中由可见历史 FC 构造，不代表独立实测的解剖连接。
 """
 import math
 
@@ -68,20 +50,18 @@ class SoftAnatomicalPrior(nn.Module):
     Args:
         features:    ROI 数 F
         seq_len:     每个窗口的时间长度 S（节点特征维度）
-        mode:        soft_prior / adaptive_only / functional_only
+        mode:        固定为 soft_prior
         rank:        功能图低秩分解维度
-        lambda_mode: global / sample / roi（仅 soft_prior 生效）
+        lambda_mode: 固定为 global
         lambda_init: λ 初值（默认 0.7，偏向信任 SC）
         delta_a:     是否启用低秩 subject-specific 邻接残差 ΔA
         delta_rank:  ΔA 的秩，None 时取 max(4, rank // 2)
-        prob_mask:   是否启用可学习概率掩码（straight-through）
         sinkhorn_iters: 对称 Sinkhorn 迭代次数
         self_loop_eps:  Sinkhorn 前附加的对角项，保证无零行（数值安全）
-        return_sequence: 是否额外导出逐窗功能图 A_seq（供时间一致性正则）
     """
 
-    PRIOR_MODES = ('soft_prior', 'adaptive_only', 'functional_only')
-    LAMBDA_MODES = ('global', 'sample', 'roi')
+    PRIOR_MODES = ('soft_prior',)
+    LAMBDA_MODES = ('global',)
 
     def __init__(
         self,
@@ -93,10 +73,8 @@ class SoftAnatomicalPrior(nn.Module):
         lambda_init: float = 0.7,
         delta_a: bool = True,
         delta_rank: int = None,
-        prob_mask: bool = False,
         sinkhorn_iters: int = 64,
         self_loop_eps: float = 1e-4,
-        return_sequence: bool = False,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -115,7 +93,6 @@ class SoftAnatomicalPrior(nn.Module):
         self.lambda_init = float(min(max(lambda_init, 1e-3), 1.0 - 1e-3))
         self.sinkhorn_iters = int(sinkhorn_iters)
         self.self_loop_eps = float(self_loop_eps)
-        self.return_sequence = bool(return_sequence)
         self.eps = float(eps)
 
         # ── 功能图低秩分解 U Vᵀ ─────────────────────────────────────
@@ -127,18 +104,8 @@ class SoftAnatomicalPrior(nn.Module):
             nn.init.zeros_(lin.bias)
 
         # ── λ 混合系数（仅 soft_prior 需要；其余模式 SC 不参与）────────
-        self.lambda_logit = None
-        self.lambda_proj = None
-        if mode == 'soft_prior':
-            if lambda_mode == 'global':
-                self.lambda_logit = nn.Parameter(
-                    torch.tensor(prob_to_logit(self.lambda_init), dtype=torch.float32))
-            else:
-                # sample: 作用于池化特征 [B, S] → [B, 1]
-                # roi:    作用于逐 ROI 特征 [B, F, S] → [B, F, 1]
-                self.lambda_proj = nn.Linear(self.seq_len, 1)
-                nn.init.zeros_(self.lambda_proj.weight)
-                nn.init.constant_(self.lambda_proj.bias, prob_to_logit(self.lambda_init))
+        self.lambda_logit = nn.Parameter(
+            torch.tensor(prob_to_logit(self.lambda_init), dtype=torch.float32))
 
         # ── 低秩邻接残差 ΔA（dp Xavier、dq 零 → 初始输出恒为 0）────────
         # 方案 §4.2：dp/dq 同时零初始化时乘积残差 ΔA = dp(dq(z))·scale 无法启动
@@ -156,13 +123,6 @@ class SoftAnatomicalPrior(nn.Module):
             nn.init.zeros_(self.dq.weight)
             nn.init.zeros_(self.dq.bias)
             self.delta_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
-
-        # ── 可学习概率掩码（straight-through，初始化保留约 95% 边）──────
-        self.prob_mask_logits = None
-        if prob_mask:
-            self.prob_mask_logits = nn.Parameter(
-                torch.full((self.features, self.features),
-                           prob_to_logit(0.95), dtype=torch.float32))
 
     # ------------------------------------------------------------------
     # 内部构件
@@ -188,15 +148,8 @@ class SoftAnatomicalPrior(nn.Module):
         return 0.5 * (p + p.transpose(-1, -2))
 
     def _mix_lambda(self, nodes: torch.Tensor) -> torch.Tensor:
-        """返回 λ（形状可广播到 [B, F, F]），非 soft_prior 模式返回 None。"""
-        if self.mode != 'soft_prior':
-            return None
-        if self.lambda_mode == 'global':
-            return torch.sigmoid(self.lambda_logit).view(1, 1, 1)
-        if self.lambda_mode == 'sample':
-            pooled = nodes.mean(dim=1)                       # [B, S]
-            return torch.sigmoid(prefix_linear(self.lambda_proj, pooled)).view(-1, 1, 1)
-        return torch.sigmoid(prefix_linear(self.lambda_proj, nodes))    # [B, F, 1]
+        """返回可广播到 [B,F,F] 的全局混合系数。"""
+        return torch.sigmoid(self.lambda_logit).view(1, 1, 1)
 
     # ------------------------------------------------------------------
     # 前向
@@ -212,31 +165,18 @@ class SoftAnatomicalPrior(nn.Module):
                         为 None 时在本模块内部复用 prepare_sc_matrix 计算。
 
         Returns:
-            dict：A_eff [B,F,F]、A_func [B,F,F]、mode；soft_prior 下附 lambda；
-                  return_sequence=True 时附 A_seq [B,W,F,F]。
+            dict：A_eff [B,F,F]、A_func [B,F,F]、mode 与全局 lambda。
         """
         if h.ndim != 4:
             raise ValueError(f"SoftAnatomicalPrior 期望 h [B,F,W,S]，收到 {tuple(h.shape)}")
         b, n, w, s = h.shape
         nodes = h.mean(dim=2)                       # [B, F, S] 窗口池化
 
-        if self.return_sequence:
-            nodes_seq = h.transpose(1, 2).reshape(b * w, n, s)   # [B*W, F, S]
-            a_seq = self._functional_graph(nodes_seq).reshape(b, w, n, n)
-            a_func = a_seq.mean(dim=1)
-        else:
-            a_seq = None
-            a_func = self._functional_graph(nodes)
-
+        a_func = self._functional_graph(nodes)
         lam = self._mix_lambda(nodes)
-
-        if self.mode == 'soft_prior':
-            if adj_norm is None:
-                _, adj_norm = prepare_sc_matrix(sc_matrix, h)
-            a = lam * adj_norm.to(dtype=h.dtype) + (1.0 - lam) * a_func
-        else:
-            # adaptive_only / functional_only：SC 不参与，纯数据驱动图
-            a = a_func
+        if adj_norm is None:
+            _, adj_norm = prepare_sc_matrix(sc_matrix, h)
+        a = lam * adj_norm.to(dtype=h.dtype) + (1.0 - lam) * a_func
 
         if self.delta_scale is not None:
             z = prefix_layernorm(self.node_norm, nodes)
@@ -247,24 +187,7 @@ class SoftAnatomicalPrior(nn.Module):
             # ΔA 可正可负，裁剪保证非负（Sinkhorn 要求非负）
             a = (a + F.softplus(self.delta_scale) * da).clamp_min(0.0)
 
-        if self.prob_mask_logits is not None:
-            p = torch.sigmoid(self.prob_mask_logits)
-            p = 0.5 * (p + p.transpose(-1, -2))
-            hard = (p > 0.5).to(a.dtype)
-            mask_st = hard + p - p.detach()          # straight-through
-            a = a * mask_st.unsqueeze(0)
-
-        # functional_only 是“no-SC 参考图”：保持 row-softmax 的原始尺度不做
-        # 双随机归一化，用于对照“归一化本身”带来的差异；其余模式统一投影为
-        # 对称双随机矩阵（行归一且对称）。
-        if self.mode != 'functional_only':
-            eye = torch.eye(n, device=a.device, dtype=a.dtype).unsqueeze(0)
-            a = symmetric_sinkhorn(a + self.self_loop_eps * eye,
-                                   iters=self.sinkhorn_iters, eps=self.eps)
-
-        info = {'A_eff': a, 'A_func': a_func, 'mode': self.mode}
-        if lam is not None:
-            info['lambda'] = lam
-        if a_seq is not None:
-            info['A_seq'] = a_seq
-        return info
+        eye = torch.eye(n, device=a.device, dtype=a.dtype).unsqueeze(0)
+        a = symmetric_sinkhorn(a + self.self_loop_eps * eye,
+                               iters=self.sinkhorn_iters, eps=self.eps)
+        return {'A_eff': a, 'A_func': a_func, 'mode': self.mode, 'lambda': lam}

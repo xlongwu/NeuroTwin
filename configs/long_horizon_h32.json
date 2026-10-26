@@ -1,7 +1,7 @@
 {
   "name": "h32_supervision",
-  "baseline_config": "configs/baseline_s2_e2.json",
-  "init_weight": "checkpoints/phase2_S2/neurotwin_tfm_pretrain/base_best.pt",
+  "model_config": "configs/neurotwin.json",
+  "init_weight": "checkpoints/neurotwin_pretrain/base_best.pt",
   "split_file": "data/subject_split_finetune.json",
   "checkpoint_root": "checkpoints/h32_runs",
   "results_root": "results/h32_runs",

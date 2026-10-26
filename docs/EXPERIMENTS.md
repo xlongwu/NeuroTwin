@@ -7,10 +7,10 @@
 ## 当前保留的模型
 
 - **最优长程模型**：S2 历史记忆 + Graph-ODE + CPM，完整 H32 监督，原分组 E2 目标。
-  权重为 `checkpoints/final/h32_best.pt`，SHA256：
+  权重为 `archive/checkpoints/h32_best.pt`，SHA256：
   `2645079664d7c399a29fb8bee44cbe26baa6cce6757e7691458ac10138d4d78b`。
-- HC 起点保留于 `checkpoints/phase2_S2/neurotwin_tfm_pretrain/base_best.pt`。
-- H8 正式契约 `configs/baseline_s2_e2.json` 与对应 S2 最佳权重保留，维持旧基线入口；
+- HC 起点保留于 `checkpoints/neurotwin_pretrain/base_best.pt`。
+- H8 正式契约 `configs/neurotwin.json` 与对应 S2 最佳权重保留，维持旧基线入口；
   其历史结果受旧调度/编译解冻问题限制，不能当成有效全模型解冻的证据。
 - CPM-off 是已有实验中的简化对照，不是优于原模型的最终方案，其权重不再保留。
   T16/T17 的 BS96 不提升为通用更优默认值。
@@ -123,4 +123,41 @@ T18读出仅使用固定train/val各64人、各256锚点；读出在train拟合�
 - 图来自history_fc与学习图，不是独立实测解剖SC；内部扰动不等于真实刺激或疾病因果。
 - 联合概率预测、CPM物理删除收益及CUDA/compile逐位续训未验证；状态恢复按epoch边界。
 
-后续问题见 [RESEARCH_PLAN.md](RESEARCH_PLAN.md)，不自动启动新实验。
+## v2 主线结果（2026-10-25，HC 参照 + 病理异常定位）
+
+完整产物见 `results/pathology_analysis/run1/`（group_tests.json、roi_fdr_table.csv、
+param_group_tests.json、clinical_partial_corr.csv）与
+`results/normative_reference/`（gate_report.json、fit.npz）。主判读：
+
+- **护栏（B4，通过）**：HC val 222 人 lag-1 模型 MAE 0.0814 vs persistence
+  0.6048（improvement 86.5%，配对置换 p=1e-4）；MDD 全队列同水平（86.6–86.7%）。
+- **条件使用（B5，最终结论）**：FiLM 条件使用近零（Δpred/信号尺度中位 0.46%，
+  零化条件后 MAE 0.08143→0.08135），按方案不再开敏感性分析支线。
+- **组间检验（B7，匹配子集 1504 对）**：模型 z 偏离 **0/116 显著 ROI**
+  （max|Δz|=0.090，q≥0.34）；网络级与全脑均不显著；离散度无差异
+  （方差比 0.98，p=0.27）；负控（HC val vs test）0 显著，流程通过。
+- **并排基线**：六描述量同样 0 显著（max|Δ|=0.060）；静态 FC+岭回归
+  站内 CV OOF AUC=0.560。**T2 触发**（模型无增量）。
+- **T2 扩展（MINDy 式参数组间分析）**：个体 profile 32 维中 1 维显著
+  （q=0.013，Δ=+0.0056），范数差 −0.03%（p=0.039）——方向性存在但效应量极小。
+- **临床关联**：网络级 z 与 HAMD 无关联（|r|≤0.043）；LN 网络与 HAMA
+  r=−0.135（p=0.008，n=422 完整观测，未多重校正，描述性）。
+
+**总体结论**：在站点匹配后，该 HC 参照模型的偏离信号在组间无可靠定位效应；
+队列可分性本身也弱（FC AUC 0.56）。未匹配比较中的正向偏移（全脑 Δz +0.07）
+由站点构成混杂解释。此结论限定于当前模型、窗口（lag-1，K=64）与队列。
+完整收档与证据链见 [V2_CLOSING_REPORT.md](V2_CLOSING_REPORT.md)。
+
+## H32 线收档声明（2026-10-25，v2 重定向）
+
+自 2026-10-25 起，本文所述 H32 长程优化线正式收档：`h32_best.pt` 及上表全部
+结果只作历史对照引用，不再产生新结果或续跑任何优化支线。项目主线切换为
+**HC 参照 + 病理异常定位**（结论见 [V2_CLOSING_REPORT.md](V2_CLOSING_REPORT.md)），
+以 HC 预训练权重 `checkpoints/neurotwin_pretrain/base_best.pt`
+为主分析模型。本节不改变上文任何既有结论的解释口径。
+
+频域监督配对初筛（已收档，产物清除前留档）：train/val 各 64 人、每人 4 锚点、
+两臂各 300 次更新下，频域臂远期时间 PCC 0.183402、控制臂 0.182752、原 ODE
+0.191393——未见值得扩大的收益；修订前 64 人初筛的输出融合（最优 α=0.35 仅
+改善 MAE_H1–32 约 0.23%）与逐 ROI 幅度缩放（对 PCC/FC 仿射不变、仅恶化
+MAE/MSE）同为负结论，不再恢复。

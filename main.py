@@ -6,7 +6,6 @@
 本文件保留 main 训练循环与 CLI 定义。
 """
 import argparse
-import contextlib
 import math
 import os
 import shutil
@@ -36,13 +35,11 @@ from models.tfm import NeuroTwinTFM
 from utils.condition_schema import DROPOUT_SEED, parse_extra_codes
 from train.losses import (TFMDualLoss, compute_graph_regularization, spatial_pcc,
                           compute_cpm_mask)
-from train.prob_losses import (ensemble_crps, ensemble_energy_score,
-                               temporal_variogram_score)
 from train.optim import (ModelEMA, build_optimizer, build_scheduler,
                          check_pretrain_config_compat, count_trainable_params,
                          load_backbone_only, load_backbone_weights,
                          migrate_pretrained_checkpoint, param_report,
-                         save_backbone_weights, set_finetune_stage,
+                         save_backbone_weights, set_finetune_trainability,
                          unfreeze_while_preserving_state)
 from train.training_state import (TrainingState, load_training_state,
                                   read_training_state_metadata,
@@ -172,7 +169,7 @@ def _index_condition(cond, index):
 def dynamics_extras(batch, device):
     """搬运 graph_ode 动态输入：calibration_bold [B,F,1,L] 与 controls [B,H,F]。
 
-    旧数据路径（discrete / legacy_mask / 非 raw）不产出这两个键，返回
+    未提供校准或控制的数据不产出这两个键，返回
     ``(None, None)``，forward 与 loss 的行为与旧版完全一致。
     """
     cal = batch.get('calibration_bold', None)
@@ -214,7 +211,7 @@ def condition_loader_kwargs(args, bundle=None):
         raise ValueError(f'mode={args.mode} 无法推导 condition_group，请显式指定')
     base = None
     if bundle is not None:
-        from experiments.evaluate_variant import condition_stats_from_bundle
+        from analysis.evaluate import condition_stats_from_bundle
         base = condition_stats_from_bundle(bundle, group)
     return {
         'condition_group': group,
@@ -469,28 +466,6 @@ def _format_loss_weight(name, info):
     return f"{name}: w={info['weight']:.4f} (log_s={log_s_text})"
 
 
-@contextlib.contextmanager
-def paired_val_rng(active: bool, seed: int):
-    """验证期共同随机数：固定采样轨迹的随机流，使各 epoch 的集合指标（CRPS/ES/
-    Variogram）比较的是模型权重而不是采样运气；退出时恢复原随机流，训练侧
-    dropout/数据采样序列逐位不变。``active=False`` 时是空操作。
-
-    S4 的 ``dynamics_samples`` 在 forward 内用 ``torch.randn`` 生成，若沿用训练推进后
-    的全局 RNG，checkpoint 选优可能选中「运气好」的那一次采样（方案 §S4 验收）。
-    """
-    if not active:
-        yield
-        return
-    cpu_state = torch.get_rng_state()
-    cuda_state = (torch.cuda.get_rng_state_all()
-                  if torch.cuda.is_available() else None)
-    torch.manual_seed(int(seed))
-    try:
-        yield
-    finally:
-        torch.set_rng_state(cpu_state)
-        if cuda_state is not None:
-            torch.cuda.set_rng_state_all(cuda_state)
 
 
 @torch.no_grad()
@@ -529,8 +504,7 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
     cpm_acc = defaultdict(lambda: [0.0, 0, 0])       # h -> [Σ|err|, Σw, n_elem]
     rollout_hs = [int(h) for h in (rollout_horizons or []) if int(h) <= int(rollout_steps)]
     horizon = int(getattr(model, 'cpm_horizon', 0) or args.cpm_horizon)
-    dyn_horizon = (max(horizon, dyn_metric_horizon)
-                   if getattr(model, 'dynamics_mode', 'discrete') == 'graph_ode' else horizon)
+    dyn_horizon = (max(horizon, dyn_metric_horizon))
     pbar = make_pbar(data_loader, len(data_loader), '[Val-TFM]')
 
     for batch in pbar:
@@ -570,26 +544,6 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                                            cpm_target, cpm_mask,
                                            context_last=bl, epoch=loss_epoch,
                                            **dyn_kwargs)
-        # S4：验证集集合 CRPS（仅监控/可选选优；不参与反传）
-        prob_samples = aux_info.get('dynamics_samples', None)
-        if torch.is_tensor(prob_samples) and prob_samples.shape[0] > 0:
-            hp = min(int(prob_samples.shape[3]), int(horizon), int(fut.shape[2]))
-            if hp > 0:
-                ps = prob_samples[:, :, :, :hp]
-                ft = fut[:, :, :hp]
-                fm = fmask[:, :hp]
-                meters['metric_crps_dynamics'].append(
-                    ensemble_crps(ps, ft, fm).detach())
-                meters['metric_energy_dynamics'].append(
-                    ensemble_energy_score(ps, ft, fm).detach())
-                if hp >= 2:
-                    meters['metric_variogram_dynamics'].append(
-                        temporal_variogram_score(ps, ft, fm).detach())
-                    tv = temporal_variogram_score(ps, ft, fm, lags=(1, 2, 4), power=0.5)
-                    meters['metric_temporal_variogram_p05'].append(tv.detach())
-                    meters['metric_probability_joint'].append((
-                        args.s4_crps_weight * ensemble_crps(ps, ft, fm)
-                        + getattr(args, 's4_variogram_weight', 0.0) * tv).detach())
         graph_reg, graph_stats = compute_graph_regularization(
             aux_info, device,
             sparsity_weight=args.sc_sparsity_weight,
@@ -735,25 +689,6 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
     return result
 
 
-def fit_pathology_normalizer(model, dl, args):
-    """用训练集病理评分拟合模型内归一化模块的统计量。
-
-    仅在 finetune 模式且模型持有 pathology_normalizer 时生效。
-    当 --reuse_pretrained_norm_stats 为真且模块已带拟合标记时，跳过重新拟合。
-    """
-    norm = getattr(model, 'pathology_normalizer', None)
-    if norm is None:
-        return
-    if getattr(args, 'reuse_pretrained_norm_stats', False) and norm.is_fitted():
-        print(f'[HAMD norm] 复用已加载的归一化统计量 (mode={norm.mode})')
-        return
-    scores = dl.get_train_pathology_scores()
-    if scores is None or len(scores) == 0:
-        raise RuntimeError('无法获取训练集病理（HAMD）评分，pathology normalizer 拟合失败。')
-    norm.fit(scores)
-    print(f'[HAMD norm] mode={norm.mode} | 拟合样本数={len(scores)} | '
-          f'center={norm.center.tolist()} | scale={norm.scale.tolist()} | '
-          f'out_dim={norm.out_dim}')
 
 
 def check_seed_separation(args):
@@ -784,7 +719,6 @@ def _resume_argument_mismatches(saved_args: dict, current_args: dict) -> dict:
     ignored = {
         'checkpoint_dir', 'name', 'pretrained_weight', 'condition_inherit_stats',
         'resume_training_state', 'save_training_state', 'eval_after_train',
-        's4_variogram_calibration',
     }
     keys = (set(saved_args) | set(current_args)) - ignored
     return {key: (saved_args.get(key, '<missing>'), current_args.get(key, '<missing>'))
@@ -793,7 +727,7 @@ def _resume_argument_mismatches(saved_args: dict, current_args: dict) -> dict:
 
 
 def main(args):
-    # checkpoint config.args 快照保留 model_arch 键：evaluate_variant 重建与
+    # checkpoint config.args 快照保留 model_arch 键：evaluate 重建与
     # pretrain 签名校验依赖它（TFM 已是唯一主干，CLI 不再暴露该开关）
     args.model_arch = 'tfm'
     resume_metadata = None
@@ -813,10 +747,6 @@ def main(args):
         if (saved_study.get('mode') != args.mode
                 or saved_args.get('mode') != args.mode):
             raise ValueError('训练状态 mode 与当前入口不一致')
-        if (args.s4_variogram_weight == -1
-                and isinstance(saved_args.get('s4_variogram_calibration'), dict)):
-            args.s4_variogram_weight = float(saved_args['s4_variogram_weight'])
-            args.s4_variogram_calibration = saved_args['s4_variogram_calibration']
     # DataLoader 共享内存策略：默认的 file_descriptor 依赖 TMPDIR 下的
     # resource_sharer socket；Qoder/GUI 会话切换会清理该临时目录，导致长训练在
     # worker 交接时抛 FileNotFoundError。file_system 走 /dev/shm 文件描述符，
@@ -871,7 +801,7 @@ def main(args):
         print(f'[Pretrain] 正在启动预训练 | task_mode={dims["task_mode"]} | '
               f'model_arch=tfm | CPM horizon: {dims["cpm_horizon"]}')
         print('=' * 50 + '\n' + '=' * 50)
-        print('启动模式: [Stage 1] Healthy Control (HC) physics backbone pretraining')
+        print('启动模式: Healthy Control (HC) physics backbone pretraining')
     else:
         print(f'[Finetune] Starting finetuning | task_mode={dims["task_mode"]} | '
               f'model_arch=tfm | CPM horizon: {dims["cpm_horizon"]}')
@@ -897,7 +827,7 @@ def main(args):
     cond_enabled = bool(getattr(args, 'condition_arm', None) not in (None, '', 'none'))
     if args.pretrained_horizon_policy != 'require_match' and (
             args.mode != 'finetune' or not cond_enabled or args.load_backbone_only
-            or args.s4_variant != 'off' or args.pretrained_arch_policy != 'require_match'):
+            or args.pretrained_arch_policy != 'require_match'):
         raise ValueError('CPM horizon 扩展仅支持确定性条件微调的严格显式迁移路径')
     condition_group = (str(args.condition_group) if getattr(args, 'condition_group', None)
                        else CONDITION_GROUP_BY_MODE.get(args.mode)) if cond_enabled else None
@@ -1028,20 +958,8 @@ def main(args):
         condition_config=condition_cfg_dict,
         condition_stats_payload=condition_stats_payload,
         cond_inject=args.cond_inject,
-        cond_backbone_scope=args.cond_backbone_scope,
-        cond_norm_generator=args.cond_norm_generator,
-        cond_norm_ident_dim=args.cond_norm_ident_dim,
-        cond_lambda_os=args.cond_lambda_os,
         cond_lambda_cpm=args.cond_lambda_cpm,
-        cond_gate_residual=args.cond_gate_residual,
-        cond_gate_hidden=args.cond_gate_hidden,
-        pathology_input_dim=args.pathology_input_dim,
-        pathology_norm_mode=args.pathology_norm_mode,
-        pathology_norm_quantiles=args.pathology_norm_quantiles,
-        pathology_norm_rbf_knots=args.pathology_norm_rbf_knots,
         use_revin=args.norm,
-        # graph_ode 动态路线（方案 §6）：旧默认 discrete / personalized=False /
-        # legacy_mask 不改变任何已有行为
         dynamics_mode=args.dynamics_mode,
         ode_steps=args.ode_steps,
         dynamics_dt=args.dynamics_dt,
@@ -1049,15 +967,7 @@ def main(args):
         personalized=args.personalized,
         profile_dim=args.profile_dim,
         dynamics_history_memory=args.dynamics_history_memory,
-        s4_variant=args.s4_variant,
-        s4_residual_rank=args.s4_residual_rank,
-        s4_residual_hidden=args.s4_residual_hidden,
-        s4_residual_init_scale=args.s4_residual_init_scale,
-        s4_noise_rank=args.s4_noise_rank,
-        s4_noise_scale=args.s4_noise_scale,
-        s4_train_samples=args.s4_train_samples,
     ).to(device)
-    s4_active = args.s4_variant != 'off'
     migration_report = (resume_progress_data.get('study', {}).get('pretrained_migration')
                         if resume_progress_data is not None else None)
 
@@ -1070,7 +980,7 @@ def main(args):
         saved_layout = None
         same_group_arm = False
         if cond_enabled and resume_metadata is None:
-            from experiments.evaluate_variant import load_condition_bundle
+            from analysis.evaluate import load_condition_bundle
             bundle = load_condition_bundle(args.pretrained_weight)
             if bundle is not None:
                 saved_layout = (bundle.get('meta') or {}).get('layout_hash')
@@ -1117,35 +1027,15 @@ def main(args):
             load_backbone_weights(model, args.pretrained_weight, device,
                                   arch_policy=args.pretrained_arch_policy,
                                   skip_pattern=getattr(args, 'pretrained_skip_pattern', ''))
-        set_finetune_stage(model, backbone_unfrozen=False)
-        stage1_trainables = []
+        set_finetune_trainability(model, backbone_unfrozen=False)
+        condition_trainables = []
         if getattr(model.one_step_head, 'film', None) is not None:
-            stage1_trainables.append('One-Step FiLM')
+            condition_trainables.append('One-Step FiLM')
         if getattr(model.cpm_head, 'film', None) is not None:
-            stage1_trainables.append('CPM FiLM')
-        if s4_active and args.s4_stage == 'head':
-            # S4 两阶段 stage 1：严格只训练新增概率模块，连条件适配器也冻结，
-            # 避免 S2 点预测损失（或常数项）污染概率模块的梯度解释。
-            for p in model.parameters():
-                p.requires_grad = False
-            s4_modules = model.s4_modules()
-            if not s4_modules:
-                raise RuntimeError('S4 已启用但没有构建任何 S4 模块，请检查模型构造参数。')
-            for module in s4_modules:
-                for p in module.parameters():
-                    p.requires_grad = True
-            print(f'[S4] stage=head：前 {args.freeze_backbone_epochs} epoch 仅训练 '
-                  f'{args.s4_variant} 新模块（主干/条件/双头全部冻结）；'
-                  '之后解冻并联合微调。')
-        elif s4_active and args.s4_stage == 'joint':
-            set_finetune_stage(model, backbone_unfrozen=True)
-            print(f'[S4] stage=joint：从 epoch 0 起联合训练 {args.s4_variant} 与 S2 全部模块。')
-        else:
-            print(f'已进入分阶段微调: 前期仅训练条件适配器'
-                  f'（{ "+ ".join(stage1_trainables) }），后期逐步解冻主干。')
+            condition_trainables.append('CPM FiLM')
+        print(f'已进入分阶段微调: 前期仅训练条件适配器'
+              f'（{ "+ ".join(condition_trainables) }），后期逐步解冻主干。')
 
-    if args.mode == 'finetune' and resume_metadata is None:
-        fit_pathology_normalizer(model, dl, args)
 
     print(f"Total Model Parameters: {sum(p.numel() for p in model.parameters())}")
     print(f"Trainable Parameters: {count_trainable_params(model)}")
@@ -1161,46 +1051,6 @@ def main(args):
 
     # TFM 双目标损失（方案 §20）：L_one = Huber + λ_pcc(1-PCC)；
     # L_CPM = γ 加权逐 horizon Huber。不再使用数学等价的 abs+delta 双计。
-    if args.s4_variogram_weight == -1:
-        # A small, train-only pilot fixes lambda before any optimizer update.
-        # Separate zero-worker loader plus RNG restoration preserves the P0/P1
-        # initialization and subsequent training sampling sequence.
-        import random
-        import numpy as np
-        import itertools
-        np_state, py_state = np.random.get_state(), random.getstate()
-        was_training = model.training
-        pilot = torch.utils.data.DataLoader(
-            train_data.dataset, batch_sampler=train_data.batch_sampler,
-            collate_fn=train_data.collate_fn, num_workers=0)
-        crps_sum, tv_sum, n_pilot = 0.0, 0.0, 0
-        try:
-            with torch.random.fork_rng(), torch.no_grad():
-                model.eval()
-                for batch in itertools.islice(pilot, 4):
-                    bx, _, _, _, bs, bp = next_point_batch(batch, device)
-                    bcal, bctl = dynamics_extras(batch, device)
-                    _, aux = model(bx, bs, bp, condition=condition_batch(batch, device),
-                                   controls=bctl, calibration_bold=bcal)
-                    ps = aux['dynamics_samples']
-                    target = batch['future'].to(device)
-                    mask = batch['future_mask'].to(device)
-                    crps_sum += float(ensemble_crps(ps, target, mask))
-                    tv_sum += float(temporal_variogram_score(
-                        ps, target, mask, lags=(1, 2, 4), power=0.5))
-                    n_pilot += 1
-        finally:
-            np.random.set_state(np_state)
-            random.setstate(py_state)
-            model.train(was_training)
-        if not n_pilot or not math.isfinite(tv_sum) or tv_sum <= 0:
-            raise ValueError('P1 pilot has no finite positive temporal variogram')
-        args.s4_variogram_weight = 0.05 * crps_sum / tv_sum
-        args.s4_variogram_calibration = dict(
-            batches=n_pilot, crps=crps_sum/n_pilot, variogram=tv_sum/n_pilot,
-            target_loss_ratio=0.05, source='train-only initialization; no optimizer updates')
-        print(f'[P1] fixed train-only lambda_v={args.s4_variogram_weight:.8g}; '
-              f'pilot={args.s4_variogram_calibration}')
 
     if args.temporal_mode == 'adaptive' and args.adaptive_delta_scale <= 0:
         # Read only MDD-train subjects, in the calibrated data space used by loss.
@@ -1278,16 +1128,15 @@ def main(args):
           f"（args 值 {args.tfm_patho_mode}）"
           f" | OS FiLM: {'on' if getattr(model.one_step_head, 'film', None) is not None else 'off'}"
           f" | CPM FiLM: {'on' if getattr(model.cpm_head, 'film', None) is not None else 'off'}"
-          f" | 主干条件 RMSNorm: {'on' if getattr(model, 'cond_norm', None) is not None else 'off'}")
+)
 
-    backbone_unfrozen = ((args.mode == 'pretrain')
-                         or (s4_active and args.s4_stage == 'joint'))
+    backbone_unfrozen = (args.mode == 'pretrain')
     optimizer = build_optimizer(model, criterion, args)
     scheduler = build_scheduler(optimizer, args)
     if resume_metadata is not None:
         saved_unfrozen = bool(resume_progress_data.get('backbone_unfrozen', False))
         if saved_unfrozen and not backbone_unfrozen:
-            set_finetune_stage(model, backbone_unfrozen=True)
+            set_finetune_trainability(model, backbone_unfrozen=True)
             added, names = unfreeze_while_preserving_state(model, optimizer, args)
             scheduler.sync_param_groups()
             print(f'[resume] 重建已解冻 optimizer 拓扑：新增参数 numel={added} '
@@ -1297,7 +1146,7 @@ def main(args):
         backbone_unfrozen = saved_unfrozen
     _report_conditioning(
         model, optimizer, args, dl,
-        allow_frozen_conditioning=(s4_active and args.s4_stage == 'head'))
+        allow_frozen_conditioning=False)
     scaler    = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     ema       = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     if args.compile and device.type == 'cuda' and hasattr(torch, 'compile'):
@@ -1312,24 +1161,11 @@ def main(args):
 
     # 主 checkpoint 判据（prompt §三十八：不使用单纯 PCC 选模型）：
     #   graph_ode → 验证集 H1..N 被试级多步 MAE（本阶段改动，越低越好）
-    #   discrete  → 无 Graph-ODE 轨迹可评估，保持原单步 next-state MAE 判据
     # 两个口径数值量纲不同、不可互相比较；同一 run 内判据固定，不继承另一口径的历史 best。
     dyn_metric_horizon = resolve_dynamics_metric_horizon(args)
     dyn_metric_key = dynamics_metric_key(dyn_metric_horizon)
-    if s4_active and args.s4_ckpt_metric == 'crps':
-        ckpt_metric_key = 'metric_crps_dynamics'
-        ckpt_metric_name = 'val dynamics CRPS'
-    elif args.dynamics_mode == 'graph_ode':
-        if s4_active and dyn_metric_horizon > int(dims['cpm_horizon']):
-            raise ValueError(
-                f'--dynamics_metric_horizon={dyn_metric_horizon} 超出模型的 '
-                f'--cpm_horizon={dims["cpm_horizon"]}：多步判据无法覆盖到第 '
-                f'{dyn_metric_horizon} 步，请调小 horizon 或增大预测范围。')
-        ckpt_metric_key = dyn_metric_key
-        ckpt_metric_name = dynamics_metric_name(dyn_metric_horizon)
-    else:
-        ckpt_metric_key = 'metric_mae_next'
-        ckpt_metric_name = 'val next-state MAE'
+    ckpt_metric_key = dyn_metric_key
+    ckpt_metric_name = dynamics_metric_name(dyn_metric_horizon)
     selector = CheckpointSelector(ckpt_metric_key, ckpt_metric_name,
                                   patience=args.patience)
     print(f"[next_timepoint] checkpoint 选择判据: {ckpt_metric_name}"
@@ -1465,7 +1301,7 @@ def main(args):
         if (args.mode == 'finetune'
                 and not backbone_unfrozen
                 and epoch >= args.freeze_backbone_epochs):
-            set_finetune_stage(model, backbone_unfrozen=True)
+            set_finetune_trainability(model, backbone_unfrozen=True)
             backbone_unfrozen = True
             # 解冻只追加新可训练参数：已训练条件参数的 Adam 状态与 LR 进度必须保留
             added, names = unfreeze_while_preserving_state(model, optimizer, args)
@@ -1524,55 +1360,17 @@ def main(args):
                         dynamics_target_norm=_normalized_future(
                             model, by_roll, aux_info.get('norm_stats', None)),
                     )
-                prob_loss = None
-                variogram_loss = outputs.new_zeros(())
-                if s4_active:
-                    prob_samples = aux_info.get('dynamics_samples', None)
-                    if not torch.is_tensor(prob_samples):
-                        raise RuntimeError(
-                            'S4 已启用但模型未返回 dynamics_samples；请检查 s4_variant '
-                            '与 graph_ode 路径。')
-                    if by_roll is None or bm_roll is None:
-                        raise RuntimeError(
-                            'S4 CRPS 训练需要未来真值 future/future_mask，但当前 batch '
-                            '没有（请确认 train_rollout_steps > 0）。')
-                    hp = min(int(prob_samples.shape[3]), int(by_roll.shape[2]))
-                    prob_loss = ensemble_crps(
-                        prob_samples[:, :, :, :hp], by_roll[:, :, :hp],
-                        bm_roll[:, :hp])
-                    if args.s4_variogram_weight > 0:
-                        variogram_loss = temporal_variogram_score(
-                            prob_samples[:, :, :, :hp], by_roll[:, :, :hp],
-                            bm_roll[:, :hp], lags=(1, 2, 4), power=0.5)
-                if s4_active and args.s4_stage == 'head' and not backbone_unfrozen:
-                    # stage 1：只回传 CRPS，不计算/不反传 S2 点预测损失与损失权重参数
-                    zero = outputs.new_zeros(())
-                    total_loss = args.s4_crps_weight * prob_loss
-                    loss_stats = {'loss_one': zero, 'loss_cpm': zero,
-                                  'loss_crps': prob_loss.detach()}
-                    graph_reg = zero
-                    graph_stats = {}
-                else:
-                    total_loss, loss_stats = criterion(
-                        outputs, by, aux_info['cpm_pred'], by_roll,
-                        cpm_mask_train, context_last=bl, epoch=epoch, **dyn_kwargs)
-                    graph_reg, graph_stats = compute_graph_regularization(
-                        aux_info, device,
-                        sparsity_weight=args.sc_sparsity_weight,
-                        entropy_weight=args.sc_entropy_weight,
-                        temporal_weight=args.sc_temporal_weight,
-                    )
-                    total_loss = total_loss + graph_reg
-                    if prob_loss is not None:
-                        total_loss = total_loss + args.s4_crps_weight * prob_loss
-                        loss_stats['loss_crps'] = prob_loss.detach()
+                total_loss, loss_stats = criterion(
+                    outputs, by, aux_info['cpm_pred'], by_roll,
+                    cpm_mask_train, context_last=bl, epoch=epoch, **dyn_kwargs)
+                graph_reg, graph_stats = compute_graph_regularization(
+                    aux_info, device,
+                    sparsity_weight=args.sc_sparsity_weight,
+                    entropy_weight=args.sc_entropy_weight,
+                    temporal_weight=args.sc_temporal_weight,
+                )
+                total_loss = total_loss + graph_reg
 
-                if prob_loss is not None:
-                    total_loss = total_loss + args.s4_variogram_weight * variogram_loss
-                    loss_stats['loss_temporal_variogram'] = variogram_loss.detach()
-                    loss_stats['loss_probability_joint'] = (
-                        args.s4_crps_weight * prob_loss
-                        + args.s4_variogram_weight * variogram_loss).detach()
 
             scaler.scale(total_loss).backward()
 
@@ -1612,12 +1410,11 @@ def main(args):
             pbar_metrics(pbar, **postfix)
 
         eval_model  = ema.ema if ema is not None else model
-        with paired_val_rng(s4_active, args.val_sampling_seed):
-            val_metrics = evaluate_tfm(eval_model, val_data, criterion, device,
-                                       args, rollout_steps=eval_rollout_steps,
-                                       rollout_horizons=eval_rollout_horizons,
-                                       pathology_epoch=epoch,
-                                       loss_epoch=epoch)
+        val_metrics = evaluate_tfm(eval_model, val_data, criterion, device,
+                                   args, rollout_steps=eval_rollout_steps,
+                                   rollout_horizons=eval_rollout_horizons,
+                                   pathology_epoch=epoch,
+                                   loss_epoch=epoch)
         scheduler.step()
 
         train_metrics = {k: torch.stack(vs).mean().item() for k, vs in train_meters.items()}
@@ -1816,7 +1613,7 @@ def main(args):
             and not (resume_metadata is not None
                      and (early_stopped or start_epoch >= args.train_epochs))):
         # 训练结束自动评 test（闭环）：复用版本化切分 manifest。评估失败不影响训练产物。
-        from experiments.evaluate_variant import evaluate as _eval_variant
+        from analysis.evaluate import evaluate as _eval_variant
         eval_dir = os.path.join(save_dir, 'eval')
         try:
             summary = _eval_variant(best_path, eval_dir, eval_splits=('test',),
@@ -1826,17 +1623,15 @@ def main(args):
             print(f"[post-train eval] 详细指标见: {eval_dir}/metrics_test.json")
         except Exception as e:
             print(f"[post-train eval] 自动评估失败（训练产物不受影响）: {type(e).__name__}: {e}\n"
-                  f"可手动复评: python -m experiments.evaluate_variant --ckpt {best_path} --out_dir {eval_dir}")
+                  f"可手动复评: python -m analysis.evaluate --ckpt {best_path} --out_dir {eval_dir}")
     elif (args.mode == 'finetune' and resume_metadata is not None
           and (early_stopped or start_epoch >= args.train_epochs)):
         print('[post-train eval] 续训状态已早停或达到原预算，跳过重复的自动 test；'
               'best 权重仍可手动复评。')
 
 
-#: 历史入口的默认预训练权重：**只在 finetune 省略 --pretrained_weight 时回填**
-#: （保持旧脚本行为不变）。正式 runbook（两个 *_tfm.sh 脚本）始终显式传入起点权重，
-#: 不依赖这个默认值。
-LEGACY_PRETRAINED_WEIGHT = './checkpoints/neurotwin_pretrain/base_best.pt'
+#: 微调的默认健康预训练起点；训练脚本也可用 HC_WEIGHT 显式覆盖。
+DEFAULT_PRETRAINED_WEIGHT = './checkpoints/neurotwin_pretrain/base_best.pt'
 
 
 def parse_args():
@@ -1850,7 +1645,7 @@ def parse_args():
     p.add_argument('--pretrained_weight', default='',
                    help='起点权重路径。finetune 必填；pretrain 一律留空。'
                         '省略时按历史入口回填 '
-                        f'{LEGACY_PRETRAINED_WEIGHT}。')
+                        f'{DEFAULT_PRETRAINED_WEIGHT}。')
     p.add_argument('--save_training_state', action='store_true',
                    help='每个完整 epoch 后原子保存可续训状态 training_state.pt。')
     p.add_argument('--resume_training_state', default='',
@@ -1897,21 +1692,11 @@ def parse_args():
                    action='store_false',
                    help='finetune 训练结束后不自动评 test（默认自动评估并落盘到'
                         ' <save_dir>/eval/）')
-    p.add_argument('--pathology_norm_mode', default='robust_z',
-                   choices=['identity', 'robust_z', 'zscore_quadratic',
-                            'empirical_cdf', 'quantile', 'zscore_rbf'],
-                   help='模型内病理评分归一化模式，决定条件输入宽度。')
-    p.add_argument('--pathology_norm_quantiles', type=int, default=64,
-                   help='empirical_cdf/quantile 模式的分位数网格点数。')
-    p.add_argument('--pathology_norm_rbf_knots', type=int, default=8,
-                   help='zscore_rbf 模式的 RBF 结点数。')
     p.add_argument('--pathology_fields', default=None,
                    help='逗号分隔的病理字段列表，默认 None 时使用 HAMD 标量。')
     p.add_argument('--pathology_missing', default='drop',
                    choices=['drop', 'zero', 'mean'],
                    help='病理字段缺失处理策略。')
-    p.add_argument('--reuse_pretrained_norm_stats', type=str2bool, default=True,
-                   help='加载的检查点已带归一化统计量时是否复用（否则用 train subjects 重新拟合）。')
     p.add_argument('--adapter_lr_scale', type=float, default=1.0,
                    help='条件适配器（adapter）参数组的学习率缩放（历史键；'
                         '未设 --condition_lr_scale 时作为其回退值）。')
@@ -1956,31 +1741,17 @@ def parse_args():
                    help='融合后条件向量宽度 C。')
     p.add_argument('--cond_h_delta', type=int, default=64,
                    help='增量 DeltaE 的隐藏宽度 H_delta。')
-    p.add_argument('--cond_delta_style', default='mlp', choices=['linear', 'mlp'],
+    p.add_argument('--cond_delta_style', default='mlp', choices=['mlp'],
                    help='DeltaE 结构；mlp 末层零初始化使 c_MDD 起点等于 c_demo。')
     p.add_argument('--cond_dropout_p', type=float, default=0.0,
                    help='Condition Dropout 的遮蔽概率 p（受试者级、每 epoch 固定）。')
     p.add_argument('--cond_dropout_seed', type=int, default=DROPOUT_SEED,
                    help='Condition Dropout 种子（与 --seed 模型种子、划分 seed 分离）。')
     p.add_argument('--cond_inject', default='heads',
-                   choices=['heads', 'backbone', 'heads+backbone'],
-                   help='注入位置：双头 FiLM / 主干条件 RMSNorm / 两者。')
-    p.add_argument('--cond_backbone_scope', default='last1',
-                   choices=['last1', 'last2', 'all'],
-                   help='主干调制范围（先只调制最后一个 block 的三个 norm 位置）。')
-    p.add_argument('--cond_norm_generator', default='per_layer',
-                   choices=['per_layer', 'shared'],
-                   help='条件 norm 生成器：逐层独立 或 共享生成器＋层身份嵌入。')
-    p.add_argument('--cond_norm_ident_dim', type=int, default=8,
-                   help='shared 生成器的层身份嵌入宽度。')
-    p.add_argument('--cond_lambda_os', type=float, default=1.0,
-                   help='OS 头注入强度 λ（固定值，可被可学习 W 吸收，不是特征贡献比）。')
+                   choices=['heads'],
+                   help='固定使用预测头 FiLM。')
     p.add_argument('--cond_lambda_cpm', type=float, default=1.0,
                    help='CPM 头注入强度 λ（同上）。')
-    p.add_argument('--cond_gate_residual', type=str2bool, default=False,
-                   help='扩展候选：条件门控残差 h + g(h,c)⊙R(h,c)（R 末层零初始化）。')
-    p.add_argument('--cond_gate_hidden', type=int, default=64,
-                   help='条件门控残差分支 R 的隐藏宽度。')
     p.add_argument('--cond_control', default='none',
                    choices=['none', 'static_new', 'mask_only'],
                    help='信息/容量对照：static_new=新增五字段取训练常量且新增 mask '
@@ -1992,14 +1763,11 @@ def parse_args():
 
     # ---------- SC 软先验（soft anatomical prior / 图正则） ----------
     p.add_argument('--sc_prior_mode', default='soft_prior',
-                   choices=['scaled', 'soft_prior', 'adaptive_only', 'functional_only'],
-                   help='SC 注入形态：scaled=旧的静态 SC 度归一化（复现 Phase 1）；'
-                        'soft_prior=λ·A_SC+(1-λ)·A_func（默认）；'
-                        'adaptive_only=纯数据驱动功能图（同归一化口径）；'
-                        'functional_only=功能图原始 row_softmax（不做 Sinkhorn）。')
+                   choices=['soft_prior'],
+                   help='历史功能图与学习功能图的软先验。')
     p.add_argument('--sc_lambda_mode', default='global',
-                   choices=['global', 'sample', 'roi'],
-                   help='λ 混合系数的粒度：global 全局标量 / sample 样本级 / roi 逐 ROI。')
+                   choices=['global'],
+                   help='λ 使用全局可学习标量。')
     p.add_argument('--sc_lambda_init', type=float, default=0.7,
                    help='λ 初值（越大越信任 SC 结构先验）。')
     p.add_argument('--sc_prior_rank', type=int, default=12,
@@ -2068,7 +1836,7 @@ def parse_args():
                    help='TFM 损失：one-step Huber 项权重（方案 §20.1）。')
     p.add_argument('--lambda_cpm', type=float, default=1.0,
                    help='TFM 损失：CPM 轨迹项权重（0 可退化为纯 one-step 的 '
-                        'Stage 0 基线，方案 §24）。')
+                        '单步目标，方案 §24）。')
     p.add_argument('--lambda_pcc', type=float, default=0.1,
                    help='损失：spatial PCC 惩罚项权重（1 - 逐 ROI 空间相关）。')
     p.add_argument('--cpm_gamma', type=float, default=1.0,
@@ -2091,7 +1859,7 @@ def parse_args():
                    choices=['none', 'film'],
                    help='One-Step 头病理条件模式：none=无条件（HC 预训练自动置为 '
                         'none）；film=FiLM 调制转移隐层（当前 baseline，legacy '
-                        'discrete 路线）。CPM 恒保留自身 FiLM。')
+                        '动力学条件注入）。CPM 保留自身 FiLM。')
 
     # ---------- 任务口径与 next_timepoint 数据协议 ----------
     p.add_argument('--task_mode', default='next_timepoint',
@@ -2163,18 +1931,16 @@ def parse_args():
                         '并显式打印 loaded/missing/reinitialized 清单。')
 
     # ---------- graph_ode 动态路线（神经微分方程优化，方案 §6/§9/§10） ----------
-    p.add_argument('--dynamics_mode', default='discrete',
-                   choices=['discrete', 'graph_ode'],
-                   help='动态分支：discrete=旧 OneStepDynamicsHead（delta_norm+x_last，默认）；'
-                        'graph_ode=受控条件图 ODE（Heun RK2 同步积分 z/q，持续状态预测）。')
+    p.add_argument('--dynamics_mode', default='graph_ode',
+                   choices=['graph_ode'],
+                   help='固定采用受控条件图 ODE（Heun RK2 同步积分 z/q）。')
     p.add_argument('--ode_steps', type=int, default=2,
                    help='graph_ode 每个区间的固定 Heun RK2 步数（>=1；默认 2）。')
     p.add_argument('--dynamics_dt', type=float, default=1.0,
                    help='graph_ode 每个区间的积分步长 dt（>0，单位=TR；默认 1.0）。')
-    p.add_argument('--graph_source', default='legacy_mask',
-                   choices=['legacy_mask', 'history_fc'],
-                   help='图来源：legacy_mask=外部解剖 Mask 图（旧路径）；'
-                        'history_fc=当前可见历史的 signed Pearson 绝对值功能耦合图'
+    p.add_argument('--graph_source', default='history_fc',
+                   choices=['history_fc'],
+                   help='当前可见历史的 signed Pearson 绝对值功能耦合图'
                         '（经 SoftAnatomicalPrior，不要求 Mask 文件）。')
     p.add_argument('--personalized', type=str2bool, default=False,
                    help='是否启用固定基线个体 profile（graph_ode 专用；需 --bold_source raw '
@@ -2182,7 +1948,7 @@ def parse_args():
     p.add_argument('--profile_dim', type=int, default=32,
                    help='个体 profile 维度（personalized=True 时生效；默认 32）。')
     p.add_argument('--dynamics_history_memory', type=str2bool, default=False,
-                   help='S2：向量场加入固定历史记忆 FiLM（编码 token 的 patch 维均值，'
+                   help='向量场加入固定历史记忆 FiLM（编码 token 的 patch 维均值，'
                         'rollout 期间不变；零初始化，默认 False 不构建模块）。')
     p.add_argument('--calibration_length', type=int, default=0,
                    help='基线校准前缀长度（TR 数；bold_source=raw 时必须 >=1，'
@@ -2208,8 +1974,6 @@ def parse_args():
                    help='Positive fixed train-only scale; 0 estimates mean absolute delta on train subjects.')
     p.add_argument('--dynamics_horizon_weight', type=str2bool, default=False)
     p.add_argument('--horizon_weight_power', type=float, default=1.0)
-    p.add_argument('--s4_variogram_weight', type=float, default=0.0,
-                   help='0=CRPS only; -1=fix lambda from four train pilot batches at 5% CRPS scale.')
     p.add_argument('--lambda_temporal_pcc', type=float, default=0.0,
                    help='Fixed weight for CPM+ODE future-trajectory temporal PCC; 0 disables. '
                         'At least 3 valid future points and nonconstant targets are required.')
@@ -2234,53 +1998,29 @@ def parse_args():
                         '且只纳入具备完整 N 步真值的锚点。确定性 Graph-ODE 可自由推进'
                         '超过 cpm_horizon，训练监督范围仍由 cpm_horizon 决定。')
 
-    # ---------- S4 概率轨迹（默认 off；开启时才构建新模块） ----------
-    p.add_argument('--s4_variant', default='off', choices=['off', 's4_1', 's4_2'],
-                   help="S4 概率化链：off=S2 原路径；s4_1=输出端低秩时空残差头；"
-                        "s4_2=潜状态低秩随机创新（graph_ode 专用）。")
-    p.add_argument('--s4_stage', default='head', choices=['head', 'joint'],
-                   help="两阶段训练：head=前 --freeze_backbone_epochs 仅训 S4 模块，"
-                        "之后联合微调；joint=从第 0 epoch 起联合训练。")
-    p.add_argument('--s4_crps_weight', type=float, default=1.0,
-                   help='S4 集合 CRPS 损失权重（固定权重，不进入 uncertainty 聚合）。')
-    p.add_argument('--s4_lr_scale', type=float, default=1.0,
-                   help='S4 新模块学习率倍率（相对 --lr_peak）。')
-    p.add_argument('--s4_train_samples', type=int, default=32,
-                   help='训练/验证时每个锚点采样的轨迹条数 K（默认 32）。')
-    p.add_argument('--s4_residual_rank', type=int, default=8,
-                   help='S4-1 低秩空间因子秩 r（默认 8）。')
-    p.add_argument('--s4_residual_hidden', type=int, default=128,
-                   help='S4-1 残差头隐层宽度（默认 128）。')
-    p.add_argument('--s4_residual_init_scale', type=float, default=0.1,
-                   help='S4-1 残差尺度初值（小初始化，默认 0.1；不是零方差）。')
-    p.add_argument('--s4_noise_rank', type=int, default=8,
-                   help='S4-2 潜状态创新秩 r（默认 8；禁止全 ROI 独立噪声）。')
-    p.add_argument('--s4_noise_scale', type=float, default=1e-2,
-                   help='S4-2 创新增益初值尺度（小初始化，默认 0.01）。')
-    p.add_argument('--s4_ckpt_metric', default='point', choices=['point', 'crps'],
-                   help='S4 实验的 checkpoint 判据：point=沿用 graph-ODE 多步 MAE；'
-                        'crps=验证集 dynamics CRPS（越低越好）。')
-    p.add_argument('--val_sampling_seed', type=int, default=2024,
-                   help='S4 启用时验证期采样轨迹所用的随机种子（每个 epoch 重置并'
-                        '在验证后恢复原随机流）。使 CRPS 选优基于同一批随机创新，'
-                        '避免把采样运气当成模型改进；非 S4 运行不生效。')
 
+    from model import load_model_config
+    config = load_model_config()
+    declared = {action.dest for action in p._actions}
+    defaults = {
+        key: value
+        for section in ('architecture', 'loss', 'training', 'data_and_split')
+        for key, value in config[section].items()
+        if key in declared and key not in ('name', 'conditioning')
+    }
+    conditioning = config['data_and_split']['conditioning']
+    defaults.update({key: value for key, value in conditioning.items()
+                     if key in declared})
+    p.set_defaults(**defaults, name=None)
     args = p.parse_args()
-    if not math.isfinite(args.s4_variogram_weight) or (args.s4_variogram_weight < 0 and args.s4_variogram_weight != -1):
-        p.error('--s4_variogram_weight must be nonnegative or -1 (train-only calibration)')
-    if args.s4_variogram_weight != 0 and args.s4_variant != 's4_1':
-        p.error('P1 temporal variogram requires the existing s4_1 head')
-    if args.s4_variant != 'off':
-        if args.dynamics_mode != 'graph_ode':
-            p.error('--s4_variant 仅支持 --dynamics_mode graph_ode')
-        if args.s4_stage == 'head' and args.freeze_backbone_epochs <= 0:
-            p.error('--s4_stage head 需要 --freeze_backbone_epochs >= 1')
-        if args.s4_train_samples < 2:
-            p.error('--s4_train_samples 必须 >= 2（CRPS 需要集合）')
-    # 历史入口行为：finetune 省略 --pretrained_weight 时回填默认主权重路径。
-    # 本轮脚本始终显式传入起点，不依赖这个默认值。
+    if args.name is None:
+        args.name = f'neurotwin_{args.mode}'
+    if args.condition_arm is None:
+        args.condition_arm = conditioning[args.mode]['condition_arm']
     if args.mode == 'finetune' and not args.pretrained_weight:
-        args.pretrained_weight = LEGACY_PRETRAINED_WEIGHT
+        args.pretrained_weight = DEFAULT_PRETRAINED_WEIGHT
+    if args.mode == 'finetune' and not args.condition_inherit_stats:
+        args.condition_inherit_stats = args.pretrained_weight
     return args
 
 

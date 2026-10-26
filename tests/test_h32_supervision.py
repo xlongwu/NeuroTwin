@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from analysis.next_point_eval import run_inference
-from baseline import CONTRACT_FIELDS, config_value, load_baseline_config
+from model import CONTRACT_FIELDS, config_value, load_model_config
 from experiments.long_horizon.evaluate_supervision import subject_segment_mae, validate_pair
 from experiments.long_horizon import evaluate_supervision as paired_eval
 from main import evaluate_tfm, split_hash
@@ -168,7 +168,7 @@ def test_pair_rejects_frozen_or_differently_seeded_checkpoints():
                   eval_context_length=64, eval_anchors_per_subject=16,
                   eval_rollout_tasks_per_subject=0,
                   dynamics_metric_horizon=32, freeze_backbone_epochs=0,
-                  dynamics_mode='graph_ode', dynamics_history_memory=True, s4_variant='off')
+                  dynamics_mode='graph_ode', dynamics_history_memory=True)
     left, right = SimpleNamespace(**shared), SimpleNamespace(**shared)
     left.cpm_horizon, right.cpm_horizon = 8, 32
     meta = dict(backbone_unfrozen=True, ckpt_metric_key='metric_mae_dynamics_h1_32_subject',
@@ -182,7 +182,7 @@ def test_pair_rejects_frozen_or_differently_seeded_checkpoints():
 
 
 def test_paired_evaluation_writes_report_on_shared_synthetic_batch(tmp_path, monkeypatch):
-    baseline = load_baseline_config()
+    baseline = load_model_config()
     common = {key: config_value(baseline, path) for path, key in CONTRACT_FIELDS}
     common.update(mode='finetune', pretrained_weight='same.pt', split_file='same.json',
                   freeze_backbone_epochs=0, dynamics_metric_horizon=32,

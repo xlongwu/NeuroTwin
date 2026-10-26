@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """按脑网络分组渲染 AAL116 显著脑区玻璃脑图（next_timepoint 口径）。
 
-输入为 experiments/evaluate_variant.py --feature_importance 落盘的
+输入为 analysis/evaluate.py --feature_importance 落盘的
 ``feature_importance_<split>.json``：优先取 ``significant_roi_indices``（ROI 置换重要性
 经 BH-FDR 校正后的显著 ROI，1 基 AAL 索引），无显著 ROI 时回落到重要性 Top N，并按
 ``data/AAL116.xlsx`` 的「对应网络」列把脑区分组，逐网络绘制一张玻璃脑图（每个脑区
@@ -53,7 +53,7 @@ DISPLAY_MODE = "lyrz"
 def parse_args():
     p = argparse.ArgumentParser(description="显著脑区玻璃脑图（按脑网络分组）")
     p.add_argument("--input_json", required=True,
-                   help="evaluate_variant.py --feature_importance 输出的 "
+                   help="evaluate.py --feature_importance 输出的 "
                         "feature_importance_<split>.json")
     p.add_argument("--aal_file", default=DEFAULT_AAL_FILE,
                    help="AAL116 脑区图谱 xlsx（提供脑区名称与「对应网络」列）")

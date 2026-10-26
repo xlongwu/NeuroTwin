@@ -1,0 +1,176 @@
+# 完整可视化交付
+
+在上一批 13 张图的基础上补齐 F4、F13、F14 与 D6 附图，共 16 张主图及 1 张附图；保留全部真实输入、统计数据和中文图注。旧目录不覆盖。
+
+新增计算复用 HC base、固定种子和原条件统计；HC/MDD 全 val 滚动评估使用全部锚点。历史块和 ROI 扰动仅描述模型结构性质，不作新的组间推断。F2 保持历史 H32 权重口径，其余 HC base H32 结果属于外推。
+
+[全部图览](overview.png) · [新增图与图库示例对照](reference_comparison.png) · [检查记录](CHECKS.json)
+
+原方案中的“默认不执行”项在用户追加“执行完整可视化”后授权执行；设置见 [执行登记](../../../docs/VISUALIZATION_COMPLETION_PREREG.md)。
+
+## 新增结果与边界
+
+- 全 val 滚动重算：HC 222 人、25290 锚点，模型 MAE 0.081428；MDD 225 人、25356 锚点，模型 MAE 0.080256。
+- F13：打乱最近 8 TR，H1–8 相对误差变化 +85.83%，H17–32 为 -7.72%；这是 HC base 外推，不是历史 T08 的复现。
+- F14：40 人、116 个源 ROI、双符号扰动全部完成，零扰动负控最大差为 0；传播仅解释模型结构性质。
+- D6：本次 eval 提取与原参数表未完全复现；下排原 q 值单独保留存档，不能为本次描述性效应提供显著性。
+
+## 图库借鉴
+
+实际查看 plot-is-all-you-need 的 raincloud-median-badges、oa-tech-pone-0258309-f05、oa-bio-plos-pcbi-1011915-f05 原图与卡片。借鉴真实点分布、克制的点线与基准线、等尺寸矩阵和共同色阶；HC 蓝/MDD 橙沿用上一批，网络色沿用项目约定。F14 将直接自响应从传播矩阵的显示色阶中排除，完整数据保留。
+reference_comparison.png 左列为图库参考，右列为本项目新图；参考图使用其自身数据，不是本项目结果。本次未向共享图库收图。
+
+## fig_f0a_pipeline
+
+![fig_f0a_pipeline](fig_f0a_pipeline.png)
+
+F0a｜完整可视化流程。保留前批 T0/T1/T2 结果，补充 HC/MDD 全 val 滚动误差、固定匹配样本的历史顺序和单 ROI 输入扰动。模型、训练及权重不变；新结果仅作描述性结构分析，不新增疾病判据。
+
+[PDF](fig_f0a_pipeline.pdf) · [脚本](fig_f0a_pipeline.py)
+
+## fig_f0b_composition
+
+![fig_f0b_composition](fig_f0b_composition.png)
+
+F0b｜被试构成。HC 2222 人、MDD 2253 人，按原 train/val/test 划分展示；深色为已登记站点匹配子集，浅色为其余被试。匹配共 1504 对、36 站点。此处为 z 矩阵的分析队列，不能与 F2 的 MDD 验证/测试各 225 人或 F1 的 HC 验证 222 人混用。
+
+[PDF](fig_f0b_composition.pdf) · [脚本](fig_f0b_composition.py)
+
+## fig_f1_gate
+
+![fig_f1_gate](fig_f1_gate.png)
+
+F1｜滚动单步护栏及实际零分布。原 null 样本未保留，本次利用恢复的完整 HC val 222 人滚动 MAE，按原 B4 方法及 seed=2024 重算 10000 次被试级配对符号翻转，单侧 p 与存档一致，仍为约 0.00010；直方图为真实重算的置换分布，不是模拟示意数据。柱状图与雨云图来自本次全部锚点重算，先对每人 ROI 等权再对被试等权。原 gate_report 保留在数据副本中，不覆盖正式护栏结果。
+
+[PDF](fig_f1_gate.pdf) · [脚本](fig_f1_gate.py)
+
+## fig_f2_horizon
+
+![fig_f2_horizon](fig_f2_horizon.png)
+
+F2｜历史 H32 最优模型的长程精度（T0），来源为 final 存档，权重 SHA256 为 264507…d78b；它与其余主分析使用的 HC 参照权重不同。两组点表示 val/test 各 225 人的均值，小提琴表示逐被试分布。虚线仅对应 test H17–32 历史均值基线 0.922955，不能外推到其他分段或 val。test 远期 MAE 为 0.896604，相对基线改善 2.86%；PCC 约 0.178 是历史实验摘要值。T04/S4/T18 仅引用存档阴性结论，未重跑或部署校准。
+
+[PDF](fig_f2_horizon.pdf) · [脚本](fig_f2_horizon.py)
+
+## fig_f3_generation
+
+![fig_f3_generation](fig_f3_generation.png)
+
+F3｜HC 参照模型的生成质量补充（T2 描述性），不是 F2 的历史 H32 权重。按固定种子在原站点匹配对中抽取双方均位于 val/test 的 20 对，每人最早 K64 预测未来 H32，使用前 32 TR 固定校准、继承 hc3 条件统计。此权重快照 forecast_offsets=1、cpm_horizon=8，H32 超出其辅助训练时程，为外推。轨迹示例选 HC 组 FC-r 最接近中位数者，ROI 固定为 1/29/31/61，灰带标记 H1–8；FC 在真实和预测未来 32 TR 分别计算，上三角边 Pearson r 描述相似性，差矩阵色阶为 ±2、FC 为 ±1。下排展示 40 人的 FC-r、ROI 平均 KL(true||pred) 和平均谱形；Welch nperseg=32、去 DC、逐 ROI 谱归一化、频率单位 cycles/TR，不假定所有站点 TR 秒数相同。32 点频谱和 FC 估计不稳定，且无低频临床解释；HC/MDD 分布不做新的组间检验。
+
+[PDF](fig_f3_generation.pdf) · [脚本](fig_f3_generation.py)
+
+## fig_f4_error_structure
+
+![fig_f4_error_structure](fig_f4_error_structure.png)
+
+F4｜滚动误差结构（T3）。冻结 HC base、K64、全部合法锚点，HC val 222 人/MDD val 225 人；逐被试逐 ROI 改善度先计算 1−MAE_model/MAE_persistence，再对被试等权平均。两脑图共享对称色阶；网络条形先按 ROI 汇总，不作组间显著性推断。散点每点为一个 ROI 的被试均值，幅度为真实下一步信号的 RMS，单位沿用每人前 32 TR 固定校准；不等同去均值后时间标准差。站点箱线保留全部实际被试点，两个面板共享横纵轴。展示预测 QC，不代表疾病效应。逐被试/ROI 原数值另存 f4_subject_metrics.csv、f4_roi_metrics.csv。
+
+[PDF](fig_f4_error_structure.pdf) · [脚本](fig_f4_error_structure.py)
+
+## fig_f5_pathology_main
+
+![fig_f5_pathology_main](fig_f5_pathology_main.png)
+
+F5｜病理主结果（T0，三组图为 T1 复核值）。匹配 1504 对，原站点块置换加 BH-FDR 检验为 0/116 ROI 显著，最小 q=0.336；森林图为原 95% 配对 bootstrap 区间，按绝对效应选择 Top-20，未校正区间不作为显著性依据。网络/全脑面板严格保留原稀疏分组：仅 14 ROI 被具名，102 ROI 属于 Other，不能解释为完整 AAL 网络检验。底部脑图共享色阶，依次为匹配 MDD−HC、未匹配 MDD−HC、HC val−test 原始均值差；后两者仅提供混杂与噪声对照。展示排序依据 AAL116 完整网络标签，与原推断分组不同。
+
+[PDF](fig_f5_pathology_main.pdf) · [脚本](fig_f5_pathology_main.py)
+
+## fig_f6_site_confounding
+
+![fig_f6_site_confounding](fig_f6_site_confounding.png)
+
+F6｜站点混杂方法学演示（T1）。前三面板用同一组未匹配 Top-15 ROI、相同横轴，对照匹配、未匹配和 HC 负控的原始均值差；下方比较全部 116 ROI 的绝对差异分布。未匹配全脑原始差为 +0.06880，匹配后为 −0.02281，HC 负控最大绝对差 0.17622。排名表另存 top_roi_changes.csv。既有未匹配/负控 p 值检验的是站点加权差，与本图原始差的估计量不同，故不在此图标注或解释为其显著性。变化与站点构成混杂一致，不能据此指定病理脑区。
+
+[PDF](fig_f6_site_confounding.pdf) · [脚本](fig_f6_site_confounding.py)
+
+## fig_f7_separability
+
+![fig_f7_separability](fig_f7_separability.png)
+
+F7｜队列可分性与描述量基线（T1）。复用原站内轮转 5 折岭分类器的固定 OOF 分数，AUC=0.55980；500 次站内匹配对 bootstrap 的 AUC 95% 区间为 0.54026–0.57822，阴影为逐点 ROC 区间，未重新拟合分类器，也不表示跨站点或外部验证。右图比较原模型 z 与六描述量规范性距离的匹配 ROI 均值差；两者尺度不同，对角线仅作数值参考，不能据此量化模型增益。二者原检验均 0/116 过 FDR。下方保留模型 z 的匹配、未匹配和 HC 负控三组对照；描述量非匹配/负控逐 ROI 数组未保留，不新增相应推断。
+
+[PDF](fig_f7_separability.pdf) · [脚本](fig_f7_separability.py)
+
+## fig_f8_heterogeneity
+
+![fig_f8_heterogeneity](fig_f8_heterogeneity.png)
+
+F8｜个体异质性（T0 描述性）。上排同尺度展示站点匹配、未匹配与 HC val/test 负控的逐被试 mean|z| 分布；点为被试，白点为中位数。下排按 mean|z| 确定性选取各组最大、次大及中位个体的完整 116 ROI 剖面，共享对称色阶；这些个体为明确选择的示例，不代表典型患病定位。右侧为匹配组个体内 z 标准差。原匹配组 mean|z| 组内方差比为 0.977、p=0.274；未对本图新增统计检验。
+
+[PDF](fig_f8_heterogeneity.pdf) · [脚本](fig_f8_heterogeneity.py)
+
+## fig_f9_clinical
+
+![fig_f9_clinical](fig_f9_clinical.png)
+
+F9｜临床关联（T0/T1 描述性）。偏相关沿用原稀疏网络分组，控制年龄、性别和站点哑变量。每格标注原 r 与 n；HAMD 均无明显关联。右图为同一完整观测集的 LN−HAMA 残差散点，r=−0.13489、未校正 p=0.00812、n=422，全部残差 r/n 已与原表逐项核对。HAMA 全 MDD 可用率 569/2253=25.3%，匹配组为 422/1504=28.1%；未检验缺失机制，不能把这条弱关联当作病理或临床预测证据。未进行插补或新增组间推断。
+
+[PDF](fig_f9_clinical.pdf) · [脚本](fig_f9_clinical.py)
+
+## fig_f10_condition_usage
+
+![fig_f10_condition_usage](fig_f10_condition_usage.png)
+
+F10｜条件使用终裁（T0）。HC val 222 人，条件引起的预测差相对真实单步变化尺度的中位数为 0.458%；注意分母为 mean|true−x_last|，不是 BOLD 振幅。条件零化按原全缺失编码定义，平均 MAE 从 0.081428 变为 0.081354。右图展示 ODE FiLM 的 L2 范数中位数与四分位区间，参数大小不等同输出贡献。编码器 AdaRMS 未启用，原数据为缺失而非零，不绘制虚构分布。此图复用 B5 终裁，不重启敏感性分支。
+
+[PDF](fig_f10_condition_usage.pdf) · [脚本](fig_f10_condition_usage.py)
+
+## fig_f11_graph
+
+![fig_f11_graph](fig_f11_graph.png)
+
+F11｜学习图结构（T2 描述性）。展示同一批 40 人平均的历史绝对 FC 度归一化先验、学习功能图 A_func 及有效图 A_eff，按 AAL 完整网络标签排序，三矩阵共享色阶。当前 checkpoint 的 graph_source=history_fc，所谓 SC 位置实际输入可见历史功能耦合图，不是独立实测解剖连接。有效图还包含可学习低秩残差、自环及 Sinkhorn 归一化，不能只用 λ 混合公式概括最终输出。下排展示剔除对角后的网络块均值和 λ；λ 若为全局参数，其跨人恒定不代表个体结构相同。图仅说明模型结构性质，不构成生理连接或因果机制证据。
+
+[PDF](fig_f11_graph.pdf) · [脚本](fig_f11_graph.py)
+
+## fig_f12_roi_importance
+
+![fig_f12_roi_importance](fig_f12_roi_importance.png)
+
+F12｜ROI 置换重要性（T2，小样本结构性描述）。复用 next_point_eval 的跨样本 ROI 历史置换与逐批单侧 t 近似口径，在同批 40 人、4 个各 10 人批次内分别置换一个 ROI 的 K64 历史；批次不跨 HC/MDD。保留目标被试原 hc3 条件、前缀校准及 profile，图按扰动后历史重新计算。ΔMAE 为主输出 lag-1 的误差增量，不是 H32 或疾病分类重要性。星号仅指 116 ROI 的近似 BH-FDR q<0.05，误差线为批间 SEM，不是 95% CI；4 批且每 ROI 单次随机置换的稳定性有限。脑图、网络条形和 Top-20 使用同一向量，不作为病理定位或临床因果证据。
+
+[PDF](fig_f12_roi_importance.pdf) · [脚本](fig_f12_roi_importance.py)
+
+## fig_f13_history_attribution
+
+![fig_f13_history_attribution](fig_f13_history_attribution.png)
+
+F13｜历史时间顺序敏感性。固定的 20 对同站点留出被试，每人 K64 分为 8 个连续 8 TR 块，每次只对一块内部时间顺序进行 3 次固定种子置换，所有 ROI 同步置换；校准、条件与 profile 固定，功能图从改变后的输入重算。每人先平均 3 次，再对每对 HC/MDD 等权平均；折线为 20 对均值，色带为匹配对之间 25–75 分位范围（不是置信区间）。热图展示 H17–32 的逐对百分比增量，负值如实保留。使用 HC base 的 H32 外推，与历史 T08 的 H32 权重、扰动口径不同，原 +14.2% 仅为存档参照。不能预设近历史更重要，不作疾病或临床因果解释。
+
+[PDF](fig_f13_history_attribution.pdf) · [脚本](fig_f13_history_attribution.py)
+
+## fig_f14_perturbation
+
+![fig_f14_perturbation](fig_f14_perturbation.png)
+
+F14｜输入扰动传播敏感性（预登记后描述性前向）。固定 20 对同站点留出被试，对每个源 ROI 的最后 8 TR 分别加/减 0.1 个固定校准单位，其他输入不变；条件、32 TR 校准、profile 固定，功能图随输入重算。响应为相对同批次未扰动预测的绝对变化除以 0.1，先平均正负方向、再对 40 人等权汇总。两个矩阵共享色阶，行为源、列为目标；矩阵灰色对角线、脑图、Top-15 及时间曲线均排除源 ROI 对自身的直接响应，数据仍保留完整矩阵与直接响应。时间曲线色带为匹配对间四分位范围。每人零扰动 sham 最大差均须不超过 1e-6。这里只描述模型输入敏感性，未校准为真实刺激、损伤或治疗响应，不构成疾病因果证据；H32 对 HC base 属于外推。完整逐人早/远期传播矩阵另存 f14_propagation.npz。
+
+[PDF](fig_f14_perturbation.pdf) · [脚本](fig_f14_perturbation.py)
+
+## fig_s1_profile
+
+![fig_s1_profile](fig_s1_profile.png)
+
+S1/D6｜参数线完整可视化。上排以统一纵轴显示本次 eval 模式提取 profile 的 1504 对匹配差、全队列未匹配差与 HC val−test 负控，不新增 p 值或病理结论。本次匹配均值与存档值存在差异，量化见 d6_extraction_comparison.json；旧参数提取脚本未调用 model.eval()，模型可能启用 dropout，前缀浮点计算路径也不同，因此不把原 q 值配给上排新效应。下排仅存档展示 run1 原 q 值，dim=20（零基）q≈0.0128 的可靠性尚待单独复核，不能视为已复现的参数标志物。能量占比引用原未中心化 SVD 首方向 99.36%，不等同中心化个体差异解释率。不重训、不调参数、不重跑参数线推断。
+
+[PDF](fig_s1_profile.pdf) · [脚本](fig_s1_profile.py)
+
+## 复现
+
+从仓库根目录运行，使用新的输出路径：
+
+```bash
+OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 python -m analysis.paper_figs.run_20261026.complete_infer --out-dir NEW_INFER/probes
+OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 python -m analysis.paper_figs.run_20261026.complete_profiles --out-dir NEW_INFER/profile_controls
+# For each cohort hc/mdd and partition 0/1/2/3 (eight disjoint jobs):
+OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 python -m analysis.paper_figs.run_20261026.complete_rolling --group COHORT --partition PART --out-dir NEW_INFER/rolling_parts/COHORT
+MPLCONFIGDIR=/tmp/paper-mpl python -m analysis.paper_figs.run_20261026.complete_build --infer-dir NEW_INFER --out-dir NEW_FIGURES
+MPLCONFIGDIR=/tmp/paper-mpl python -m analysis.paper_figs.run_20261026.complete_check --infer-dir NEW_INFER --out-dir NEW_FIGURES
+```
+
+F4 的 complete_rolling 复用 analysis.rolling_one_step 的视图、前向与汇总函数，使用 torch.set_num_threads(2)、batch_size=64、context_length=64、anchor_stride=1；四个分片无重叠，合并时核对完整 val 被试集合与协议。F13/F14 本次用 --pair-start/--pair-stop 分为六份同协议 CPU 作业并行，所有样本及随机排列不变。
+
+沿用的限制：F1 原 null 未保留，本次恢复 HC 全 val 滚动数据后按原口径重算实际零分布；F10 未启用的 AdaRMS 不绘制伪分布；F11 实际 history-FC 先验不称为实测解剖 SC；HAMA 缺失机制未知；不新增临床因果结论。
+本批补齐 D6 未匹配和 HC 负控的描述性面板，不重跑疾病检验。原参数提取脚本没有切换 eval；一个固定 HC 前缀的重复诊断显示 eval 差为 0、训练模式差约 0.1324，而两种前缀浮点路径差约 3.5e-7。因此旧参数线 q≈0.0128 只作存档，不称为本次已复现的弱线索。详情见 [提取对照](d6_extraction_comparison.json)。
+前版 13 图交付已清理；当前保留范围与数据位置见 [目录说明](README.md)。

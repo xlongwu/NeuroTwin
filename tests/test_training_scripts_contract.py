@@ -11,12 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from baseline import CONTRACT_FIELDS, config_value, load_baseline_config
+from model import CONTRACT_FIELDS, config_value, load_model_config
 
 ROOT = Path(__file__).resolve().parents[1]
-REAL_CKPT = ROOT / 'checkpoints' / 'phase2_S2' / 'neurotwin_tfm_finetune' \
+REAL_CKPT = ROOT / 'checkpoints' / 'neurotwin_finetune' \
     / 'finetuned_best.pt'
-PRETRAIN_CKPT = ROOT / 'checkpoints' / 'phase2_S2' / 'neurotwin_tfm_pretrain' \
+PRETRAIN_CKPT = ROOT / 'checkpoints' / 'neurotwin_pretrain' \
     / 'base_best.pt'
 
 pytestmark = pytest.mark.skipif(os.name != 'posix', reason='训练入口是 bash 脚本')
@@ -44,7 +44,7 @@ def _prepare(tmp_path):
     (data / 'Raw' / 'MDD').mkdir(parents=True)
     (data / 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx').write_text('', encoding='utf-8')
     checkpoints = tmp_path / 'checkpoints'
-    hc = checkpoints / 'neurotwin_tfm_pretrain'
+    hc = checkpoints / 'neurotwin_pretrain'
     hc.mkdir(parents=True)
     (hc / 'base_best.pt').write_text('', encoding='utf-8')
     return data, checkpoints
@@ -102,8 +102,8 @@ def _same(actual, expected):
 
 
 def _expected_from_json(stage):
-    cfg = load_baseline_config()
-    skip = {'model_arch', 's4_variant', 'sc_delta_rank'}
+    cfg = load_model_config()
+    skip = {'model_arch', 'sc_delta_rank'}
     if stage == 'pretrain':
         # HC 预训练由 main.py 强制 tfm_patho_mode=none，且不进入冻结/解冻阶段。
         skip |= {'tfm_patho_mode', 'freeze_backbone_epochs', 'backbone_lr_scale'}
@@ -117,8 +117,8 @@ def _expected_from_json(stage):
 
 
 @pytest.mark.parametrize('stage,script', [
-    ('pretrain', 'Pretrain_HC_tfm.sh'),
-    ('finetune', 'Finetune_MDD_tfm.sh'),
+    ('pretrain', 'pretrain.sh'),
+    ('finetune', 'finetune.sh'),
 ])
 def test_scripts_follow_baseline_json(tmp_path, stage, script):
     got = _run_script(tmp_path, script, tmp_path / f'{stage}_args.txt')
@@ -132,10 +132,10 @@ def test_scripts_follow_baseline_json(tmp_path, stage, script):
 
 
 @pytest.mark.skipif(not REAL_CKPT.exists() or not PRETRAIN_CKPT.exists(),
-                    reason='正式 S2 权重不在本机')
+                    reason='当前 权重不在本机')
 @pytest.mark.parametrize('stage,script,ckpt', [
-    ('pretrain', 'Pretrain_HC_tfm.sh', PRETRAIN_CKPT),
-    ('finetune', 'Finetune_MDD_tfm.sh', REAL_CKPT),
+    ('pretrain', 'pretrain.sh', PRETRAIN_CKPT),
+    ('finetune', 'finetune.sh', REAL_CKPT),
 ])
 def test_scripts_match_checkpoint_snapshot(tmp_path, stage, script, ckpt):
     import torch
@@ -169,8 +169,8 @@ def test_h32_experiment_reuses_script_with_explicit_overrides(tmp_path, arm, hor
     env = {**os.environ, **overrides, 'PYTHON': str(_fake_python(tmp_path)),
            'CAPTURE': str(capture), 'DATA_ROOT': str(data),
            'CHECKPOINT_DIR': str(checkpoints),
-           'HC_WEIGHT': str(checkpoints / 'neurotwin_tfm_pretrain/base_best.pt')}
-    subprocess.run(['bash', str(ROOT / 'scripts/Finetune_MDD_tfm.sh')],
+           'HC_WEIGHT': str(checkpoints / 'neurotwin_pretrain/base_best.pt')}
+    subprocess.run(['bash', str(ROOT / 'scripts/finetune.sh')],
                    cwd=ROOT, env=env, capture_output=True, text=True, check=True)
     got = _parse_argv(capture)
     expected = _expected_from_json('finetune')

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from models.tfm import NeuroTwinTFM
-from train.optim import (build_optimizer, set_finetune_stage,
+from train.optim import (build_optimizer, set_finetune_trainability,
                          unfreeze_while_preserving_state)
 
 
@@ -27,7 +27,7 @@ def test_compiled_unfreeze_matches_eager_gradients():
                            backbone_lr_scale=0.2, adapter_lr_scale=1.0,
                            weight_decay=0.01)
     criterion = torch.nn.MSELoss()
-    set_finetune_stage(raw, False)
+    set_finetune_trainability(raw, False)
     optimizer = build_optimizer(raw, criterion, args)
     compiled = torch.compile(raw, backend='aot_eager', dynamic=True)
     x, sc = torch.randn(2, 6, 1, 8), torch.eye(6)
@@ -45,14 +45,14 @@ def test_compiled_unfreeze_matches_eager_gradients():
         condition_param = next(raw.cpm_head.film.parameters())
         condition_state = optimizer.state[condition_param]['exp_avg'].clone()
         eager.load_state_dict(raw.state_dict())
-        set_finetune_stage(compiled, True)
+        set_finetune_trainability(compiled, True)
         unfreeze_while_preserving_state(compiled, optimizer, args)
         assert torch.equal(optimizer.state[condition_param]['exp_avg'], condition_state)
         in_optimizer = {id(p) for g in optimizer.param_groups for p in g['params']}
         assert all(id(p) in in_optimizer for p in raw.parameters() if p.requires_grad)
 
         optimizer.zero_grad(set_to_none=True)
-        set_finetune_stage(eager, True)
+        set_finetune_trainability(eager, True)
         loss(eager).backward()
         loss(compiled).backward()
         grads = dict(eager.named_parameters())

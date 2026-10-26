@@ -979,7 +979,7 @@ def roi_permutation_importance(model, data_loader, device, max_tasks=256,
 
 
 def write_feature_importance(out_dir, split, result, offsets):
-    """落盘 ``feature_importance_<split>.json``（键与旧 evaluate_variant 产物兼容）。
+    """落盘 ``feature_importance_<split>.json``（键与旧 evaluate 产物兼容）。
 
     ``roi_importance`` / ``roi_pvalues`` / ``roi_std_errors`` / ``roi_importance_rank`` /
     ``baseline_mae`` / ``method`` 沿用旧文件名与键名，供
@@ -1182,12 +1182,11 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                if isinstance(aux_info, dict) else None)
         if torch.is_tensor(ode):
             chunk['ode_pred'].append(ode.float().cpu().numpy())           # [B,F,H]
-        # S4-0：Graph-ODE VarianceHead 的逐 ROI/horizon 输出。std 已由模型换算到
+        # Graph-ODE VarianceHead 的逐 ROI/horizon 输出。std 已由模型换算到
         # 数据尺度；logvar 保留归一化空间，供校准诊断复核。旧模型/其他路线没有
         # 这两个键时不写入，保存端以空数组占位保持 npz 字段稳定。
         for key, aux_key in (('dynamics_std', 'dynamics_std'),
-                             ('dynamics_logvar_norm', 'dynamics_logvar_norm'),
-                             ('dynamics_samples', 'dynamics_samples')):
+                             ('dynamics_logvar_norm', 'dynamics_logvar_norm')):
             val = (aux_info.get(aux_key, None)
                    if isinstance(aux_info, dict) else None)
             if torch.is_tensor(val):
@@ -1254,8 +1253,6 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                          if chunk['dynamics_std'] else None),
         'dynamics_logvar_norm': (np.concatenate(chunk['dynamics_logvar_norm'], axis=0)
                                  if chunk['dynamics_logvar_norm'] else None),
-        'dynamics_samples': (np.concatenate(chunk['dynamics_samples'], axis=0)
-                             if chunk['dynamics_samples'] else None),
         'future': (np.concatenate(chunk['future'], axis=0)
                    if chunk['future'] else None),
         'future_mask': (np.concatenate(chunk['future_mask'], axis=0)
@@ -1276,7 +1273,7 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
     }
     n_anchor = len(data['subj_ids'])
     for key in ('future', 'future_mask', 'ode_pred', 'cpm_pred',
-                'dynamics_std', 'dynamics_logvar_norm', 'dynamics_samples'):
+                'dynamics_std', 'dynamics_logvar_norm'):
         arr = data.get(key)
         if arr is not None and arr.shape[0] != n_anchor:
             raise AssertionError(
@@ -1547,10 +1544,10 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
                                  'reason': '评估视图提供 all_future_steps 时计算'}
 
     # ---- 第一阶段核心：Graph-ODE / CPM 逐 horizon 动力学 + 双头一致性 ----
-    phase1_head_arrays = OrderedDict()
-    phase1_head_labels = OrderedDict()
-    phase1_diag_arrays = OrderedDict()
-    phase1_diag_labels = []
+    head_metrics_arrays = OrderedDict()
+    head_metrics_labels = OrderedDict()
+    head_diag_arrays = OrderedDict()
+    head_diag_labels = []
     if data.get('future') is not None:
         future = data['future']
         future_mask = data['future_mask']
@@ -1558,66 +1555,66 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         head_h = min(int(cpm_horizon or max_h), max_h)
         fut = future[:, :, :head_h]
         fmask = future_mask[:, :head_h]
-        phase1_labels = [f'H{k}' for k in range(1, head_h + 1)]
+        head_labels = [f'H{k}' for k in range(1, head_h + 1)]
 
         ode_pred = data.get('ode_pred')
         cpm_pred = data.get('cpm_pred')
         if ode_pred is not None:
             ho = min(int(ode_pred.shape[2]), head_h)
-            labels_o = phase1_labels[:ho]
+            labels_o = head_labels[:ho]
             a = per_task_head_metrics(
                 ode_pred[:, :, :ho], fut[:, :, :ho], fmask[:, :ho],
                 anchor=anchor, direction_deadzone=direction_deadzone)
-            phase1_head_arrays['ODE'] = a
-            phase1_head_labels['ODE'] = labels_o
+            head_metrics_arrays['ODE'] = a
+            head_metrics_labels['ODE'] = labels_o
         if cpm_pred is not None:
             hc = min(int(cpm_pred.shape[2]), head_h)
-            labels_c = phase1_labels[:hc]
+            labels_c = head_labels[:hc]
             a = per_task_head_metrics(
                 cpm_pred[:, :, :hc], fut[:, :, :hc], fmask[:, :hc],
                 anchor=anchor, direction_deadzone=direction_deadzone)
-            phase1_head_arrays['CPM'] = a
-            phase1_head_labels['CPM'] = labels_c
-        if 'ODE' in phase1_head_arrays and 'CPM' in phase1_head_arrays:
-            hd = min(int(phase1_head_arrays['ODE']['mae'].shape[1]),
-                     int(phase1_head_arrays['CPM']['mae'].shape[1]))
-            labels_d = phase1_labels[:hd]
+            head_metrics_arrays['CPM'] = a
+            head_metrics_labels['CPM'] = labels_c
+        if 'ODE' in head_metrics_arrays and 'CPM' in head_metrics_arrays:
+            hd = min(int(head_metrics_arrays['ODE']['mae'].shape[1]),
+                     int(head_metrics_arrays['CPM']['mae'].shape[1]))
+            labels_d = head_labels[:hd]
             a = per_task_dual_head_metrics(
                 cpm_pred[:, :, :hd], ode_pred[:, :, :hd],
                 fut[:, :, :hd], fmask[:, :hd], anchor=anchor,
                 direction_deadzone=direction_deadzone)
-            phase1_head_arrays['DUAL'] = a
-            phase1_head_labels['DUAL'] = labels_d
+            head_metrics_arrays['DUAL'] = a
+            head_metrics_labels['DUAL'] = labels_d
 
         head_blocks = OrderedDict()
-        for name, a in phase1_head_arrays.items():
-            agg_h = aggregate_columns(a, subj_idx, phase1_head_labels[name])
+        for name, a in head_metrics_arrays.items():
+            agg_h = aggregate_columns(a, subj_idx, head_metrics_labels[name])
             block = OrderedDict()
-            for label in phase1_head_labels[name]:
+            for label in head_metrics_labels[name]:
                 blk = _block_summary(agg_h, label)
                 if blk:
                     block[label] = blk
-            block['overall'] = _overall_all(agg_h, phase1_head_labels[name])
+            block['overall'] = _overall_all(agg_h, head_metrics_labels[name])
             head_blocks[name] = block
 
-        phase1_subject = OrderedDict()
-        if 'ODE' in phase1_head_arrays:
-            phase1_subject['ODE'] = _subj_block(
-                phase1_head_arrays['ODE'], subj_idx,
+        head_subject = OrderedDict()
+        if 'ODE' in head_metrics_arrays:
+            head_subject['ODE'] = _subj_block(
+                head_metrics_arrays['ODE'], subj_idx,
                 ('mae', 'rmse', 'spatial_pcc',
                  'delta_mae_step', 'delta_mae_anchor',
                  'direction_accuracy_step', 'direction_accuracy_anchor',
                  'delta_magnitude_ratio', 'variance_ratio'))
-        if 'CPM' in phase1_head_arrays:
-            phase1_subject['CPM'] = _subj_block(
-                phase1_head_arrays['CPM'], subj_idx,
+        if 'CPM' in head_metrics_arrays:
+            head_subject['CPM'] = _subj_block(
+                head_metrics_arrays['CPM'], subj_idx,
                 ('mae', 'rmse', 'spatial_pcc',
                  'delta_mae_step', 'delta_mae_anchor',
                  'direction_accuracy_step', 'direction_accuracy_anchor',
                  'delta_magnitude_ratio', 'variance_ratio'))
-        if 'DUAL' in phase1_head_arrays:
-            phase1_subject['DUAL'] = _subj_block(
-                phase1_head_arrays['DUAL'], subj_idx,
+        if 'DUAL' in head_metrics_arrays:
+            head_subject['DUAL'] = _subj_block(
+                head_metrics_arrays['DUAL'], subj_idx,
                 ('gap', 'gap_norm', 'cpm_mae', 'ode_mae', 'persistence_mae',
                  'both_fail_vs_persistence', 'head_error_corr', 'oracle_mae',
                  'oracle_gain_vs_cpm', 'oracle_gain_vs_ode', 'cpm_win_rate',
@@ -1625,24 +1622,24 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         # ---- 幅度诊断：ODE/CPM + 三条轨迹基线，共用同一套分位分层 ----
         diag_edges = amplitude_quantile_edges(fut, fmask, anchor)
         if ode_pred is not None:
-            phase1_diag_arrays['ODE'] = per_task_amplitude_diagnostics(
+            head_diag_arrays['ODE'] = per_task_amplitude_diagnostics(
                 ode_pred[:, :, :head_h], fut, fmask, anchor, amp_edges=diag_edges)
         if cpm_pred is not None:
-            phase1_diag_arrays['CPM'] = per_task_amplitude_diagnostics(
+            head_diag_arrays['CPM'] = per_task_amplitude_diagnostics(
                 cpm_pred[:, :, :head_h], fut, fmask, anchor, amp_edges=diag_edges)
         for bname, btraj in _trajectory_baselines(
                 data['x_last'], data['x_prev'], ar1, head_h).items():
-            phase1_diag_arrays[bname] = per_task_amplitude_diagnostics(
+            head_diag_arrays[bname] = per_task_amplitude_diagnostics(
                 btraj, fut, fmask, anchor, amp_edges=diag_edges)
-        phase1_diag_labels = phase1_labels
+        head_diag_labels = head_labels
         diag_report = OrderedDict(
-            (name, _diag_block(d, subj_idx, phase1_labels, diag_edges))
-            for name, d in phase1_diag_arrays.items())
+            (name, _diag_block(d, subj_idx, head_labels, diag_edges))
+            for name, d in head_diag_arrays.items())
 
-        report['phase1'] = OrderedDict([
+        report['head_metrics'] = OrderedDict([
             ('enabled', True),
             ('horizon', int(head_h)),
-            ('labels', phase1_labels),
+            ('labels', head_labels),
             ('direction_deadzone', direction_deadzone),
             ('definition', {
                 'delta_MAE_step': '相邻帧一阶差分误差：Δŷ_1=ŷ_1−x_t，'
@@ -1666,7 +1663,7 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
                                             'reason': '未收集 CPM 输出'})),
             ('dual_head', head_blocks.get('DUAL', {
                 'enabled': False, 'reason': '需要 ODE 与 CPM 同时可用'})),
-            ('subject_level', phase1_subject),
+            ('subject_level', head_subject),
             ('diagnostics', OrderedDict([
                 ('amplitude_bin_edges',
                  [float(e) if np.isfinite(e) else 1e9 for e in diag_edges]),
@@ -1686,7 +1683,7 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
             ])),
         ])
     else:
-        report['phase1'] = {'enabled': False,
+        report['head_metrics'] = {'enabled': False,
                             'reason': '评估视图未提供 future/future_mask'}
 
     # ---- FC（rollout 轨迹；长度不足则不计算） ----
@@ -1771,17 +1768,17 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / f'metrics_{split}.json').open('w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=float)
-    phase1_extra = OrderedDict(
-        (head, {'labels': phase1_head_labels[head], 'arrays': arrs})
-        for head, arrs in phase1_head_arrays.items())
+    head_extra = OrderedDict(
+        (head, {'labels': head_metrics_labels[head], 'arrays': arrs})
+        for head, arrs in head_metrics_arrays.items())
     _write_subject_csv(out_dir / f'per_subject_metrics_{split}.csv', data, arrays,
-                       base_arrays, subj_idx, labels, extra_arrays=phase1_extra)
+                       base_arrays, subj_idx, labels, extra_arrays=head_extra)
     _write_task_csv(out_dir / f'per_task_metrics_{split}.csv', data, arrays, labels,
-                    extra_arrays=phase1_extra)
-    if phase1_diag_arrays:
-        _write_phase1_diagnostics_csv(
-            out_dir / f'phase1_diagnostics_subject_{split}.csv',
-            phase1_diag_arrays, phase1_diag_labels, subj_idx)
+                    extra_arrays=head_extra)
+    if head_diag_arrays:
+        _write_head_diagnostics_csv(
+            out_dir / f'head_diagnostics_subject_{split}.csv',
+            head_diag_arrays, head_diag_labels, subj_idx)
     if save_arrays:
         extra = {}
         # 条件矩阵按 [N, K] 原样落盘（**不展平**），字段名一并保存，供置换诊断、
@@ -1808,9 +1805,6 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
             dynamics_logvar_norm=(data['dynamics_logvar_norm']
                                   if data.get('dynamics_logvar_norm') is not None
                                   else []),
-            dynamics_samples=(data['dynamics_samples']
-                              if data.get('dynamics_samples') is not None
-                              else []),
             cpm_pred=(data['cpm_pred'] if data.get('cpm_pred') is not None
                       else []),
             future=(data['future'] if data.get('future') is not None else []),
@@ -1968,8 +1962,8 @@ def _trajectory_baselines(x_last, x_prev, ar1, horizon):
     return out
 
 
-def _write_phase1_diagnostics_csv(path, diag_arrays, labels, subj_idx):
-    """逐被试写出幅度诊断（供 compare_phase1 配对使用）。"""
+def _write_head_diagnostics_csv(path, diag_arrays, labels, subj_idx):
+    """逐被试写出幅度诊断（供 配对评价 配对使用）。"""
     subjects = sorted(set(str(s) for s in subj_idx))
     rows = []
     for s in subjects:
@@ -2131,10 +2125,10 @@ def summarize(report):
         for label, blk in cpm.get('model', {}).items():
             summary[f'{split}_cpm_mae_{label}'] = blk.get('MAE')
             summary[f'{split}_cpm_pcc_{label}'] = blk.get('PCC_spatial')
-    phase1 = report.get('phase1', {})
-    if phase1.get('enabled'):
+    head_metrics = report.get('head_metrics', {})
+    if head_metrics.get('enabled'):
         for head, key in (('ODE', 'ode'), ('CPM', 'cpm_head')):
-            head_block = phase1.get(head, {})
+            head_block = head_metrics.get(head, {})
             for label, blk in head_block.items():
                 if label == 'overall' or not isinstance(blk, dict):
                     continue
@@ -2150,7 +2144,7 @@ def summarize(report):
                     'delta_MAE_step')
                 summary[f'{split}_{key}_da_step_overall'] = overall.get(
                     'direction_accuracy_step')
-        dual = phase1.get('dual_head', {})
+        dual = head_metrics.get('dual_head', {})
         for label, blk in dual.items():
             if label == 'overall' or not isinstance(blk, dict):
                 continue

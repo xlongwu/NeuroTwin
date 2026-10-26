@@ -13,7 +13,7 @@ DEFAULT_CONFIG = ROOT / 'configs/long_horizon_h32.json'
 
 def training_environment(config: dict, arm: str, python: str = sys.executable) -> dict:
     """复用正式脚本，锁定实验相关覆盖值，避免继承其他消融的环境变量。"""
-    baseline = json.loads((ROOT / config['baseline_config']).read_text())
+    baseline = json.loads((ROOT / config['model_config']).read_text())
     shared, variant = config['shared'], config['arms'][arm]
     loss, training = baseline['loss'], baseline['training']
     save_training_state = shared.get(
@@ -43,7 +43,7 @@ def training_environment(config: dict, arm: str, python: str = sys.executable) -
         'EVAL_BATCH_SIZE': str(shared.get('eval_batch_size', 512)),
         'NUM_WORKERS': str(shared.get('num_workers', 6)),
         'PIN_MEMORY': str(shared.get('pin_memory', False)),
-        'DYNAMICS_HISTORY_MEMORY': 'True', 'S4_VARIANT': 'off',
+        'DYNAMICS_HISTORY_MEMORY': 'True',
         'EVAL_AFTER_TRAIN': 'False',
         'PRINT_CMD': '1',
         'LAMBDA_TEMPORAL_DIFF': str(loss['lambda_temporal_diff']),
@@ -80,7 +80,7 @@ def main():
         env['RESUME_TRAINING_STATE'] = args.resume_training_state
         if args.resume_training_state:
             env['SAVE_TRAINING_STATE'] = 'True'
-    cmd = ['bash', 'scripts/Finetune_MDD_tfm.sh']
+    cmd = ['bash', 'scripts/finetune.sh']
     print(shlex.join(['env', *(f'{k}={v}' for k, v in env.items()), *cmd]), flush=True)
     if args.execute:
         subprocess.run(cmd, cwd=ROOT, env={**os.environ, **env}, check=True)

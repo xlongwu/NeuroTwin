@@ -169,7 +169,7 @@ def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
            "否则大量键会因 shape 不匹配被静默跳过。")
     if arch_policy == 'require_match':
         raise RuntimeError(
-            msg + "\n请用当前任务口径重新预训练（scripts/Pretrain_HC_tfm.sh），"
+            msg + "\n请用当前任务口径重新预训练（scripts/pretrain.sh），"
                   "或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
     print("警告: " + msg + f"（arch_policy={arch_policy}：继续按 shape 过滤加载）")
 
@@ -208,7 +208,7 @@ def load_backbone_weights(model, pretrained_path, device, arch_policy='require_m
                f"结构改动会使部分同名参数语义发生变化，按 shape 加载可能得到错误结果。")
         if arch_policy == 'require_match':
             raise RuntimeError(
-                msg + f"\n请用当前代码重新预训练（scripts/Pretrain_HC_tfm.sh），"
+                msg + f"\n请用当前代码重新预训练（scripts/pretrain.sh），"
                       f"或显式指定 --pretrained_arch_policy warn 强制按 shape 加载。")
         if arch_policy == 'ignore':
             print(msg + " arch_policy=ignore: 跳过预训练权重加载。")
@@ -341,19 +341,8 @@ def conditioning_module_prefixes(model) -> set:
     return out
 
 
-def s4_module_prefixes(model) -> set:
-    """S4 概率模块的参数键前缀（用于迁移归类/优化器分组）。"""
-    out = set()
-    for mod_name, module in model.named_modules():
-        if getattr(module, 'is_s4_module', False) and mod_name:
-            out.add(mod_name + '.')
-    return out
 
 
-def s4_module_ids(model) -> set:
-    return {id(p) for _, module in model.named_modules()
-            if getattr(module, 'is_s4_module', False)
-            for p in module.parameters()}
 
 
 def param_report(model, optimizer=None) -> dict:
@@ -410,8 +399,7 @@ def verify_conditioning_param_groups(model, optimizer, expect_frozen_backbone=Fa
         problems.append(f'条件参数 requires_grad=False（{len(untrainable)} 个，例如 '
                         f'{untrainable[:5]}）；冻结期条件模块必须可训练')
     elif untrainable:
-        print(f'[params] S4 stage=head：{len(untrainable)} 个条件参数按协议冻结'
-              '（此阶段仅训练 S4 新模块）')
+        print(f'[params] {len(untrainable)} 个条件参数已冻结')
     if dup:
         problems.append(f'优化器存在重复参数（{len(dup)} 个张量出现在多个参数组）')
     if cond_numel != opt_cond_numel:
@@ -489,6 +477,9 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
 
     ckpt = torch.load(pretrained_path, map_location=device)
     state, arch_version, config = unwrap_state_dict(ckpt)
+    if (getattr(model, 'conditioner', None) is not None
+            and not any(key.startswith('conditioner.') for key in state)):
+        raise ValueError('条件微调需要匹配条件编码与统计量的预训练权重；不再支持无条件实验起点。')
     fname = os.path.basename(str(pretrained_path))
     if arch_version is None:
         print(f'提示: {fname} 无 arch_version，按 {LEGACY_ARCH_VERSION} 处理。')
@@ -507,10 +498,7 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
                     'arch_version': arch_version}
         print('警告: ' + msg + '（arch_policy=warn：继续迁移）')
 
-    # S4 新模块与条件适配器一样，是「旧 checkpoint 里没有、属预期新增」的键；
-    # 若漏掉这一步，迁移器会把 S4 参数误判为主干结构漂移并直接报错。
-    prefixes = (set(conditioning_module_prefixes(model))
-                | set(s4_module_prefixes(model)))
+    prefixes = set(conditioning_module_prefixes(model))
     cond_prefixes = tuple(sorted(prefixes))
     model_state = model.state_dict()
     horizon_expanded = []
@@ -572,7 +560,7 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
           f"zero_expanded={len(zero_expanded)} | skipped={len(cls['skipped'])} | "
           f"missing={len(cls['missing'])}")
     if plain_new:
-        print(f"[migrate] 新增条件/S4 概率模块键示例: {plain_new[:5]}")
+        print(f"[migrate] 新增条件模块键示例: {plain_new[:5]}")
     return report
 
 
@@ -604,7 +592,7 @@ def unfreeze_while_preserving_state(model, optimizer, args):
     return added_numel, [g.get('name') for g in optimizer.param_groups]
 
 
-def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
+def set_finetune_trainability(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
     """微调分阶段训练：默认训练条件模块（病理 FiLM 等），backbone_unfrozen 后解冻主干。"""
     for p in model.parameters():
         p.requires_grad = False
@@ -624,8 +612,6 @@ def set_finetune_stage(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
         # 条件 FiLM 等适配器已由上方条件模块循环解冻，不在此重复。
         if getattr(model, 'profile_encoder', None) is not None:
             backbone_modules.append(model.profile_encoder)
-        # S4-1 残差头位于模型顶层，不在 one_step_head 内；联合阶段一并解冻。
-        backbone_modules.extend(getattr(model, 's4_modules', lambda: [])())
         for module in backbone_modules:
             for p in module.parameters():
                 p.requires_grad = True
@@ -639,8 +625,7 @@ def get_param_groups(model: NeuroTwinTFM, args):
     """按模式划分参数组。
 
     - pretrain: 单组 'all'（HC 预训练允许条件模块，此时条件参数随主干一起训练）
-    - finetune: 'backbone' / 'condition'（条件模块：独立编码器、融合、FiLM、
-      条件 norm、门控残差/低秩）/ 's4'，各自独立学习率。
+    - finetune: 'backbone' / 'condition'，分别设置学习率。
       条件组 LR 倍率取 ``condition_lr_scale``（方案 §11.2 的搜索维度），
       未提供时回退历史 ``adapter_lr_scale`` 以保持旧配置可复现。
     """
@@ -653,12 +638,10 @@ def get_param_groups(model: NeuroTwinTFM, args):
         for p in module.parameters():
             adapter_ids.add(id(p))
 
-    s4_ids = s4_module_ids(model)
     adapter_p = [p for _, p in named
-                 if id(p) in adapter_ids and id(p) not in s4_ids]
-    s4_p      = [p for _, p in named if id(p) in s4_ids]
+                 if id(p) in adapter_ids]
     backbone_p = [p for _, p in named
-                  if id(p) not in adapter_ids and id(p) not in s4_ids]
+                  if id(p) not in adapter_ids]
 
     cond_scale = getattr(args, 'condition_lr_scale', None)
     if cond_scale is None:
@@ -670,10 +653,6 @@ def get_param_groups(model: NeuroTwinTFM, args):
     if adapter_p:
         groups.append({'params': adapter_p,
                        'lr': args.lr_peak * float(cond_scale), 'name': 'condition'})
-    if s4_p:
-        groups.append({'params': s4_p,
-                       'lr': args.lr_peak * getattr(args, 's4_lr_scale', 1.0),
-                       'name': 's4'})
     return groups
 
 

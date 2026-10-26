@@ -2,7 +2,7 @@
 """
 ROI 重要性可视化（next_timepoint 口径）
 
-输入为 experiments/evaluate_variant.py --feature_importance 落盘的
+输入为 analysis/evaluate.py --feature_importance 落盘的
 ``feature_importance_<split>.json``（ROI 置换重要性 ΔMAE + BH-FDR 校正 q 值），
 结合 AAL116 脑区图谱名称与网络标签进行可视化；FDR 显著脑区在图中单独标注。
 """
@@ -52,7 +52,7 @@ NETWORK_COLORS = {
 def parse_args():
     p = argparse.ArgumentParser(description='ROI 重要性可视化（结合 AAL116 图谱）')
     p.add_argument('--input_json', type=str, required=True,
-                   help='evaluate_variant.py --feature_importance 输出的 '
+                   help='evaluate.py --feature_importance 输出的 '
                         'feature_importance_<split>.json（next_timepoint ROI 置换重要性）')
     p.add_argument('--aal_file', type=str, default=str(PROJECT_ROOT / 'data' / 'AAL116.xlsx'),
                    help='AAL116 脑区图谱 xlsx')

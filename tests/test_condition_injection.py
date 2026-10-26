@@ -24,14 +24,13 @@ import pandas as pd
 import pytest
 import torch
 
-from models.conditioning import (ConditionNormGenerator, ConditionedLowRankLinear,
-                                 ConditionalGatedResidual, ConditioningConfig,
+from models.conditioning import (ConditioningConfig,
                                  build_condition_encoder,
                                  condition_dropout, deterministic_uniform,
                                  dropout_keys, pool_phi)
 from models.tfm import NeuroTwinTFM
 from train.optim import (conditioning_param_names, migrate_pretrained_checkpoint,
-                         param_report, save_backbone_weights, set_finetune_stage,
+                         param_report, save_backbone_weights, set_finetune_trainability,
                          verify_conditioning_param_groups)
 from utils.condition_schema import (DEMO_GROUP, HC_FIELDS, MDD_FIELDS,
                                    MDD_NEW_GROUP, ConditionStats, FieldSpec,
@@ -814,7 +813,7 @@ def test_L_frozen_param_groups_and_activation_within_200_steps():
     args = Namespace(mode='finetune', lr_peak=1e-4, backbone_lr_scale=0.1,
                      condition_lr_scale=2.0, adapter_lr_scale=1.0,
                      tfm_moe_lr_scale=1.0, loss_lr_scale=1.0)
-    set_finetune_stage(m, backbone_unfrozen=False)
+    set_finetune_trainability(m, backbone_unfrozen=False)
     groups = get_param_groups(m, args)
     opt = torch.optim.AdamW(groups, weight_decay=0.0)
     verify_conditioning_param_groups(m, opt, expect_frozen_backbone=True)
@@ -826,7 +825,7 @@ def test_L_frozen_param_groups_and_activation_within_200_steps():
     assert any(n.startswith('conditioner.') for n in names)
     assert any('film' in n for n in names)
     # 解冻后条件参数不会「永久静默冻结」
-    set_finetune_stage(m, backbone_unfrozen=True)
+    set_finetune_trainability(m, backbone_unfrozen=True)
     opt2 = torch.optim.AdamW(get_param_groups(m, args), weight_decay=0.0)
     verify_conditioning_param_groups(m, opt2)
     # 合成激活检查（≤200 step）
@@ -856,7 +855,7 @@ def test_L_frozen_param_groups_and_activation_within_200_steps():
 
 def test_M_checkpoint_save_strict_rebuild_same_output(tmp_path):
     """M：保存 → strict 重建 → 同 batch 输出一致；新参数确实入盘，不靠默认构造值。"""
-    from experiments.evaluate_variant import (build_model_from_args,
+    from analysis.evaluate import (build_model_from_args,
                                               load_condition_bundle, load_train_args)
     from analysis.checkpoint import load_checkpoint_compat
     stats, z, code, mask = _hc_fixtures(4)
@@ -912,7 +911,7 @@ def _ns(d):
 
 def test_M_rebuild_without_bundle_fails_instead_of_silently_dropping():
     """M：缺少条件元数据时必须报错，不允许静默按「无条件」重建。"""
-    from experiments.evaluate_variant import build_model_from_args
+    from analysis.evaluate import build_model_from_args
     stats, *_ = _hc_fixtures(2)
     args_snapshot = {'mode': 'pretrain', 'task_mode': 'next_timepoint',
                      'num_rois': 6, 'context_max': 8, 'tfm_patch_len': 2,
@@ -933,23 +932,16 @@ def _parse_cli(argv):
         sys.argv = old
 
 
-def test_M_undeclared_vs_declared_none_arm_both_rebuild_strict(tmp_path):
-    """M/§三/§六.7：``--condition_arm`` 未给=未声明（保留 legacy FiLM），
-    显式 ``none``=真无条件（连 legacy HAMD FiLM 也不建），两者都必须 strict 可重建。
-
-    回归的缺陷是：CLI 默认值曾是字符串 ``'none'``，训练侧不把它声明给模型
-    （FiLM 照建），而快照里的 ``'none'`` 又让评估侧把 FiLM 关掉 → 默认配置的
-    权重连自己的独立评估都 strict 加载失败。
-    """
+def test_M_unconditioned_models_have_no_scalar_film_and_rebuild_strict(tmp_path):
+    """Default finetuning uses cat; unconditioned model declarations have no scalar FiLM."""
     from analysis.checkpoint import load_checkpoint_compat
-    from experiments.evaluate_variant import build_model_from_args, load_train_args
+    from analysis.evaluate import build_model_from_args, load_train_args
 
-    assert _parse_cli(['--mode', 'finetune']).condition_arm is None, \
-        '不给 --condition_arm 必须解析为「未声明」(None)，不能等同于显式 none'
+    assert _parse_cli(['--mode', 'finetune']).condition_arm == 'cat'
     assert _parse_cli(['--mode', 'finetune',
                        '--condition_arm', 'none']).condition_arm == 'none'
 
-    for label, arm, expect_film in (('未声明', None, True),
+    for label, arm, expect_film in (('未声明', None, False),
                                     ('显式 none', 'none', False)):
         torch.manual_seed(0)
         trained = NeuroTwinTFM(features=6, context_max=8, patch_len=2, dim=16,
@@ -958,7 +950,7 @@ def test_M_undeclared_vs_declared_none_arm_both_rebuild_strict(tmp_path):
                                tfm_patho_mode='film',
                                condition_arm=arm).to(DEVICE)
         assert (trained.one_step_head.film is not None) is expect_film, \
-            f'{label}：legacy FiLM 的构建与臂声明语义不符'
+            f'{label}：无条件模型不应构建数值 FiLM'
         ck = tmp_path / f'arm_{arm or "undeclared"}.pt'
         torch.save({'state_dict': trained.state_dict(), 'arch_version': 5,
                     'config': {'args': {
@@ -1084,101 +1076,10 @@ def test_N_condition_controls_behave_as_specified(tmp_path):
         assert np.array_equal(outs[name]['demo_mask'], outs['none']['demo_mask'])
 
 
-def test_P_backbone_conditioning_is_identity_at_init_and_named_ada_rms_norm():
-    """P：条件 RMSNorm 起点恒等（同输入/同权重/同设备）；不冒充 AdaLN。"""
-    stats, z, code, mask = _hc_fixtures(4)
-    cond = _cond_dict(z, code, mask)
-    torch.manual_seed(0)
-    heads = _tfm('hc3', 'demo', stats, dim=16, layers=3, inject='heads')
-    torch.manual_seed(0)
-    both = _tfm('hc3', 'demo', stats, dim=16, layers=3, inject='heads+backbone',
-                cond_backbone_scope='last2', cond_norm_generator='per_layer')
-    assert both.cond_norm is not None and both.cond_norm.blocks == [1, 2]
-    x = torch.randn(4, 6, 1, 8); sc = torch.rand(6, 6)
-    heads.eval(); both.eval()
-    with torch.no_grad():
-        a, aa = both(x, sc, condition=cond)
-        b, _ = both(x, sc, condition=None)
-    assert torch.equal(a, b), '零初始化条件 RMSNorm 必须起点恒等'
-    gen = ConditionNormGenerator(32, 16, 4, scope='all', mode='shared', ident_dim=8)
-    assert gen.blocks == [0, 1, 2, 3]
-    mods = gen(torch.zeros(2, 32))
-    assert set(mods) == {0, 1, 2, 3} and all(len(v) == 3 for v in mods.values())
-    assert gen.n_params() > 0
 
 
-def test_P_shared_norm_generator_has_no_structurally_dead_identity_rows():
-    """P：``mode='shared'`` 的层身份表不得为未选中的 block 建行（§三「永不使用的条件参数」）。
-
-    旧实现按绝对层下标建 ``num_layers`` 行，只有 ``scope='all'`` 时每行都被读到；
-    ``last1`` 下未选中的行**永远拿不到梯度**却仍被 ``n_params()`` 计入条件参数预算
-    （实测 ``num_layers=4`` + ``last1``：32 个身份元素里 24 个是死参数）。
-
-    判据是**逐元素**的：``p.grad is None`` 扫不出来——整张表都有 ``grad``，死的只是行。
-    零初始化会让首步所有行梯度为 0（设计如此），因此先把输出层扰动成非零再看。
-    """
-    # 全非零的确定性条件向量：保证「某个元素梯度恰为 0」只可能来自结构，不来自输入
-    cond = (torch.arange(1, 33, dtype=torch.float32) / 32.0).repeat(2, 1)
-    for mode in ('shared', 'per_layer'):
-        for scope in ('last1', 'last2', 'all'):
-            torch.manual_seed(0)
-            gen = ConditionNormGenerator(32, 16, 4, scope=scope, mode=mode, ident_dim=8)
-            if mode == 'shared':
-                assert gen.ident.weight.shape[0] == len(gen.blocks), (
-                    f'shared/{scope} 的身份表应只为被选中的 {len(gen.blocks)} 个 block 建行，'
-                    f'实际 {gen.ident.weight.shape[0]} 行')
-                assert gen.ident_row == {int(b): r for r, b in enumerate(gen.blocks)}
-            with torch.no_grad():
-                out_layers = ([gen.shared] if mode == 'shared'
-                              else list(gen.gen.values()))
-                for lin in out_layers:
-                    lin.weight.normal_(0.0, 0.1)
-            mods = gen(cond)
-            loss = sum(t.sum() for triple in mods.values() for pair in triple for t in pair)
-            loss.backward()
-            dead, total = [], 0
-            for n, p in gen.named_parameters():
-                if p.grad is None:
-                    dead.append(f'{n}(grad is None)')
-                    continue
-                total += p.numel()
-                dead += [f'{n}#{i}' for i in
-                         (p.grad == 0).nonzero(as_tuple=False).flatten().tolist()[:4]]
-            assert not dead, (f'{mode}/{scope} 有 {len(dead)} 个永不参与计算的条件参数元素：'
-                              f'{dead[:6]}')
-            assert total == gen.n_params(), (
-                f'{mode}/{scope} 登记的条件参数预算 {gen.n_params()} ≠ 实际拿到梯度的 '
-                f'{total} 个元素（§五 要求核对实际 numel）')
-            assert set(mods) == set(gen.blocks)
-    # 身份表要真的区分层：4 个 block 的调制参数必须两两不同（否则等于退化成同一行复制）
-    torch.manual_seed(0)
-    gen = ConditionNormGenerator(32, 16, 4, scope='all', mode='shared', ident_dim=8)
-    with torch.no_grad():
-        gen.shared.weight.normal_(0.0, 0.1)
-    flat = {i: torch.cat([t.flatten() for pair in triple for t in pair])
-            for i, triple in gen(cond).items()}
-    same = [(a, b) for a in flat for b in flat
-            if a < b and torch.equal(flat[a], flat[b])]
-    assert not same, f'shared/all 下这些 block 的调制完全相同，身份嵌入没起作用：{same}'
 
 
-def test_P_extension_candidates_are_identity_and_registered(tmp_path):
-    """P：门控残差 / 条件低秩起点恒等，并登记为条件适配器（未跑即为「未比较」）。"""
-    g = ConditionalGatedResidual(16, 32, hidden=8)
-    h = torch.randn(2, 6, 16); c = torch.randn(2, 32)
-    assert torch.equal(g(h, c), h), 'R 末层零初始化 → 起点必须等于原残差'
-    g.head.weight.data.normal_(0, 0.1)
-    assert not torch.allclose(g(h, c), h)
-    base = torch.nn.Linear(16, 16)
-    lr = ConditionedLowRankLinear(base, 32, rank=4, conditional=True)
-    y0 = base(h)
-    assert torch.allclose(lr(h, c), y0, atol=1e-6), 'B=0 → 起点等于 W0'
-    lr.B.data.normal_(0, 0.1)
-    assert not torch.allclose(lr(h, c), y0, atol=1e-6)
-    uncond = ConditionedLowRankLinear(base, 32, rank=4, conditional=False)
-    assert uncond.G is None
-    assert getattr(g, 'is_conditioning_adapter', False)
-    assert getattr(lr, 'is_conditioning_adapter', False)
 
 
 def test_P_unconditional_path_bitwise_unchanged_with_same_weights():
@@ -1193,95 +1094,26 @@ def test_P_unconditional_path_bitwise_unchanged_with_same_weights():
         p1, a1 = plain(x, sc)
         p2, a2 = plain(x, sc, condition=None)
     assert torch.equal(p1, p2) and torch.equal(a1['cpm_pred'], a2['cpm_pred'])
-    assert plain.conditioner is None and plain.cond_norm is None
+    assert plain.conditioner is None and not hasattr(plain, 'cond_norm')
 
 
-def test_K2_h0_start_builds_new_identity_condition_modules(tmp_path):
-    """K2：从**无条件 H0** 起点新建恒等条件模块（§六.4）。
+def test_finetune_rejects_retired_unconditioned_start(tmp_path):
+    """The fixed conditioned architecture requires the pretraining condition bundle."""
+    source = _tfm('hc3', 'none', None, dim=16, layers=2)
+    path = tmp_path / 'unconditioned.pt'
+    save_backbone_weights(path, source, meta={'args': {'task_mode': 'next_timepoint'}})
+    target = _tfm('mdd8', 'cat', _mdd_synth_rows(4), dim=16, layers=2).to(DEVICE)
+    with pytest.raises(ValueError, match='不再支持无条件'):
+        migrate_pretrained_checkpoint(target, path, DEVICE, arch_policy='require_match')
 
-    源权重里没有任何条件 bundle 时的迁移分支。这里用真实 PyTorch 模型实测四件事：迁移不报错、
-    条件侧参数**全部**归 ``new_initialized``（没有一个条件参数来自 H0）、非条件权重逐位
-    继承、且恒等/零初始化下带条件模型的 OS/CPM 输出与 H0 起点等价（§六.3 的 <1e-6 口径），
-    最后 backward 一次确认条件参数不是死模块。
-    """
-    stats, z, code, mask = _hc_fixtures(4)
-    mdd_stats = _mdd_synth_rows(4)
-    values_hc, mask_hc = _hc_raw_values(4)
-    torch.manual_seed(0)
-    h0 = _tfm('hc3', 'none', None, dim=16, layers=2)
-    assert h0.conditioner is None and h0.cond_dim == 0, \
-        'H0 必须真的是无条件模型，否则它不是注入位置比较的共同起点'
-    path = tmp_path / 'h0_best.pt'
-    save_backbone_weights(path, h0, meta={'args': {'task_mode': 'next_timepoint'}})
 
-    # main.py 的跨阶段守卫靠 ``load_condition_bundle`` 判断源权重有没有条件协议块：
-    # H0 没有 ⇒ 返回 None ⇒ 两条 layout 闸门都跳过，迁移器以 layout_expect/saved=None
-    # 被调用（§六.4：条件模块新建恒等，本来就没有可比较的 layout_hash）。这一分支
-    # 必须钉住，否则将来若 bundle 读取对无条件权重返回半个字典，H0 起点会被误判成
-    # 「同组同臂但布局冲突」而直接 RuntimeError，无条件起点 → 条件微调这条路会整条断掉。
-    from experiments.evaluate_variant import load_condition_bundle
-    assert load_condition_bundle(path) is None, \
-        'H0 是无条件权重，不得被读成携带条件协议块'
+@pytest.mark.parametrize('inject', ['backbone', 'heads+backbone'])
+def test_retired_backbone_conditioning_is_rejected(inject):
+    stats, _, _, _ = _hc_fixtures(4)
+    with pytest.raises(ValueError, match='cond_inject=heads'):
+        _tfm('hc3', 'demo', stats, dim=16, layers=2, inject=inject)
 
-    x = torch.randn(4, 6, 1, 8).to(DEVICE)
-    sc = torch.rand(6, 6).to(DEVICE)
-    h0.eval()
-    with torch.no_grad():
-        p_h0, a_h0 = h0(x, sc)
 
-    v_obs = np.zeros((4, 8), dtype=np.float32)
-    m_obs = np.zeros((4, 8), dtype=np.uint8)
-    v_obs[:, :3] = values_hc[:4]
-    m_obs[:, :3] = mask_hc[:4]
-    m_obs[:, 3:] = 1                       # 新增五字段给合法占位（有效观测）
-    cond_batches = {
-        'all_missing': (np.zeros((4, 8), dtype=np.float32),
-                        np.zeros((4, 8), dtype=np.uint8)),
-        'observed': (v_obs, m_obs),
-    }
-
-    for inject in ('heads', 'backbone', 'heads+backbone'):
-        torch.manual_seed(7)
-        mdd = _tfm('mdd8', 'cat', mdd_stats, dim=16, layers=2,
-                   inject=inject).to(DEVICE)
-        rep = migrate_pretrained_checkpoint(mdd, path, DEVICE,
-                                            arch_policy='require_match')
-        assert rep['missing'] == [] and rep['skipped'] == [], \
-            f'{inject}: missing={rep["missing"]} skipped={rep["skipped"]}'
-        cond_names = set(conditioning_param_names(mdd))
-        assert cond_names, f'{inject}: 条件模型没有条件参数，位置比较无意义'
-        leaked = cond_names - set(rep['new_initialized'])
-        assert not leaked, f'{inject}: 这些条件参数不是新建的（等于从 H0 偷权重）：{sorted(leaked)}'
-
-        h0_sd, mdd_sd = h0.state_dict(), mdd.state_dict()
-        for key in h0_sd:
-            assert key in mdd_sd and torch.equal(h0_sd[key], mdd_sd[key].cpu()), \
-                f'{inject}: 非条件权重未逐位继承 H0：{key}'
-
-        mdd.eval()
-        for name, (v, m) in cond_batches.items():
-            zf, cf = mdd_stats.encode(v, m)
-            cond = {'cond_z': torch.from_numpy(zf), 'cond_code': torch.from_numpy(cf),
-                    'cond_mask': torch.from_numpy(m.astype(np.float32)),
-                    'subject_index': torch.arange(4)}
-            with torch.no_grad():
-                p, a = mdd(x, sc, condition=cond)
-            err = max(float((p_h0 - p).abs().max()),
-                      float((a_h0['cpm_pred'] - a['cpm_pred']).abs().max()))
-            assert err < 1e-6, f'{inject}/{name}: 恒等起点不等价，err={err}'
-
-        mdd.train()
-        zf, cf = mdd_stats.encode(*cond_batches['observed'])
-        cond = {'cond_z': torch.from_numpy(zf), 'cond_code': torch.from_numpy(cf),
-                'cond_mask': torch.from_numpy(
-                    cond_batches['observed'][1].astype(np.float32)),
-                'subject_index': torch.arange(4)}
-        out, aux = mdd(x, sc, condition=cond, condition_epoch=0)
-        mdd.zero_grad(set_to_none=True)
-        (out.pow(2).mean() + aux['cpm_pred'].pow(2).mean()).backward()
-        grads = {n: p.grad for n, p in mdd.named_parameters() if n in cond_names}
-        assert len(grads) == len(cond_names)
-        assert all(g is not None for g in grads.values()), \
-            f'{inject}: 有条件参数 backward 后 grad is None（死模块）'
-        assert any(float(g.abs().sum()) > 0 for g in grads.values()), \
-            f'{inject}: 所有条件参数首步梯度全为 0，链路没有真正接上'
+def test_retired_linear_condition_generator_is_rejected():
+    with pytest.raises(ValueError, match='delta_style'):
+        ConditioningConfig(delta_style='linear')

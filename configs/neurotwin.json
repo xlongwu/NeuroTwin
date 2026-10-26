@@ -1,0 +1,128 @@
+{
+  "_meta": {
+    "name": "neurotwin",
+    "description": "固定结构：历史编码、功能图先验、个体 profile、Graph-ODE、CPM 与逐 ROI 方差读出。预训练与微调共享此配方。",
+    "status": "current",
+    "notes": "预训练与微调分别使用 hc3/demo 和 mdd8/cat；保留训练随机种子、损失权重及优化参数。"
+  },
+  "architecture": {
+    "model_arch": "tfm",
+    "task_mode": "next_timepoint",
+    "num_rois": 116,
+    "context_min": 16,
+    "context_max": 64,
+    "forecast_offsets": "1",
+    "calibration_length": 32,
+    "tfm_dim": 256,
+    "tfm_layers": 4,
+    "tfm_heads": 4,
+    "tfm_ff_ratio": 4,
+    "tfm_patch_len": 8,
+    "tfm_one_step_hidden_dim": 256,
+    "tfm_patho_mode": "film",
+    "cpm_horizon": 8,
+    "cpm_layers": 2,
+    "cpm_intervention": false,
+    "norm": true,
+    "dropout": 0.1,
+    "sc_prior_mode": "soft_prior",
+    "sc_lambda_mode": "global",
+    "sc_lambda_init": 0.7,
+    "sc_prior_rank": 12,
+    "sc_delta_a": true,
+    "sc_delta_rank": null,
+    "sc_sinkhorn_iters": 64,
+    "dynamics_mode": "graph_ode",
+    "ode_steps": 2,
+    "dynamics_dt": 1.0,
+    "graph_source": "history_fc",
+    "personalized": true,
+    "profile_dim": 32,
+    "dynamics_history_memory": true
+  },
+  "loss": {
+    "name": "temporal_difference_and_head_consistency",
+    "lambda_one": 1.0,
+    "lambda_cpm": 1.0,
+    "lambda_pcc": 0.1,
+    "lambda_dynamics": 0.5,
+    "lambda_variance": 0.05,
+    "lambda_temporal_diff": 0.05,
+    "lambda_cross_head": 0.02,
+    "cross_head_start_epoch": 5,
+    "loss_weighting": "uncertainty",
+    "cpm_gamma": 1.0,
+    "cpm_huber_delta": 1.0,
+    "cpm_horizon_weight": "gamma",
+    "cpm_horizon_alpha": 0.5
+  },
+  "data_and_split": {
+    "data_root": "data/",
+    "bold_source": "raw",
+    "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
+    "val_ratio": 0.1,
+    "test_ratio": 0.1,
+    "split": "被试级 8:1:1，优先 split_file > 版本化 manifest（subject_split_<mode>.json）> 现场按模型 seed 生成；当前 manifest 记录 seed=2024",
+    "conditioning": {
+      "pretrain": {
+        "condition_arm": "demo",
+        "condition_group": "hc3"
+      },
+      "finetune": {
+        "condition_arm": "cat",
+        "condition_group": "mdd8"
+      },
+      "cond_inject": "heads",
+      "cond_dim": 32,
+      "cond_d_demo": 16,
+      "cond_d_new": 16,
+      "cond_h_delta": 64,
+      "cond_delta_style": "mlp",
+      "cond_dropout_p": 0.0
+    }
+  },
+  "training": {
+    "seed": 2024,
+    "sampling_seed": 20261009,
+    "cond_dropout_seed": 20261008,
+    "split_seed": 2024,
+    "batch_size": 256,
+    "train_epochs": 150,
+    "lr_init": 5e-05,
+    "lr_peak": 0.0001,
+    "lr_final": 5e-05,
+    "warmup_epochs": 15,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "patience": 20,
+    "freeze_backbone_epochs": 10,
+    "backbone_lr_scale": 0.2,
+    "use_ema": true,
+    "ema_decay": 0.999,
+    "amp": true,
+    "entrypoints": [
+      "bash scripts/pretrain.sh",
+      "bash scripts/finetune.sh"
+    ]
+  },
+  "evaluation_protocol": {
+    "primary": "val/test ODE H1–H8 被试级 MAE（metric_mae_dynamics_h1_8_subject）",
+    "final_eval": "python -m analysis.evaluate --ckpt checkpoints/neurotwin_finetune/finetuned_best.pt --out_dir results/evaluation --splits test",
+    "metrics_reference": "analysis/next_point_eval.py"
+  },
+  "weights": {
+    "pretrain": {
+      "role": "hc_pretrain",
+      "path": "checkpoints/neurotwin_pretrain/base_best.pt",
+      "sha256": "0e252be1af1750b35bd26a2112f66f6a0cb2ad6fa4249b7334d9cffdbb78d255"
+    },
+    "finetune": {
+      "role": "mdd_finetune",
+      "path": "checkpoints/neurotwin_finetune/finetuned_best.pt",
+      "sha256": "ff0b2d991dcad3c27d548837a4218a5f7521011b8477c8028784d377a2e0aada",
+      "arch_version": 6,
+      "params_total": 6244019,
+      "note": "2026-10-21 训练，epoch 22/23 早停，val ODE H1–H8 subject MAE=0.5329；完整 config.args 快照内嵌于 checkpoint。该权重由学习率调度修复前的配方训练，修复仅对后续重训生效。"
+    }
+  }
+}

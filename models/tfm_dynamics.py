@@ -1,8 +1,7 @@
 # coding=utf-8
 """受控条件图 ODE 动力学头与逐 ROI 方差读出（方案 §6）。
 
-GraphODEDynamicsHead 在 ``dynamics_mode='graph_ode'`` 时**替换**
-``OneStepDynamicsHead``（不包装旧头 residual、不构建第二套闲置参数）：
+GraphODEDynamicsHead 组合以下确定性动力学与方差读出：
 
 - 组合 Laplacian 图扩散 ``L = diag(deg) - A``（不显式构造 L，按
   ``degree.unsqueeze(-1) * z - bmm(adj, z)`` 计算）；
@@ -29,7 +28,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.tfm_personal import PersonalFiLM
-from models.tfm_probabilistic import LowRankLatentInnovation
 
 #: logvar 的数值边界（方案 §6.4 / §8.1）
 LOGVAR_MIN = -6.0
@@ -87,10 +85,7 @@ class GraphODEDynamicsHead(nn.Module):
                  ode_steps: int = 2,
                  residual_strength: float = 0.1,
                  diffusion_init: float = 0.05,
-                 history_memory: bool = False,
-                 stochastic: bool = False,
-                 noise_rank: int = 8,
-                 noise_scale: float = 1e-2):
+                 history_memory: bool = False):
         super().__init__()
         if dim < 1 or hidden_dim < 1:
             raise ValueError(f'dim/hidden_dim 必须为正：{dim}/{hidden_dim}')
@@ -148,7 +143,7 @@ class GraphODEDynamicsHead(nn.Module):
         # ---- 逐 ROI 方差读出 ----
         self.variance_head = VarianceHead(self.dim)
 
-        # ---- S2：历史记忆 FiLM（零初始化 → 起点等价于 baseline）----
+        # ---- 历史记忆 FiLM（零初始化 → 起点等价于 baseline）----
         # 记忆 M_history 为观测历史编码 token 在 patch 维的均值，rollout 期间固定，
         # 使自由推进始终能访问真实历史，而不必反复重编码预测值。
         # fork_rng 内构建：不推进全局 RNG，保证同一 seed 下后续模块的初始化
@@ -160,13 +155,6 @@ class GraphODEDynamicsHead(nn.Module):
                 nn.init.zeros_(self.memory_film.weight)
                 nn.init.zeros_(self.memory_film.bias)
 
-        # ---- S4-2：低秩潜状态创新（默认关闭；fork_rng 不推进全局随机流）----
-        self.innovation = None
-        if stochastic:
-            with torch.random.fork_rng(devices=[]):
-                self.innovation = LowRankLatentInnovation(
-                    self.dim, rank=int(noise_rank), scale_init=float(noise_scale))
-
     # ------------------------------------------------------------------
     # 向量场（方案 §6.1.1–§6.1.3）
     # ------------------------------------------------------------------
@@ -176,14 +164,14 @@ class GraphODEDynamicsHead(nn.Module):
                control: Optional[torch.Tensor] = None,
                memory: Optional[torch.Tensor] = None,
                return_terms: bool = False):
-        """dz/dt：``-κ·LZ + 0.1·R + s⊙G·u``（含 S2 历史记忆 FiLM）。
+        """dz/dt：``-κ·LZ + 0.1·R + s⊙G·u``（含 历史记忆 FiLM）。
 
         Args:
             z: [B,F,D] float32
             adj: [B,F,F] 非负对称图 A（调用方已对称化）
             cond: [B,C] 或 None；profile: [B,P] 或 None
             control: [B,F,1] 或 None（None 与全零严格等价）
-            memory: [B,D] 或 [B,F,D] 历史记忆（S2；None 时记忆 FiLM 关闭）
+            memory: [B,D] 或 [B,F,D] 历史记忆（None 时记忆 FiLM 关闭）
             return_terms: True 时额外返回各分量 dict（诊断用，不改变数值路径）
         """
         b, f, d = z.shape
@@ -268,7 +256,7 @@ class GraphODEDynamicsHead(nn.Module):
         Args:
             z: [B,F,D]；q: [B,F]（RevIN 空间）；adj: [B,F,F] 对称图
             dt: [B] 正的区间长度（单位 TR）；control: [B,F,1] 区间内固定
-            memory: [B,D] 或 [B,F,D] 历史记忆（S2；None 时关闭）
+            memory: [B,D] 或 [B,F,D] 历史记忆（None 时关闭）
         Returns:
             (z_new [B,F,D], q_new [B,F]) float32，保留反向图（不 detach）。
 
@@ -321,7 +309,7 @@ class GraphODEDynamicsHead(nn.Module):
             adj: [B,F,F] A_eff（本头内部已对称化输入可原样传入）
             controls: [B,H,F] 逐区间控制（u[t] 对应到达观测 t 的区间）；None 无控制
             time_deltas: [H] 或 [B,H] 或 None（None = 全部 dt=1）
-            memory: [B,D] 或 [B,F,D] 历史记忆（S2；rollout 期间固定不变）
+            memory: [B,D] 或 [B,F,D] 历史记忆（rollout 期间固定不变）
         Returns:
             z_final [B,F,D]；q_trajectory [B,F,H]；z_trajectory [B,H,F,D]
         """
@@ -367,87 +355,3 @@ class GraphODEDynamicsHead(nn.Module):
         q_trajectory = torch.stack(q_traj, dim=-1)             # [B,F,H]
         z_trajectory = torch.stack(z_traj, dim=1)              # [B,H,F,D]
         return z_final, q_trajectory, z_trajectory
-
-    def forward_samples(self, z0: torch.Tensor, q0: torch.Tensor,
-                        adj: torch.Tensor,
-                        cond: Optional[torch.Tensor] = None,
-                        profile: Optional[torch.Tensor] = None,
-                        controls: Optional[torch.Tensor] = None,
-                        time_deltas: Optional[torch.Tensor] = None,
-                        horizon: int = 8,
-                        memory: Optional[torch.Tensor] = None,
-                        n_samples: int = 32,
-                        generator: Optional[torch.Generator] = None):
-        """S4-2：低秩随机潜状态推进，返回 ``(q_samples [B,K,F,H], z_final [B,K,F,D])``。
-
-        每个样本的区间推进为
-
-            Z ← Z + sqrt(dt)·Gφ(Z,M)ε,   (Z,q) ← HeunRK2(Z,q)
-
-        即创新在区间入口注入，再走原 Heun 积分与 BOLD 读出；``ε [B,K,r]`` 只在
-        rank 维独立，ROI 相关由状态相关的增益 ``Gφ`` 提供。噪声与积分均在 fp32
-        执行，与确定性路径的数值口径一致。
-        """
-        if self.innovation is None:
-            raise RuntimeError('forward_samples 需要 stochastic=True 构建的创新模块')
-        if z0.ndim != 3 or q0.ndim != 2:
-            raise ValueError(
-                f'z0 期望 [B,F,D]，q0 期望 [B,F]；收到 {tuple(z0.shape)}/{tuple(q0.shape)}')
-        if adj.ndim != 3 or adj.shape[-2:] != (z0.shape[1], z0.shape[1]):
-            raise ValueError(
-                f'adj 期望 [B,{z0.shape[1]},{z0.shape[1]}]，收到 {tuple(adj.shape)}')
-        b, f, d = z0.shape
-        k = int(n_samples)
-        if k < 1:
-            raise ValueError(f'n_samples 必须 >= 1，收到 {k}')
-        h_out = int(horizon)
-        if h_out < 1:
-            raise ValueError(f'horizon 必须 >= 1，收到 {h_out}')
-        adj = 0.5 * (adj + adj.transpose(-1, -2))
-        if controls is not None and tuple(controls.shape) != (b, h_out, f):
-            raise ValueError(
-                f'controls 期望 [B,{h_out},{f}]，收到 {tuple(controls.shape)}')
-        if time_deltas is not None and time_deltas.ndim not in (1, 2):
-            raise ValueError(
-                f'time_deltas 期望 [H] 或 [B,H]，收到 {tuple(time_deltas.shape)}')
-        if time_deltas is not None and time_deltas.shape[-1] != h_out:
-            raise ValueError(
-                f'time_deltas 末维 {time_deltas.shape[-1]} 与 horizon={h_out} 不一致')
-
-        def expand(x):
-            if x is None:
-                return None
-            return x.repeat_interleave(k, dim=0)
-
-        z = expand(z0)
-        q = expand(q0)
-        adj = expand(adj)
-        cond = expand(cond)
-        profile = expand(profile)
-        memory = expand(memory)
-        controls = expand(controls)
-        if time_deltas is not None and time_deltas.ndim == 2:
-            time_deltas = expand(time_deltas)
-        ones = torch.ones(b * k, device=z0.device, dtype=torch.float32)
-        q_traj = []
-        for hidx in range(h_out):
-            u = controls[:, hidx, :].unsqueeze(-1) if controls is not None else None
-            if time_deltas is None:
-                dt = ones
-            elif time_deltas.ndim == 1:
-                dt = time_deltas.to(device=z0.device, dtype=torch.float32).expand(b * k)
-            else:
-                dt = time_deltas[:, hidx].to(device=z0.device, dtype=torch.float32)
-            with torch.autocast(device_type=z.device.type, enabled=False):
-                eps = torch.randn(b * k, self.innovation.rank,
-                                  device=z.device, dtype=torch.float32,
-                                  generator=generator)
-                noise = self.innovation(z.float(), memory=memory, eps=eps)
-                z = z.float() + (dt.float().sqrt().view(-1, 1, 1)
-                                 * noise.unsqueeze(-1))
-            z, q = self.integrate_interval(z, q, adj, dt, cond=cond,
-                                           profile=profile, control=u,
-                                           memory=memory)
-            q_traj.append(q)
-        q_samples = torch.stack(q_traj, dim=-1).reshape(b, k, f, h_out)
-        return q_samples, z.reshape(b, k, f, d)

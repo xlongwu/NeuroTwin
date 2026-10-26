@@ -156,7 +156,7 @@ class OutcomeFeatureExtractor:
 
     def __init__(self, ckpt_path: str, reference_path: str,
                  condition_file: Optional[str] = None, device=None):
-        from experiments.evaluate_variant import (build_model_from_args,
+        from analysis.evaluate import (build_model_from_args,
                                                   load_condition_bundle,
                                                   load_train_args)
         from analysis.checkpoint import load_checkpoint_compat
