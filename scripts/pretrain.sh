@@ -18,6 +18,7 @@ checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
 RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-}"
 SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-False}"
+INIT_WEIGHT="${INIT_WEIGHT:-}"
 # 预训练产物的固定目录名：下游 scripts/finetune.sh 按
 # ${name}*/base_best.pt 找起点，两处改名必须同步。
 # neurotwin_pretrain/finetune 产物混用。
@@ -34,21 +35,31 @@ if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
 fi
 
 # ---- 评估协议（不属于训练配方，保持脚本内单点定义）----
-eval_context_length=64
-eval_anchors_per_subject=16
-eval_rollout_tasks_per_subject=2
-eval_rollout_horizons="1,2,4,8,16"
+eval_context_length="${EVAL_CONTEXT_LENGTH:-64}"
+eval_anchors_per_subject="${EVAL_ANCHORS_PER_SUBJECT:-8}"
+train_samples_per_subject="${TRAIN_SAMPLES_PER_SUBJECT:-8}"
 
 # ---- 环境变量覆盖（消融/排程用）----
-# 说明：temporal_diff / cross_head 为固定权重项，不进入 uncertainty 聚合；
-#       cross_head_start_epoch 仅在 LAMBDA_CROSS_HEAD>0 时生效。
-lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-$lambda_temporal_diff}"
-lambda_cross_head="${LAMBDA_CROSS_HEAD:-$lambda_cross_head}"
-cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-$cross_head_start_epoch}"
-cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-$cpm_horizon_weight}"
-cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-$cpm_horizon_alpha}"
+lambda_rec="${LAMBDA_REC:-$lambda_rec}"
+lambda_fc="${LAMBDA_FC:-$lambda_fc}"
+lambda_freq="${LAMBDA_FREQ:-$lambda_freq}"
+loss_weighting="${LOSS_WEIGHTING:-$loss_weighting}"
 dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-$dynamics_history_memory}"
 train_epochs="${TRAIN_EPOCHS:-$train_epochs}"
+lr_init="${LR_INIT:-$lr_init}"
+lr_peak="${LR_PEAK:-$lr_peak}"
+lr_final="${LR_FINAL:-$lr_final}"
+warmup_epochs="${WARMUP_EPOCHS:-$warmup_epochs}"
+weight_decay="${WEIGHT_DECAY:-$weight_decay}"
+grad_clip="${GRAD_CLIP:-$grad_clip}"
+ema_decay="${EMA_DECAY:-$ema_decay}"
+batch_size="${BATCH_SIZE:-$batch_size}"
+patience="${PATIENCE:-$patience}"
+cpm_horizon="${CPM_HORIZON:-$cpm_horizon}"
+if [[ "$cpm_horizon" != "8" ]]; then
+  echo "[错误] 当前阶段只训练 H1–8，CPM_HORIZON 必须为 8（收到 $cpm_horizon）" >&2
+  exit 1
+fi
 
 # 数据加载并发（只影响吞吐，不影响训练结果）：默认关闭 pin_memory 以避免长时
 # 运行中 resource_sharer/pin-memory 线程因临时 socket 消失而中断训练。
@@ -75,11 +86,6 @@ ARGS=(
   --forecast_offsets "$forecast_offsets"   # 基线只建模 +1 偏移（方案 §10）
   --eval_context_length "$eval_context_length"
   --eval_anchors_per_subject "$eval_anchors_per_subject"
-  --eval_rollout_tasks_per_subject "$eval_rollout_tasks_per_subject"
-  --eval_rollout_horizons "$eval_rollout_horizons"
-  --fc_min_length 32
-  --eval_fc True
-  --eval_spectral False
   # ---- TFM 模型规模 ----
   --tfm_dim "$tfm_dim"
   --tfm_layers "$tfm_layers"
@@ -96,17 +102,10 @@ ARGS=(
   --sc_prior_rank "$sc_prior_rank"
   --sc_delta_a "$sc_delta_a"
   --sc_sinkhorn_iters "$sc_sinkhorn_iters"
-  --lambda_one "$lambda_one"
-  --lambda_cpm "$lambda_cpm"
-  --lambda_pcc "$lambda_pcc"
+  --lambda_rec "$lambda_rec"
+  --lambda_fc "$lambda_fc"
+  --lambda_freq "$lambda_freq"
   --loss_weighting "$loss_weighting"
-  --cpm_gamma "$cpm_gamma"           # 1=逐 horizon 均匀权重
-  --cpm_huber_delta "$cpm_huber_delta"
-  --lambda_temporal_diff "$lambda_temporal_diff"
-  --lambda_cross_head "$lambda_cross_head"
-  --cross_head_start_epoch "$cross_head_start_epoch"
-  --cpm_horizon_weight "$cpm_horizon_weight"
-  --cpm_horizon_alpha "$cpm_horizon_alpha"
   --norm "$norm"                     # Context-only RevIN（方案 §15）
   --dropout "$dropout"
   # ---- 优化与训练规模 ----
@@ -122,11 +121,12 @@ ARGS=(
   --use_ema "$use_ema"
   --ema_decay "$ema_decay"
   --amp "$amp"
+  --compile "${COMPILE:-False}"
   --num_workers "$num_workers"       # 见文件顶部 PIN_MEMORY/NUM_WORKERS 说明
   --pin_memory "$pin_memory"
-  --eval_batch_size "${EVAL_BATCH_SIZE:-512}"  # 仅影响验证吞吐；降低 Val 峰值内存
-  --subject_cache_size 4096         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
-  --train_samples_per_subject 0    # 0=auto（每被试每 epoch min(合法组合数, 12)）
+  --eval_batch_size "${EVAL_BATCH_SIZE:-256}"  # 仅影响验证吞吐；降低 Val 峰值内存
+  --subject_cache_size "${SUBJECT_CACHE_SIZE:-4096}"         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
+  --train_samples_per_subject "$train_samples_per_subject"  # 0=auto（每被试每 epoch min(合法组合数, 12)）
   --sampling_seed "$sampling_seed"
   --val_ratio "$val_ratio"
   --test_ratio "$test_ratio"
@@ -151,9 +151,10 @@ ARGS+=(
   --calibration_length "$calibration_length"  # Raw 标准化与 profile 用同一前缀
   --ode_steps "$ode_steps"
   --dynamics_dt "$dynamics_dt"
-  --lambda_dynamics "$lambda_dynamics"
-  --lambda_variance "$lambda_variance"
   --dynamics_history_memory "$dynamics_history_memory"
+  --state_feedback "${STATE_FEEDBACK:-False}"
+  --spatial_profile "${SPATIAL_PROFILE:-False}"
+  --condition_initial_state "${CONDITION_INITIAL_STATE:-False}"
 )
 # 条件宽度来自 JSON；HC 预训练由 main.py 将 tfm_patho_mode 强制置为 none，
 # JSON 的 film 只描述 MDD 微调阶段，因此这里不传 --tfm_patho_mode。
@@ -166,6 +167,9 @@ if [[ "$SAVE_TRAINING_STATE" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ \
 fi
 if [[ -n "$RESUME_TRAINING_STATE" ]]; then
   ARGS+=(--resume_training_state "$RESUME_TRAINING_STATE")
+fi
+if [[ -n "$INIT_WEIGHT" ]]; then
+  ARGS+=(--init_weight "$INIT_WEIGHT")
 fi
 
 # 生效参数已随 checkpoint 的 config.args 快照保存，完整命令行只在 PRINT_CMD=1 时打印。

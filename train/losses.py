@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def pearson(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -71,6 +72,316 @@ def temporal_pcc_loss(pred: torch.Tensor, target: torch.Tensor,
     denom = (p_ss + eps).sqrt() * (t_ss + eps).sqrt() + eps
     corr = ((pc * tc).sum(-1) / denom).clamp(-1.0, 1.0)
     return ((1.0 - corr) * valid).sum() / valid.sum().clamp_min(1)
+
+
+def trajectory_statistics_loss(pred: torch.Tensor, target: torch.Tensor,
+                               mask: torch.Tensor = None, *, include_tail: bool = True):
+    """Masked ROI amplitude, signed FC and lag-1 correlation errors.
+
+    Only trajectories with at least eight observed time points contribute. The
+    variance floor is applied symmetrically to prediction and target for stable
+    gradients when the predicted sequence initially has little variation.
+    """
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        return _trajectory_statistics_loss(pred.float(), target.float(), mask, include_tail)
+
+
+def _trajectory_statistics_loss(pred, target, mask, include_tail):
+    if pred.ndim != 3 or pred.shape != target.shape:
+        raise ValueError('trajectory statistics require matching [B,F,H] tensors')
+    b, f, h = pred.shape
+    if mask is not None and mask.shape != (b, h):
+        raise ValueError('trajectory statistics mask must be [B,H]')
+    p, t = pred.float(), target.float()
+    w = p.new_ones(b, 1, h) if mask is None else mask.to(p)[:, None, :]
+    n = w.sum(-1, keepdim=True).clamp_min(1)
+    valid = (w.sum(-1) >= 8).to(p.dtype)[:, 0]
+
+    def moments(x):
+        c = (x - (x * w).sum(-1, keepdim=True) / n) * w
+        var = c.square().sum(-1) / n.squeeze(-1)
+        std = (var + 1e-4).sqrt()
+        corr = torch.bmm(c, c.transpose(1, 2)) / n
+        corr = corr / (std.unsqueeze(-1) * std.unsqueeze(-2))
+        return std, corr
+
+    ps, pc = moments(p)
+    ts, tc = moments(t)
+    amp = F.smooth_l1_loss(ps, ts, reduction='none').mean(-1)
+    edge_mask = 1.0 - torch.eye(f, device=p.device, dtype=p.dtype)
+    fc = (F.smooth_l1_loss(pc, tc, reduction='none') * edge_mask).sum((1, 2))
+    fc = fc / max(f * (f - 1), 1)
+
+    def autocorr(x):
+        pair = w[:, :, 1:] * w[:, :, :-1]
+        count = pair.sum(-1, keepdim=True).clamp_min(1)
+        left, right = x[:, :, :-1], x[:, :, 1:]
+        left = (left - (left * pair).sum(-1, keepdim=True) / count) * pair
+        right = (right - (right * pair).sum(-1, keepdim=True) / count) * pair
+        denom = ((left.square().sum(-1) + 1e-4)
+                 * (right.square().sum(-1) + 1e-4)).sqrt()
+        return (left * right).sum(-1) / denom
+
+    acf = F.smooth_l1_loss(autocorr(p), autocorr(t), reduction='none').mean(-1)
+    denom = valid.sum().clamp_min(1)
+    amp, fc, acf = tuple((value * valid).sum() / denom for value in (amp, fc, acf))
+    if include_tail and h >= 16:
+        tail_mask = None if mask is None else mask[:, h // 2:]
+        tail_amp, _, tail_acf = _trajectory_statistics_loss(
+            pred[:, :, h // 2:], target[:, :, h // 2:], tail_mask, False)
+        tail_valid = (pred.new_tensor(1.0) if tail_mask is None else
+                      (tail_mask.sum(-1) >= 8).any().to(p.dtype))
+        amp = (amp + tail_valid * tail_amp) / (1.0 + tail_valid)
+        acf = (acf + tail_valid * tail_acf) / (1.0 + tail_valid)
+    return amp, fc, acf
+
+
+def masked_l1(pred: torch.Tensor, target: torch.Tensor,
+              mask: torch.Tensor = None, eps: float = 1e-8) -> torch.Tensor:
+    """Masked element-wise L1 over ``[B, F, H]`` futures.
+
+    ``mask`` is ``[B, H]`` and marks which horizons have a real target. The
+    normalization is per valid element, so partial futures do not down-weight
+    the remaining observations.
+    """
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'masked_l1 expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    if mask is None:
+        return (pred - target).abs().mean()
+    if tuple(mask.shape) != (pred.shape[0], pred.shape[2]):
+        raise ValueError(
+            f'masked_l1 mask must be [B,{pred.shape[2]}], got {tuple(mask.shape)}')
+    w = mask.to(pred.dtype)[:, None, :]
+    return ((pred - target).abs() * w).sum() / (
+        w.sum().clamp_min(eps) * pred.shape[1])
+
+
+def masked_l1_per_sample(pred: torch.Tensor, target: torch.Tensor,
+                         mask: torch.Tensor = None,
+                         eps: float = 1e-8) -> torch.Tensor:
+    """Per-sample masked L1 ``[B]`` for ``[B,F,H]`` tensors."""
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'masked_l1_per_sample expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    err = (pred - target).abs()
+    if mask is None:
+        return err.mean(dim=(1, 2))
+    if tuple(mask.shape) != (pred.shape[0], pred.shape[2]):
+        raise ValueError(
+            f'masked_l1_per_sample mask must be [B,{pred.shape[2]}], got '
+            f'{tuple(mask.shape)}')
+    w = mask.to(pred.dtype)[:, None, :]
+    return (err * w).sum(dim=(1, 2)) / (
+        w.sum(dim=(1, 2)).clamp_min(eps) * pred.shape[1])
+
+
+def complete_sequence_mask(mask: torch.Tensor, horizon: int) -> torch.Tensor:
+    """Samples with every one of the first ``horizon`` future steps observed."""
+    if mask is None:
+        raise ValueError('complete_sequence_mask requires an explicit [B,H] mask')
+    if mask.ndim != 2 or mask.shape[1] < horizon:
+        raise ValueError(
+            f'complete_sequence_mask expects [B,H>= {horizon}], got {tuple(mask.shape)}')
+    return (mask[:, :horizon] > 0).all(dim=1)
+
+
+def correlation_matrix(series: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Per-sample Pearson FC matrix from ``[B, F, T]`` time series."""
+    if series.ndim != 3:
+        raise ValueError(f'correlation_matrix expects [B,F,T], got {tuple(series.shape)}')
+    x = series.float()
+    centered = x - x.mean(dim=-1, keepdim=True)
+    std = (centered.square().mean(dim=-1) + eps).sqrt()
+    cov = torch.bmm(centered, centered.transpose(1, 2)) / x.shape[-1]
+    return cov / (std.unsqueeze(-1) * std.unsqueeze(-2) + eps)
+
+
+def fc_mse_per_sample(pred: torch.Tensor, target: torch.Tensor,
+                      eps: float = 1e-6) -> torch.Tensor:
+    """Per-sample FC-matrix MSE ``[B]``; off-diagonal edges only."""
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'fc_mse_per_sample expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        p = correlation_matrix(pred)
+        t = correlation_matrix(target)
+        f = pred.shape[1]
+        off_diag = 1.0 - torch.eye(f, device=p.device, dtype=p.dtype)
+        return ((p - t) ** 2 * off_diag).sum(dim=(1, 2)) / max(f * (f - 1), 1)
+
+
+def fc_mse(pred: torch.Tensor, target: torch.Tensor,
+           mask: torch.Tensor = None, eps: float = 1e-6) -> torch.Tensor:
+    """Mean squared error between predicted and true Pearson FC matrices.
+
+    Only samples with a fully observed future contribute: an FC matrix from a
+    truncated window is not comparable across subjects. Off-diagonal edges are
+    averaged; the diagonal is always one and carries no information.
+    """
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'fc_mse expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    if mask is None:
+        valid = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+    else:
+        valid = complete_sequence_mask(mask, pred.shape[-1])
+    if not bool(valid.any()):
+        return pred.new_zeros(())
+    return fc_mse_per_sample(pred[valid], target[valid], eps).mean()
+
+
+def frequency_l1_per_sample(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-sample L1 distance between orthonormal rFFT magnitudes ``[B]``."""
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'frequency_l1_per_sample expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        p = torch.fft.rfft(pred.float(), dim=-1, norm='ortho').abs()
+        t = torch.fft.rfft(target.float(), dim=-1, norm='ortho').abs()
+        return (p - t).abs().mean(dim=(1, 2))
+
+
+def frequency_l1(pred: torch.Tensor, target: torch.Tensor,
+                 mask: torch.Tensor = None) -> torch.Tensor:
+    """L1 distance between orthonormal rFFT magnitudes of future trajectories.
+
+    The transform is applied along time for each ROI; DC is included because a
+    short BOLD window can carry a non-zero mean level that should be matched.
+    """
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'frequency_l1 expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    if mask is None:
+        valid = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+    else:
+        valid = complete_sequence_mask(mask, pred.shape[-1])
+    if not bool(valid.any()):
+        return pred.new_zeros(())
+    return frequency_l1_per_sample(pred[valid], target[valid]).mean()
+
+
+def fc_pattern_pcc(pred: torch.Tensor, target: torch.Tensor,
+                   eps: float = 1e-8) -> torch.Tensor:
+    """Per-sample Pearson correlation between upper-triangle FC edges ``[B]``."""
+    if pred.shape != target.shape or pred.ndim != 3:
+        raise ValueError(
+            f'fc_pattern_pcc expects matching [B,F,H] tensors, got '
+            f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        p = correlation_matrix(pred)
+        t = correlation_matrix(target)
+        f = pred.shape[1]
+        iu = torch.triu_indices(f, f, offset=1, device=p.device)
+        a, b = p[:, iu[0], iu[1]], t[:, iu[0], iu[1]]
+        a = a - a.mean(dim=1, keepdim=True)
+        b = b - b.mean(dim=1, keepdim=True)
+        denom = ((a.square().sum(dim=1) + eps).sqrt()
+                 * (b.square().sum(dim=1) + eps).sqrt())
+        return (a * b).sum(dim=1) / denom
+
+
+class ForecastFidelityLoss(nn.Module):
+    """H1–H future loss: reconstruction + FC + frequency, uncertainty-weighted.
+
+    ``pred``/``target`` are ``[B, F, H]`` trajectories in BOLD units. The three
+    terms follow the documented reconstruction (L1), functional-connectivity
+    (MSE between Pearson FC matrices) and frequency (L1 between rFFT magnitudes)
+    objectives. With ``weighting='uncertainty'`` each enabled task gets a
+    learnable log-variance ``s_i`` and contributes ``exp(-s_i)·L_i + s_i``
+    (Kendall et al., CVPR 2018); initial ``s_i = -log(lambda_i)`` keeps the
+    warm-start weights equal to the configured lambdas. A task with no valid
+    sample in a batch contributes nothing, including its ``s_i`` constant.
+    """
+
+    TASKS = ('rec', 'fc', 'freq')
+
+    def __init__(self, lambda_rec: float = 1.0, lambda_fc: float = 1.0,
+                 lambda_freq: float = 1.0, weighting: str = 'uncertainty'):
+        super().__init__()
+        for name, value in (('rec', lambda_rec), ('fc', lambda_fc),
+                            ('freq', lambda_freq)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'lambda_{name} must be finite and nonnegative')
+            setattr(self, f'lambda_{name}', float(value))
+        if weighting not in ('fixed', 'uncertainty'):
+            raise ValueError(
+                f"weighting must be 'fixed' or 'uncertainty', got {weighting!r}")
+        self.weighting = str(weighting)
+        self.log_s = nn.ParameterDict()
+        if weighting == 'uncertainty':
+            for name in self.TASKS:
+                lam = float(getattr(self, f'lambda_{name}'))
+                if lam > 0:
+                    self.log_s[name] = nn.Parameter(
+                        torch.tensor(-math.log(lam), dtype=torch.float32))
+
+    def _unc_weighted(self, name: str, task_loss: torch.Tensor,
+                      valid: torch.Tensor) -> torch.Tensor:
+        s = self.log_s[name]
+        weighted = torch.exp(-s) * task_loss + s
+        return valid.to(weighted.dtype) * weighted
+
+    def get_loss_weights(self) -> dict:
+        out = {'mode': self.weighting}
+        for name in self.TASKS:
+            lam = float(getattr(self, f'lambda_{name}'))
+            if lam <= 0:
+                continue
+            if self.weighting == 'uncertainty' and name in self.log_s:
+                s = self.log_s[name]
+                out[name] = {'weight': float(torch.exp(-s.detach())),
+                             'log_s': float(s.detach())}
+            else:
+                out[name] = {'weight': lam, 'log_s': None}
+        return out
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor = None) -> tuple:
+        if pred.shape != target.shape or pred.ndim != 3:
+            raise ValueError(
+                f'ForecastFidelityLoss expects matching [B,F,H] tensors, got '
+                f'{tuple(pred.shape)} vs {tuple(target.shape)}')
+        if mask is not None and tuple(mask.shape) != (pred.shape[0], pred.shape[2]):
+            raise ValueError(
+                f'mask must be [B,{pred.shape[2]}], got {tuple(mask.shape)}')
+
+        if mask is None:
+            rec_valid = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+        else:
+            rec_valid = (mask > 0).any(dim=1)
+        complete_valid = (rec_valid if mask is None
+                          else complete_sequence_mask(mask, pred.shape[-1]))
+
+        raw = {
+            'rec': masked_l1(pred, target, mask),
+            'fc': fc_mse(pred, target, mask),
+            'freq': frequency_l1(pred, target, mask),
+        }
+        valid = {
+            'rec': rec_valid.any().to(pred.dtype),
+            'fc': complete_valid.any().to(pred.dtype),
+            'freq': complete_valid.any().to(pred.dtype),
+        }
+        total = pred.new_zeros(())
+        stats = {}
+        for name in self.TASKS:
+            lam = float(getattr(self, f'lambda_{name}'))
+            stats[f'loss_{name}'] = raw[name].detach()
+            if lam <= 0 or not bool(valid[name]):
+                continue
+            if self.weighting == 'uncertainty' and name in self.log_s:
+                total = total + self._unc_weighted(name, raw[name], valid[name])
+            else:
+                total = total + lam * raw[name]
+        stats['loss_total'] = total.detach()
+        return total, stats
 
 
 def compute_graph_regularization(aux_info, device,
@@ -374,7 +685,10 @@ class TFMDualLoss(nn.Module):
                  adaptive_delta_scale: float = 1.0,
                  dynamics_horizon_weight: bool = False,
                  horizon_weight_power: float = 1.0,
-                 lambda_temporal_pcc: float = 0.0):
+                 lambda_temporal_pcc: float = 0.0,
+                 lambda_trajectory_amplitude: float = 0.0,
+                 lambda_trajectory_fc: float = 0.0,
+                 lambda_trajectory_acf: float = 0.0):
         super().__init__()
         if lambda_one < 0 or lambda_cpm < 0 or lambda_pcc < 0:
             raise ValueError(
@@ -418,6 +732,12 @@ class TFMDualLoss(nn.Module):
         if not math.isfinite(lambda_temporal_pcc) or lambda_temporal_pcc < 0:
             raise ValueError('lambda_temporal_pcc must be finite and nonnegative')
         self.lambda_temporal_pcc = float(lambda_temporal_pcc)
+        for name, value in [('trajectory_amplitude', lambda_trajectory_amplitude),
+                            ('trajectory_fc', lambda_trajectory_fc),
+                            ('trajectory_acf', lambda_trajectory_acf)]:
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'lambda_{name} must be finite and nonnegative')
+            setattr(self, f'lambda_{name}', float(value))
         self.cpm_horizon_weight = str(cpm_horizon_weight)
         self.cpm_horizon_alpha = float(cpm_horizon_alpha)
         self.cross_head_start_epoch = int(cross_head_start_epoch)
@@ -469,7 +789,8 @@ class TFMDualLoss(nn.Module):
         """
         out = {'mode': self.weighting}
         for name in ('one', 'cpm', 'dynamics', 'variance',
-                     'temporal_diff', 'cross_head', 'temporal_pcc'):
+                     'temporal_diff', 'cross_head', 'temporal_pcc',
+                     'trajectory_amplitude', 'trajectory_fc', 'trajectory_acf'):
             lam = float(getattr(self, f'lambda_{name}'))
             if lam <= 0:
                 continue
@@ -732,16 +1053,19 @@ class TFMDualLoss(nn.Module):
                          and int(epoch) < self.cross_head_start_epoch)
                 and dynamics_pred is not None and dynamics_pred.shape[0] > 0
                 and cpm_pred.shape[0] > 0):
-            cons_mask = cpm_mask
+            common_h = min(cpm_pred.shape[-1], dynamics_pred.shape[-1])
+            cons_mask = cpm_mask[:, :common_h] if cpm_mask is not None else None
             if cons_mask is None:
-                cons_mask = dynamics_mask
+                cons_mask = dynamics_mask[:, :common_h] if dynamics_mask is not None else None
             elif dynamics_mask is not None:
-                if tuple(cons_mask.shape) != tuple(dynamics_mask.shape):
+                dyn_mask_common = dynamics_mask[:, :common_h]
+                if tuple(cons_mask.shape) != tuple(dyn_mask_common.shape):
                     raise ValueError(
                         f"双头一致性 cpm_mask {tuple(cons_mask.shape)} 与 "
                         f"dynamics_mask {tuple(dynamics_mask.shape)} 形状不一致")
-                cons_mask = cons_mask.to(dynamics_mask.dtype) * dynamics_mask
-            cross = cross_head_consistency(cpm_pred, dynamics_pred,
+                cons_mask = cons_mask.to(dyn_mask_common.dtype) * dyn_mask_common
+            cross = cross_head_consistency(cpm_pred[:, :, :common_h],
+                                           dynamics_pred[:, :, :common_h],
                                            mask=cons_mask, eps=self.eps)
             total = total + self.lambda_cross_head * cross
         stats['loss_cross_head'] = cross.detach()
@@ -758,6 +1082,17 @@ class TFMDualLoss(nn.Module):
         stats['loss_temporal_pcc'] = (tp_cpm + tp_dyn).detach()
         stats['loss_temporal_pcc_cpm'] = tp_cpm.detach()
         stats['loss_temporal_pcc_dyn'] = tp_dyn.detach()
+
+        if dynamics_pred is not None and any((self.lambda_trajectory_amplitude,
+                                              self.lambda_trajectory_fc,
+                                              self.lambda_trajectory_acf)):
+            amp, fc, acf = trajectory_statistics_loss(
+                dynamics_pred, dynamics_target, dynamics_mask)
+            total = (total + self.lambda_trajectory_amplitude * amp
+                     + self.lambda_trajectory_fc * fc
+                     + self.lambda_trajectory_acf * acf)
+            stats.update(loss_trajectory_amplitude=amp.detach(),
+                         loss_trajectory_fc=fc.detach(), loss_trajectory_acf=acf.detach())
 
         stats['loss_total'] = total.detach()
         return total, stats

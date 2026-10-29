@@ -2,7 +2,8 @@
 """v2 健康参照拟合与规范性偏离（B3）+ 校准质量门槛检查（B4）。
 
 输入：``analysis.rolling_one_step`` 的逐被试 ROI-MAE 矩阵
-（``<rolling_dir>/<group>/per_subject_roi_mae_<split>.npz`` → ``mae_model``，
+（``<rolling_dir>/<group>/逐被试_ROI误差_<split>.npz`` → ``mae_model``，
+历史产物 ``per_subject_roi_mae_<split>.npz`` 仍作为兼容回退，
 即逐 ROI 的 ``s_i,roi = mean_t |err_lag1|``）与人口学 merged 表（hc3 三字段）。
 
 - ``gate``（B4，事先写死的通过标准）：HC val 上模型 lag-1 MAE 相对 persistence
@@ -41,7 +42,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from analysis.metrics import NETWORK_GROUPS
-from analysis.rolling_one_step import GROUP_SUBDIR
+from analysis.rolling_one_step import GROUP_SUBDIR, manifest_path
+from utils.common import split_label
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +59,10 @@ EPS = 1e-12
 # ══════════════════════════════════════════════════════════════════════════
 
 def roi_mae_path(rolling_dir: Path, group: str, split: str) -> Path:
-    return Path(rolling_dir) / GROUP_SUBDIR[group] / f'per_subject_roi_mae_{split}.npz'
+    """优先使用中文 ROI-MAE 产物，历史英文产物作为兼容回退。"""
+    group_dir = Path(rolling_dir) / GROUP_SUBDIR[group]
+    preferred = group_dir / f'逐被试_ROI误差_{split_label(split)}.npz'
+    return preferred if preferred.exists() else group_dir / f'per_subject_roi_mae_{split}.npz'
 
 
 def load_roi_mae(rolling_dir: Path, group: str, split: str) -> Tuple[List[str],
@@ -302,8 +307,8 @@ def _cmd_fit(ns) -> None:
 
     out = Path(ns.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    manifest = json.loads((Path(ns.rolling_dir) / GROUP_SUBDIR['hc']
-                           / 'manifest.json').read_text(encoding='utf-8'))
+    manifest = json.loads(manifest_path(
+        Path(ns.rolling_dir) / GROUP_SUBDIR['hc']).read_text(encoding='utf-8'))
     meta = {'design_layout': json.dumps(fit['design_layout']),
             'demo': json.dumps(fit['demo']),
             'conformal_alpha': float(ns.conformal_alpha),

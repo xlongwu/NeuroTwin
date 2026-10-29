@@ -118,7 +118,7 @@ def main() -> None:
     np.random.seed(2024)
     rng = np.random.RandomState(2024)
     permutations = np.array([[rng.permutation(8) for _ in range(3)] for _ in range(8)])
-    registration = ROOT/'docs/VISUALIZATION_COMPLETION_PREREG.md'
+    registration = ROOT/'docs/可视化复现设置.md'
     manifest = dict(source_manifest=source, amplitude=ns.amplitude, batch_size=ns.batch_size,
                     seed=2024, history_block_size=8, history_repeats=3,
                     block_permutations=permutations.tolist(), input_perturbation_last_tr=8,

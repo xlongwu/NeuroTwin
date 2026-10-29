@@ -130,6 +130,17 @@ def test_aggregation_raises_when_no_full_horizon_target():
 DYN_KEY = dynamics_metric_key(H)
 
 
+def test_selection_metric_combines_mae_and_fc_mse():
+    """联合判据 = H1–N MAE + FC MSE；分项同时返回供日志核对。"""
+    from main import selection_metric, selection_metric_key
+    metrics = {DYN_KEY: 0.5, 'metric_fc_mse': 0.25}
+    score, mae, fc = selection_metric(metrics, H)
+    assert selection_metric_key(H) == f'metric_selection_h1_{H}_mae_plus_fc_mse'
+    assert score == pytest.approx(0.75)
+    assert mae == pytest.approx(0.5)
+    assert fc == pytest.approx(0.25)
+
+
 def test_selection_uses_multi_step_metric_over_single_step():
     """候选 A 单步更优、候选 B 多步更优 → 选 B，且单步指标不影响判定。"""
     selector = CheckpointSelector(DYN_KEY, dynamics_metric_name(H), patience=3)
@@ -190,22 +201,18 @@ class _StubModel(torch.nn.Module):
     def forward(self, bx, bs, bp, **kwargs):
         b, f = bx.shape[0], bx.shape[1]
         outputs = torch.zeros(b, f, 1, 1)
-        aux = {'dynamics_pred': torch.zeros(b, f, STUB_H),
-               'cpm_pred': torch.zeros(b, f, STUB_H)}
+        aux = {'dynamics_pred': torch.zeros(b, f, STUB_H)}
         return outputs, aux
 
 
 class _StubCriterion:
-    def __call__(self, pred, target, cpm_pred, cpm_target, cpm_mask, **dyn_kwargs):
-        return torch.zeros(()), {'loss_one': torch.zeros(())}
+    def __call__(self, pred, target, mask):
+        zero = torch.zeros(())
+        return zero, {'loss_rec': zero, 'loss_fc': zero, 'loss_freq': zero}
 
 
 def _stub_args():
-    return SimpleNamespace(cpm_horizon=STUB_H, cpm_huber_delta=1.0,
-                           tfm_competence_temperature=1.0,
-                           sc_sparsity_weight=0.0, sc_entropy_weight=0.0,
-                           sc_temporal_weight=0.0,
-                           dynamics_metric_horizon=STUB_H)
+    return SimpleNamespace(cpm_horizon=STUB_H)
 
 
 def _make_batches(specs, partitions):
@@ -236,8 +243,7 @@ def _make_batches(specs, partitions):
 def _run(specs, partitions):
     from main import evaluate_tfm
     return evaluate_tfm(_StubModel(), _make_batches(specs, partitions),
-                        _StubCriterion(), 'cpu', _stub_args(),
-                        rollout_steps=0, rollout_horizons=None)
+                        _StubCriterion(), 'cpu', _stub_args())
 
 
 #: S1 三个完整锚点 (1,3,5) → 被试内均值 3；S2 一个完整锚点 (7) → 均值 7；S3 锚点只有 3 步
@@ -245,16 +251,13 @@ _SPECS = [('S1', 1.0, STUB_H), ('S1', 3.0, STUB_H), ('S1', 5.0, STUB_H),
           ('S2', 7.0, STUB_H), ('S3', 9.0, STUB_H - 1)]
 
 
-def test_evaluate_emits_subject_equal_metric_with_counts():
+def test_evaluate_emits_subject_equal_metric():
     key = dynamics_metric_key(STUB_H)
     metrics = _run(_SPECS, [5])
     # 被试等权 (3+7)/2 = 5；锚点等权会是 (1+3+5+7)/4 = 4，两者必须可区分
     assert metrics[key] == pytest.approx(5.0)
-    assert metrics[f'{key}_n_subjects'] == 2.0
-    assert metrics[f'{key}_n_anchors'] == 4.0
-    assert metrics[f'{key}_n_anchors_total'] == 5.0
-    assert metrics[f'{key}_n_subjects_without_full_anchor'] == 1.0
-    # 单步指标仍然产出（观察短期退化）
+    assert metrics['metric_mae_h1_4_n_subjects'] == 2.0
+    # 单步指标仍然产出（观察短期精度）
     assert 'metric_mae_next' in metrics
 
 
@@ -264,28 +267,6 @@ def test_metric_invariant_to_batch_partition(partitions):
     assert _run(_SPECS, partitions)[key] == pytest.approx(5.0)
 
 
-def test_evaluate_raises_when_no_full_horizon_anchor():
-    specs = [('S1', 1.0, STUB_H - 1), ('S2', 2.0, 1)]
-    with pytest.raises(RuntimeError, match='没有具备完整'):
-        _run(specs, [2])
-
-
-def test_horizon_override_renames_emitted_key():
-    """覆盖 horizon 时键名与筛选范围同步变化，不残留 h1_8 名义。"""
-    from main import evaluate_tfm
-    args = _stub_args()
-    args.dynamics_metric_horizon = 3
-    specs = [('S1', 1.0, 3), ('S1', 3.0, STUB_H), ('S2', 5.0, 3)]
-    metrics = evaluate_tfm(_StubModel(), _make_batches(specs, [3]),
-                           _StubCriterion(), 'cpu', args,
-                           rollout_steps=0, rollout_horizons=None)
-    key = dynamics_metric_key(3)
-    assert key in metrics and dynamics_metric_key(STUB_H) not in metrics
-    # 被试等权：S1=(1+3)/2=2，S2=5 → (2+5)/2=3.5
-    assert metrics[key] == pytest.approx(3.5)
-    assert metrics[f'{key}_n_anchors'] == 3.0
-
-
 def test_evaluate_reports_missing_subject_id():
     """无 subj_id 时不得退化成 batch 均值（被试等权是主判据定义的一部分）。"""
     from main import evaluate_tfm
@@ -293,5 +274,4 @@ def test_evaluate_reports_missing_subject_id():
     for b in batches:
         b.pop('subj_id')
     with pytest.raises(KeyError, match='subj_id'):
-        evaluate_tfm(_StubModel(), batches, _StubCriterion(), 'cpu', _stub_args(),
-                     rollout_steps=0, rollout_horizons=None)
+        evaluate_tfm(_StubModel(), batches, _StubCriterion(), 'cpu', _stub_args())

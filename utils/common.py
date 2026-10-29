@@ -26,6 +26,12 @@ def parse_float_list(text, name: str):
     return vals
 
 
+def split_label(split: str) -> str:
+    """把 train/val/test 映射为中文结果文件名标签。"""
+    return {'train': '训练集', 'val': '验证集', 'test': '测试集'}.get(
+        str(split), str(split))
+
+
 def parse_int_list(text, name: str):
     """把逗号/空格分隔的字符串解析为 int 列表；空值返回 None。
 

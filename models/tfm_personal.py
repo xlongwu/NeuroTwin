@@ -4,6 +4,8 @@
 ProfileEncoder 从同一扫描最早 ``calibration_length``（默认 32）TR 的
 ``calibration_bold`` 出发，经**共享** TFM 编码器得到基线 tokens 后，沿 ROI 和
 patch 双均值池化，经两层 MLP + tanh 得到固定维（默认 32）的个体校准码 p。
+可选空间分支先对各 ROI 的 patch 均值做通道投影，再保留 ROI 顺序映射至 p；
+其末层零初始化，默认不启用。
 
 - 基线编码不注入当前临床 FiLM，临床影响
   留给向量场的 c，避免把同一份当前评分再编码进 profile；
@@ -36,7 +38,8 @@ class ProfileEncoder(nn.Module):
         hidden: MLP 隐藏宽度（默认 64）。
     """
 
-    def __init__(self, dim: int, profile_dim: int = 32, hidden: int = 64):
+    def __init__(self, dim: int, profile_dim: int = 32, hidden: int = 64,
+                 spatial_features: int = 0):
         super().__init__()
         if dim < 1 or profile_dim < 1 or hidden < 1:
             raise ValueError(
@@ -49,6 +52,12 @@ class ProfileEncoder(nn.Module):
         self.fc1 = nn.Linear(self.dim, self.hidden)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(self.hidden, self.profile_dim)
+        self.spatial_features = int(spatial_features)
+        if self.spatial_features:
+            self.roi_score = nn.Linear(self.dim, 1)
+            self.roi_projection = nn.Linear(self.spatial_features, self.profile_dim,
+                                            bias=False)
+            nn.init.zeros_(self.roi_projection.weight)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """tokens ``[B, F, P0, D]`` → p ``[B, profile_dim]``。
@@ -63,7 +72,13 @@ class ProfileEncoder(nn.Module):
             raise ValueError(
                 f'基线 tokens 通道宽 {tokens.shape[-1]} 与登记的 D={self.dim} 不一致')
         b = tokens.mean(dim=(1, 2))                            # [B,D]
-        return torch.tanh(self.fc2(self.act(self.fc1(self.norm(b)))))
+        pooled = self.fc2(self.act(self.fc1(self.norm(b))))
+        if self.spatial_features:
+            if tokens.shape[1] != self.spatial_features:
+                raise ValueError('profile 的 ROI 数与配置不一致')
+            roi = self.roi_score(self.norm(tokens.mean(dim=2))).squeeze(-1)
+            pooled = pooled + self.roi_projection(roi)
+        return torch.tanh(pooled)
 
 
 class PersonalFiLM(nn.Module):

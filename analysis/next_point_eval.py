@@ -32,7 +32,7 @@ import torch
 from tqdm import tqdm
 
 from utils.common import (parse_int_list, resolve_forecast_offsets,
-                          resolve_task_dims)
+                          resolve_task_dims, split_label)
 from utils.dataloader import NeuroTwinDataLoader
 
 log = logging.getLogger(__name__)
@@ -921,7 +921,7 @@ def roi_permutation_importance(model, data_loader, device, max_tasks=256,
 
     n_rois = xs[0].shape[1]
     baseline_maes = np.array(
-        [_masked_mae(model(x, sc, p)[0][:, :, :, 0], y, m)
+        [_masked_mae(model(x, sc, None)[0][:, :, :, 0], y, m)
          for x, y, sc, p, m in zip(xs, ys, scs, paths, masks)], dtype=np.float64)
     baseline_mae = float(baseline_maes.mean())
 
@@ -1021,7 +1021,8 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
     dims = resolve_task_dims(args)
     if dims['task_mode'] != 'next_timepoint':
         raise ValueError("build_next_point_loader 仅支持 task_mode=next_timepoint 的配置快照")
-    horizons = eval_horizons(args)
+    future_steps = max(int(getattr(args, 'cpm_horizon', 0) or 0),
+                       int(getattr(args, 'dynamics_metric_horizon', 0) or 0))
     loader = NeuroTwinDataLoader(
         data_root=args.data_root, mode=args.mode, batch_size=args.batch_size,
         **condition_loader_kwargs(args, condition_bundle),
@@ -1053,13 +1054,14 @@ def build_next_point_loader(args, split, refresh_split_manifest=False,
         eval_context_length=(int(getattr(args, 'eval_context_length', 0) or 0)
                              or int(args.context_max)),
         eval_anchors_per_subject=int(getattr(args, 'eval_anchors_per_subject', 16)),
-        eval_rollout_tasks_per_subject=int(
-            getattr(args, 'eval_rollout_tasks_per_subject', 2)),
-        eval_rollout_steps=eval_rollout_steps(args, horizons),
+        # 当前阶段只评估 H1–8，不生成 free rollout 任务；避免额外锚点混入
+        # next-state / FC 统计，使评估与训练 val 的 anchor 网格一致。
+        eval_rollout_tasks_per_subject=0,
+        eval_rollout_steps=0,
         train_rollout_steps=0,
-        eval_all_future_steps=max(int(getattr(args, 'cpm_horizon', 0) or 0),
-                                  int(getattr(args, 'dynamics_metric_horizon', 0) or 0)),
-        eval_anchor_min_future_steps=int(getattr(args, 'eval_anchor_min_future_steps', 0)),
+        eval_all_future_steps=future_steps,
+        eval_anchor_min_future_steps=int(
+            getattr(args, 'eval_anchor_min_future_steps', 0) or future_steps),
         # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
         num_rois=int(getattr(args, 'num_rois', 116)),
         graph_source=str(getattr(args, 'graph_source', 'legacy_mask')),
@@ -1142,7 +1144,7 @@ def run_inference(model, data_loader, device, offsets, rollout_steps,
                 cond['subject_index'] = batch['subject_index'].to(device, non_blocking=True)
         bcal, bctl = dynamics_extras(batch, device)
 
-        pred, aux_info = model(x, sc, pathology, condition=cond,
+        pred, aux_info = model(x, sc, None, condition=cond,
                                controls=(bctl[:, :dyn_h] if bctl is not None else None),
                                calibration_bold=bcal,
                                **({'dynamics_horizon': dyn_h}
@@ -1361,7 +1363,7 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
                    extra_report=None, ar1=None, compute_importance=False,
                    importance_max_tasks=256, importance_permutations=0,
                    importance_fdr_alpha=0.05, direction_deadzone=None):
-    """单个 split 的完整 next_timepoint 评估，落盘 metrics_<split>.json 与两个 csv。
+    """单个 split 的完整 next_timepoint 评估，落盘 指标_<split>.json 与两个 csv。
 
     ``compute_importance=True`` 时额外做 ROI 置换重要性并落盘
     ``feature_importance_<split>.json``（见 ``roi_permutation_importance``）。
@@ -1686,6 +1688,58 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
         report['head_metrics'] = {'enabled': False,
                             'reason': '评估视图未提供 future/future_mask'}
 
+    # ---- H1–8 FC/频域相似性（与训练目标同口径，被试等权）----
+    fc_block = OrderedDict()
+    if data.get('future') is not None and data.get('ode_pred') is not None:
+        from train.losses import (complete_sequence_mask, correlation_matrix,
+                                  fc_mse_per_sample, fc_pattern_pcc,
+                                  frequency_l1_per_sample)
+        hh = min(int(data['ode_pred'].shape[2]), int(data['future'].shape[2]))
+        pred_t = torch.from_numpy(
+            np.ascontiguousarray(data['ode_pred'][:, :, :hh])).float()
+        tgt_t = torch.from_numpy(
+            np.ascontiguousarray(data['future'][:, :, :hh])).float()
+        mask_t = torch.from_numpy(
+            np.ascontiguousarray(data['future_mask'][:, :hh])).float()
+        comp = complete_sequence_mask(mask_t, hh).numpy()
+        if comp.any():
+            sel = torch.from_numpy(comp)
+            p_sel, t_sel = pred_t[sel], tgt_t[sel]
+            mse = fc_mse_per_sample(p_sel, t_sel).numpy()
+            pcc = fc_pattern_pcc(p_sel, t_sel).numpy()
+            freq = frequency_l1_per_sample(p_sel, t_sel).numpy()
+            comp_subj = subj_idx[comp]
+
+            def _subj_stats(values):
+                buckets = defaultdict(list)
+                for sid, v in zip(comp_subj, values):
+                    buckets[str(sid)].append(float(v))
+                means = np.array([np.mean(v) for v in buckets.values()])
+                return {'mean': float(means.mean()),
+                        'std': float(means.std()),
+                        'n_subjects': int(means.size)}
+
+            p_fc = correlation_matrix(p_sel).mean(0).numpy()
+            t_fc = correlation_matrix(t_sel).mean(0).numpy()
+            iu = np.triu_indices(p_fc.shape[0], k=1)
+            group_pcc = float(np.corrcoef(p_fc[iu], t_fc[iu])[0, 1])
+            fc_block.update(OrderedDict([
+                ('enabled', True), ('horizon', int(hh)),
+                ('aggregation', '每被试先平均，再跨被试等权'),
+                ('fc_mse', _subj_stats(mse)), ('fc_pcc', _subj_stats(pcc)),
+                ('freq_l1', _subj_stats(freq)),
+                ('fc_group_pcc', group_pcc),
+                ('n_samples', int(comp.sum())),
+                ('definition', {
+                    'fc_mse': '预测与真实 H1–8 序列 Pearson FC 矩阵的非对角边均方误差',
+                    'fc_pcc': '预测与真实 FC 上三角边向量的逐样本 Pearson 相关',
+                    'fc_group_pcc': '先对 FC 矩阵跨样本平均，再计算边相关',
+                    'freq_l1': '正交 rFFT 幅度谱的 L1 距离',
+                }),
+            ]))
+    report['fc_h1_8'] = fc_block or {
+        'enabled': False, 'reason': '需要 future 与 ode_pred'}
+
     # ---- FC（rollout 轨迹；长度不足则不计算） ----
     if eval_fc and data['roll_pred'] is not None:
         roll_subj = np.array([str(s) for s in data['roll_subj']], dtype=object)
@@ -1766,18 +1820,19 @@ def evaluate_split(model, data_loader, args, device, out_dir, split,
 
     # ---- 落盘 ----
     out_dir.mkdir(parents=True, exist_ok=True)
-    with (out_dir / f'metrics_{split}.json').open('w', encoding='utf-8') as f:
+    split_cn = split_label(split)
+    with (out_dir / f'指标_{split_cn}.json').open('w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=float)
     head_extra = OrderedDict(
         (head, {'labels': head_metrics_labels[head], 'arrays': arrs})
         for head, arrs in head_metrics_arrays.items())
-    _write_subject_csv(out_dir / f'per_subject_metrics_{split}.csv', data, arrays,
+    _write_subject_csv(out_dir / f'逐被试指标_{split_cn}.csv', data, arrays,
                        base_arrays, subj_idx, labels, extra_arrays=head_extra)
-    _write_task_csv(out_dir / f'per_task_metrics_{split}.csv', data, arrays, labels,
+    _write_task_csv(out_dir / f'逐任务指标_{split_cn}.csv', data, arrays, labels,
                     extra_arrays=head_extra)
     if head_diag_arrays:
         _write_head_diagnostics_csv(
-            out_dir / f'head_diagnostics_subject_{split}.csv',
+            out_dir / f'预测头诊断_逐被试_{split_cn}.csv',
             head_diag_arrays, head_diag_labels, subj_idx)
     if save_arrays:
         extra = {}
@@ -2155,6 +2210,13 @@ def summarize(report):
         if dual_overall:
             summary[f'{split}_gap_overall'] = dual_overall.get('gap')
             summary[f'{split}_gap_norm_overall'] = dual_overall.get('gap_norm')
+    fc18 = report.get('fc_h1_8', {})
+    if fc18.get('enabled'):
+        summary[f'{split}_fc_mse'] = fc18['fc_mse']['mean']
+        summary[f'{split}_fc_pcc'] = fc18['fc_pcc']['mean']
+        summary[f'{split}_fc_group_pcc'] = fc18['fc_group_pcc']
+        summary[f'{split}_freq_l1'] = fc18['freq_l1']['mean']
+        summary[f'{split}_fc_h1_8_n_subjects'] = fc18['fc_mse']['n_subjects']
     fc = report.get('fc', {}).get('model', {}) if isinstance(report.get('fc'), dict) else {}
     if isinstance(fc, dict) and fc.get('available'):
         summary[f'{split}_fc_upper_mae'] = fc.get('fc_mae')

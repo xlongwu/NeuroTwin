@@ -2,7 +2,7 @@
 """F2 长程精度衰减：分段 MAE 小提琴 + 历史均值基线。
 
 借鉴图库 oa-geo-hess-30-629-2026-f10 卡片（淡彩小提琴 + 同色数值标注）；
-虚线为历史均值基线（EXPERIMENTS.md：test H17–32 历史均值 0.922955）。
+虚线为历史均值基线（实验结论与证据汇总.md：test H17–32 历史均值 0.922955）。
 数据：results/paper_figures/complete_20261026/sources/h32/metrics_{val,test}.json 与 per_subject_{val,test}.csv。
 运行：python -m analysis.paper_figs.fig_f2_horizon
 """

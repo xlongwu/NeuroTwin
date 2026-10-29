@@ -58,7 +58,7 @@ def test_cache_uses_only_requested_split_and_rejects_missing_or_unordered(tmp_pa
                 'checkpoint': 'model.pt', 'checkpoint_sha256': 'example',
                 'context_length': 64, 'calibration_length': 32,
                 'bold_source': 'raw', 'graph_source': 'history_fc'}
-    (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+    (tmp_path / '数据清单.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='subjects missing'):
         evaluate_cache(tmp_path, split_file, 'test')
     np.savez(tmp_path / 'test.npz', pred=x, true=x, x_last=x, cutoff=np.arange(63, 127))

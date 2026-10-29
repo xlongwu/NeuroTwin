@@ -333,7 +333,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument('--data-root', type=Path, default=Path('data'))
     ap.add_argument('--ckpt', type=Path,
                     default=Path('checkpoints/'
-                                 'neurotwin_pretrain/base_best.pt'))
+                                 'h1_8_v2/neurotwin_pretrain/base_best.pt'))
     ap.add_argument('--subset', type=Path,
                     default=Path('data/splits/site_matched_subset.json'))
     ap.add_argument('--n-perm', type=int, default=N_PERM)

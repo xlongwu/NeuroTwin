@@ -19,7 +19,7 @@ seed=2024）+ BH-FDR（q=0.05）+ bootstrap CI；另报 profile 范数与余弦�
 用法::
 
     python -m analysis.param_group_tests \
-      --ckpt checkpoints/neurotwin_pretrain/base_best.pt
+      --ckpt checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt
 """
 import argparse
 import csv
@@ -81,7 +81,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', type=Path,
                     default=Path('checkpoints/'
-                                 'neurotwin_pretrain/base_best.pt'))
+                                 'h1_8_v2/neurotwin_pretrain/base_best.pt'))
     ap.add_argument('--data-root', type=Path, default=Path('data'))
     ap.add_argument('--subset', type=Path, default=DEFAULT_SUBSET)
     ap.add_argument('--out-dir', type=Path,

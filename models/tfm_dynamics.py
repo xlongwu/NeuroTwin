@@ -11,6 +11,9 @@ GraphODEDynamicsHead 组合以下确定性动力学与方差读出：
 - 连续 BOLD 速率读出 ``dq/dt = W_y Z + b_y``；
 - 固定 Heun RK2 同步积分 Z 与 q（integrate_interval）。
 
+可选 ``state_feedback`` 以历史均值为锚点，为 BOLD 速率加入恢复项，并把
+局部状态偏差和有符号历史图上的邻域偏差输入隐状态向量场；默认关闭。
+
 向量场不加 Dropout / DropPath、不随机跳子步；积分在 autocast 关闭的 float32
 中执行（编码器与 CPM 继续使用原 AMP）。非正 dt、ode_steps<1 与形状错误直接
 报错，不做静默轨迹裁剪、自适应步长或假预测 fallback。
@@ -85,7 +88,8 @@ class GraphODEDynamicsHead(nn.Module):
                  ode_steps: int = 2,
                  residual_strength: float = 0.1,
                  diffusion_init: float = 0.05,
-                 history_memory: bool = False):
+                 history_memory: bool = False,
+                 state_feedback: bool = False):
         super().__init__()
         if dim < 1 or hidden_dim < 1:
             raise ValueError(f'dim/hidden_dim 必须为正：{dim}/{hidden_dim}')
@@ -97,6 +101,7 @@ class GraphODEDynamicsHead(nn.Module):
         self.residual_strength = float(residual_strength)
         self.cond_dim = int(cond_dim) if cond_dim else 0
         self.profile_dim = int(profile_dim) if profile_dim else 0
+        self.state_feedback = bool(state_feedback)
 
         # ---- 神经残差：W1 Xavier / W2 std=0.01 / bias 零 ----
         self.norm_z = nn.LayerNorm(self.dim)
@@ -155,6 +160,14 @@ class GraphODEDynamicsHead(nn.Module):
                 nn.init.zeros_(self.memory_film.weight)
                 nn.init.zeros_(self.memory_film.bias)
 
+        if self.state_feedback:
+            # Local and signed-neighbour errors feed the latent dynamics; the
+            # positive restoring rate keeps BOLD deviations from accumulating freely.
+            with torch.random.fork_rng(devices=[]):
+                self.feedback_proj = nn.Linear(2, self.dim, bias=False)
+                nn.init.normal_(self.feedback_proj.weight, std=0.01)
+            self.restore_raw = nn.Parameter(torch.tensor(float(np.log(np.expm1(0.03)))))
+
     # ------------------------------------------------------------------
     # 向量场（方案 §6.1.1–§6.1.3）
     # ------------------------------------------------------------------
@@ -163,6 +176,9 @@ class GraphODEDynamicsHead(nn.Module):
                profile: Optional[torch.Tensor] = None,
                control: Optional[torch.Tensor] = None,
                memory: Optional[torch.Tensor] = None,
+               q: Optional[torch.Tensor] = None,
+               q_anchor: Optional[torch.Tensor] = None,
+               signed_adj: Optional[torch.Tensor] = None,
                return_terms: bool = False):
         """dz/dt：``-κ·LZ + 0.1·R + s⊙G·u``（含 历史记忆 FiLM）。
 
@@ -206,6 +222,14 @@ class GraphODEDynamicsHead(nn.Module):
         diffusion = -kappa.unsqueeze(-1) * lz
         residual = self.residual_strength * r
         out = diffusion + residual
+        feedback = None
+        if self.state_feedback:
+            if q is None or q_anchor is None or signed_adj is None:
+                raise ValueError('state_feedback 需要 q、q_anchor 和 signed_adj')
+            error = q - q_anchor
+            neighbour = torch.bmm(signed_adj, error.unsqueeze(-1)).squeeze(-1)
+            feedback = self.feedback_proj(torch.stack((error.tanh(), neighbour.tanh()), dim=-1))
+            out = out + feedback
         control_term = None
 
         # 状态相关控制门：s = sigmoid(W_s[V_i, c, p])；u=None 与全零严格等价
@@ -225,22 +249,30 @@ class GraphODEDynamicsHead(nn.Module):
             out = out + control_term
         if return_terms:
             return out, {'diffusion': diffusion, 'residual': residual,
-                         'control': control_term, 'kappa': kappa}
+                         'control': control_term, 'q_feedback': feedback, 'kappa': kappa}
         return out
 
     def field_terms(self, z: torch.Tensor, adj: torch.Tensor,
                     cond: Optional[torch.Tensor] = None,
                     profile: Optional[torch.Tensor] = None,
                     control: Optional[torch.Tensor] = None,
-                    memory: Optional[torch.Tensor] = None) -> dict:
+                    memory: Optional[torch.Tensor] = None,
+                    q: Optional[torch.Tensor] = None,
+                    q_anchor: Optional[torch.Tensor] = None,
+                    signed_adj: Optional[torch.Tensor] = None) -> dict:
         """诊断接口：返回向量场各分量（diffusion/residual/control/kappa）。"""
         _, terms = self._field(z, adj, cond, profile, control, memory=memory,
+                               q=q, q_anchor=q_anchor, signed_adj=signed_adj,
                                return_terms=True)
         return terms
 
-    def _rate(self, z: torch.Tensor) -> torch.Tensor:
+    def _rate(self, z: torch.Tensor, q: Optional[torch.Tensor] = None,
+              q_anchor: Optional[torch.Tensor] = None) -> torch.Tensor:
         """dq/dt = W_y Z + b_y → [B,F]。"""
-        return self.decode_rate(z).squeeze(-1)
+        rate = self.decode_rate(z).squeeze(-1)
+        if self.state_feedback:
+            rate = rate - F.softplus(self.restore_raw) * (q - q_anchor)
+        return rate
 
     # ------------------------------------------------------------------
     # 固定 Heun RK2（方案 §6.2）
@@ -250,7 +282,9 @@ class GraphODEDynamicsHead(nn.Module):
                            cond: Optional[torch.Tensor] = None,
                            profile: Optional[torch.Tensor] = None,
                            control: Optional[torch.Tensor] = None,
-                           memory: Optional[torch.Tensor] = None):
+                           memory: Optional[torch.Tensor] = None,
+                           q_anchor: Optional[torch.Tensor] = None,
+                           signed_adj: Optional[torch.Tensor] = None):
         """在**一个**预测区间内以固定 Heun RK2 同步推进 latent Z 与归一化 BOLD q。
 
         Args:
@@ -277,17 +311,21 @@ class GraphODEDynamicsHead(nn.Module):
             p32 = profile.float() if profile is not None else None
             u32 = control.float() if control is not None else None
             m32 = memory.float() if memory is not None else None
+            anchor32 = q_anchor.float() if q_anchor is not None else None
+            signed32 = signed_adj.float() if signed_adj is not None else None
             h = (dt.float() / self.ode_steps)                  # [B]
             hz = h[:, None, None]                              # z 步长 [B,1,1]
             hq = h[:, None]                                    # q 步长 [B,1]
             for _ in range(self.ode_steps):
-                k1 = self._field(z32, adj32, c32, p32, u32, memory=m32)
-                v1 = self._rate(z32)
+                k1 = self._field(z32, adj32, c32, p32, u32, memory=m32,
+                                 q=q32, q_anchor=anchor32, signed_adj=signed32)
+                v1 = self._rate(z32, q32, anchor32)
                 z_stage = z32 + hz * k1
                 q_stage = q32 + hq * v1
                 k2 = self._field(z_stage, adj32, c32, p32, u32,
-                                 memory=m32)
-                v2 = self._rate(z_stage)
+                                 memory=m32, q=q_stage, q_anchor=anchor32,
+                                 signed_adj=signed32)
+                v2 = self._rate(z_stage, q_stage, anchor32)
                 z32 = z32 + 0.5 * hz * (k1 + k2)
                 q32 = q32 + 0.5 * hq * (v1 + v2)
         return z32, q32
@@ -301,7 +339,9 @@ class GraphODEDynamicsHead(nn.Module):
                 controls: Optional[torch.Tensor] = None,
                 time_deltas: Optional[torch.Tensor] = None,
                 horizon: int = 8,
-                memory: Optional[torch.Tensor] = None):
+                memory: Optional[torch.Tensor] = None,
+                q_anchor: Optional[torch.Tensor] = None,
+                signed_adj: Optional[torch.Tensor] = None):
         """从初始状态连续推进 ``horizon`` 个预测区间。
 
         Args:
@@ -348,7 +388,8 @@ class GraphODEDynamicsHead(nn.Module):
                 dt = time_deltas[:, hidx].to(device=device, dtype=torch.float32)
             z, q = self.integrate_interval(z, q, adj, dt, cond=cond,
                                            profile=profile, control=u,
-                                           memory=memory)
+                                           memory=memory, q_anchor=q_anchor,
+                                           signed_adj=signed_adj)
             z_traj.append(z)
             q_traj.append(q)
         z_final = z

@@ -2,7 +2,7 @@
 
 NeuroTwin 面向静息态 fMRI 的个体脑活动建模：根据已观测的 BOLD 历史、人口学信息与个体校准信息，预测 116 个 ROI 的后续信号，并以健康模型为参照开展病理偏离、脑网络和临床关联分析。
 
-当前采用固定结构：**时空 Transformer 编码器 + 历史功能图先验 + 个体 profile + Graph-ODE 主预测头 + CPM 辅助预测头 + 方差读出**。当前研究重点是健康参照下的病理分析，暂不优化长程预测。
+原始基线采用 **时空 Transformer 编码器 + 历史功能图先验 + 个体 profile + Graph-ODE 主预测头 + CPM 辅助预测头 + 方差读出**。针对现有病理参照与自由生成结果，新增独立的模型优化和病理预测实验；原配方和权重继续保留，技术设计及命令见 [模型优化方案与训练交付](docs/模型优化方案与训练交付.md)。
 
 模型与训练配方见 [configs/neurotwin.json](configs/neurotwin.json)，模块索引见 [models/README.md](models/README.md)。本文描述当前代码；已有权重的实际运行参数以 checkpoint 内嵌的 `config.args`、条件统计量和数据划分记录为准。
 
@@ -196,7 +196,7 @@ $$
 
 ### 3.2 HC 预训练
 
-仅使用 HC 训练集，从初始化参数开始联合学习历史编码器、图先验、profile、Graph-ODE、CPM、条件编码与方差头。使用 `hc3/demo` 条件，即 Sex、Age、education。
+仅使用 HC 训练集，从已登记的 HC 权重初始化继续学习历史编码器、图先验、profile、Graph-ODE、CPM、条件编码与方差头。使用 `hc3/demo` 条件，即 Sex、Age、education。
 
 目标是建立健康人群的条件化短程预测模型，为后续 MDD 适配及健康参照分析提供起点。验证集用于选模型，测试集不参与训练、条件统计量拟合或早停。
 
@@ -211,49 +211,38 @@ $$
 
 ### 3.4 优化、验证与保存
 
-采用 AdamW、线性 warmup 后余弦衰减、梯度裁剪与 EMA。编码器及 CPM 可使用 AMP，ODE 积分保持 FP32。验证脚本使用固定 `K=64`、每被试 16 个锚点，并另设自由 rollout 任务。
+采用 AdamW、线性 warmup 后余弦衰减、梯度裁剪与 EMA。编码器及 CPM 可使用 AMP，ODE 积分保持 FP32。验证脚本使用固定 `K=64`、每被试 8 个锚点；不设自由 rollout 任务。
 
-**主要选模指标为验证集 Graph-ODE H1–H8 的被试等权 MAE**：先汇总每个被试的误差，再在被试间平均，避免长扫描或更多窗口获得额外权重。早停 patience 为 20；启用 EMA 时用 EMA 参数评价和保存最佳预测权重。
+**主要选模指标为验证集的 H1–8 被试等权 MAE + FC MSE**：MAE 先在被试内汇总、再在被试间平均，避免长扫描或更多窗口获得额外权重；FC MSE 取完整 8 步未来轨迹的 Pearson FC 非对角边均方误差。两项同为 C 空间误差、越低越好，等权相加。早停 patience 为 12；启用 EMA 时用 EMA 参数评价和保存最佳预测权重。
 
-当前训练脚本已修复分组学习率调度，使共享参数组保持相对学习率比例。保留的 MDD 权重在该修复前训练，不能把当前调度描述成它的完整实际训练轨迹；本说明与整理工作没有重新训练已有权重。
+当前 HC 与 MDD 权重均于 2026-10-28 按本配方重训，训练脚本已修复分组学习率调度，使共享参数组保持相对学习率比例；不存在调度修复前后权重混用的问题。
 
 ## 4. 训练目标
 
-信号预测损失在**固定前缀校准后的 BOLD 尺度**计算；方差 NLL 在模型内部的 RevIN 空间计算。当前目标包括：
+当前阶段只监督 Graph-ODE 的 **H1–8** 未来轨迹，损失在固定前缀校准后的 BOLD 尺度计算：
 
-| 损失项 | 监督对象 | 当前设置与作用 |
+| 损失项 | 监督对象 | 计算方式 |
 |---|---|---|
-| 单步 `L_one` | ODE 的 H1 | Huber + `0.1 × (1 - 空间 PCC)`，兼顾幅值误差和同一时点的全脑空间形状 |
-| CPM `L_cpm` | CPM 的 H1–H8 | 逐 horizon 的 Huber + 空间 PCC；`gamma=1`，各 horizon 均匀加权 |
-| 动力学 `L_dynamics` | ODE 的 H2–H8 | Huber + 空间 PCC；H1 已由单步项监督，不在此重复 |
-| 方差 `L_variance` | ODE 的 H1–H8 方差 | 对角高斯 NLL；均值、目标与输入隐状态停止梯度，仅拟合方差头 |
-| 时间差分 `L_td` | CPM 与 ODE 轨迹 | 约束预测变化量；CPM 首步以真实历史末帧为参照，ODE 从 H2 起约束相邻预测差分 |
-| 双头一致性 `L_cross` | CPM 对齐 ODE | L1 一致性，ODE 为停止梯度的教师；前 5 个 epoch 关闭，随后启用 |
-| 图正则 `R_graph` | `A_eff` | 非对角 L1 与行熵正则，权重分别为 `1e-3`；图时间正则权重为 0 |
+| 重建 `L_rec` | ODE H1–8 | 预测与真实未来轨迹的逐元素 L1 |
+| FC `L_fc` | ODE H1–8 | 预测与真实序列的 Pearson FC 矩阵（6,670 条非对角边）MSE |
+| 频域 `L_freq` | ODE H1–8 | 沿时间做正交 rFFT，比较幅度谱的 L1 |
 
-四个主要任务使用可学习的不确定性权重。令 $\mathcal{I}$ 表示单步、CPM、动力学、方差四项任务，$s_i$ 为各任务可学习的 log-variance 参数，则有效任务的总目标为：
+三项使用同方差不确定性加权（Kendall et al., CVPR 2018）：
 
 $$
-\mathcal{L}
-= \sum_{i\in\mathcal{I}}\left[\exp(-s_i)L_i+s_i\right]
-+0.05L_{\mathrm{td}}+0.02L_{\mathrm{cross}}+R_{\mathrm{graph}}.
+\mathcal{L}=\sum_{i\in\{\mathrm{rec},\mathrm{fc},\mathrm{freq}\}}
+\left[\exp(-s_i)L_i+s_i\right].
 $$
 
-`s_i` 以 `-log(lambda_i)` 初始化，使初始有效权重等于下表的 `lambda_i`；训练后权重可变化。无有效监督的任务通过 mask 整项排除。时间差分、一致性和图正则保持固定权重，不进入上述自适应聚合。
+`s_i` 为可学习 log 方差，以 `-log(lambda_i)` 初始化，使初始有效权重等于下表；训练后权重可自适应变化。某个 batch 没有完整的 H1–8 真值时，FC/频域项整项跳过，不引入常数项。
 
 | 参数 | 值 | 含义 |
 |---|---:|---|
-| `lambda_one` | 1.0 | 单步任务初始有效权重 |
-| `lambda_cpm` | 1.0 | CPM 任务初始有效权重 |
-| `lambda_dynamics` | 0.5 | ODE 多步任务初始有效权重 |
-| `lambda_variance` | 0.05 | 方差任务初始有效权重 |
-| `lambda_pcc` | 0.1 | 各预测任务内部空间 PCC 项权重 |
-| `lambda_temporal_diff` | 0.05 | 时间差分固定权重 |
-| `lambda_cross_head` / `cross_head_start_epoch` | 0.02 / 5 | 双头一致性权重与启用时机，epoch 使用零基索引 |
-| `cpm_huber_delta` | 1.0 | Huber 二次区间阈值 |
-| `cpm_horizon_weight` / `cpm_gamma` | `gamma` / 1.0 | CPM 当前使用均匀时程权重 |
+| `lambda_rec` | 1.0 | 重建项初始有效权重 |
+| `lambda_fc` | 1.0 | FC 项初始有效权重 |
+| `lambda_freq` | 1.0 | 频域项初始有效权重 |
 
-当前配置未启用额外的未来轨迹时间 PCC 损失。训练中的空间 PCC、评价中的逐 ROI 时间 PCC、FC 矩阵之间的相关性属于不同指标。任务权重中的“不确定性”也不同于方差头输出的逐 ROI 预测方差。
+当前阶段不使用 CPM/方差辅助头监督、H9–32 监督、时间差分、双头一致性或图正则。单步 MAE、H1–8 MAE、FC PCC/MSE 与频域 L1 是训练/验证的四个观察指标；checkpoint 以 H1–8 被试级 MAE + FC MSE 选优。
 
 ## 5. 参数设计
 
@@ -271,7 +260,7 @@ $$
 | `tfm_ff_ratio` | 4 | 编码器前馈隐藏宽度为 1024 |
 | `tfm_one_step_hidden_dim` | 256 | ODE 神经残差隐藏宽度 |
 | `dropout` / `norm` | 0.1 / `true` | 编码与辅助解码正则，以及可逆输入归一化 |
-| `cpm_horizon` / `cpm_layers` | 8 / 2 | 辅助未来时程与 cross-attention 解码层数 |
+| `cpm_horizon` / `cpm_layers` | 8 / 2 | 当前 ODE 监督/评估时程固定为 H1–8；CPM 辅助头保留但本阶段不监督 |
 | `profile_dim` | 32 | 前缀个体码宽度；ProfileEncoder 隐藏宽度为 64 |
 | `dynamics_history_memory` | `true` | 将历史 patch 平均记忆持续注入 ODE |
 | `cond_dim` | 32 | 条件码宽度 |
@@ -319,10 +308,10 @@ $$
 
 | 角色 | 路径 | 用途 |
 |---|---|---|
-| HC 预训练 | `checkpoints/neurotwin_pretrain/base_best.pt` | 健康参照、HC 预测及 MDD 偏离分析 |
-| MDD 微调 | `checkpoints/neurotwin_finetune/finetuned_best.pt` | MDD 临床条件下的预测适配 |
+| HC 预训练 | `checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt` | 健康参照、HC 预测及 MDD 偏离分析 |
+| MDD 微调 | `checkpoints/h1_8_v2/neurotwin_finetune/finetuned_best.pt` | MDD 临床条件下的预测适配 |
 
-权重 SHA256 登记于模型配置；`model.py` 根据内嵌参数重建模型、检查身份并严格加载权重。历史 H32 实验权重单独保存在 `archive/checkpoints/h32_best.pt`，不属于当前默认训练入口。数据和权重不纳入 Git。
+权重 SHA256 登记于模型配置；`model.py` 根据内嵌参数重建模型、检查身份并严格加载权重。数据和权重不纳入 Git。
 
 ```bash
 # 在项目根目录运行：仅检查配置、哈希与严格加载，不训练
@@ -342,7 +331,7 @@ DEVICE=cuda:0 CHECKPOINT_DIR=checkpoints/new_training \
   bash scripts/finetune.sh
 ```
 
-`PYTHON`、`DATA_ROOT`、`CHECKPOINT_DIR`、`HC_WEIGHT` 可覆盖运行环境与路径。输入数据位于 `data/Raw/HC/`、`data/Raw/MDD/`，临床表路径见配置。输出目录若已存在会另建带后缀的目录，微调时应指定本次预训练实际产生的文件。
+`PYTHON`、`DATA_ROOT`、`CHECKPOINT_DIR`、`HC_WEIGHT` 可覆盖运行环境与路径；预训练另可用 `INIT_WEIGHT` 指定初始化权重（本轮 HC 重训从上一版 HC 权重 warm start）。输入数据位于 `data/Raw/HC/`、`data/Raw/MDD/`，临床表路径见配置。输出目录若已存在会另建带后缀的目录，微调时应指定本次预训练实际产生的文件。
 
 `SAVE_TRAINING_STATE=True` 可额外保存完整训练状态；`RESUME_TRAINING_STATE` 指向对应状态文件进行恢复。最佳预测权重与包含优化器、调度器、AMP、EMA、随机源等信息的完整恢复状态用途不同。
 
@@ -351,45 +340,99 @@ DEVICE=cuda:0 CHECKPOINT_DIR=checkpoints/new_training \
 ```bash
 # 将 SUBJECT 替换成数据与临床表中的实际 ID
 python inference_twin.py \
-  --checkpoint checkpoints/neurotwin_pretrain/base_best.pt \
+  --checkpoint checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt \
   --raw data/Raw/MDD/ROISignals_SUBJECT.mat --subject_id SUBJECT \
   --condition_file Rest-meta-MDD-V1V2-Merged-MDD.xlsx \
   --horizon 8 --device cuda:0
 
 # MDD 微调模型的固定 test 评价，使用独立输出目录
 python -m analysis.evaluate \
-  --ckpt checkpoints/neurotwin_finetune/finetuned_best.pt \
+  --ckpt checkpoints/h1_8_v2/neurotwin_finetune/finetuned_best.pt \
   --out_dir results/evaluation --splits test --device cuda:0
 
 # HC 参照模型的小规模滚动单步检查；--limit 0 表示完整划分
 python -m analysis.rolling_one_step \
-  --ckpt checkpoints/neurotwin_pretrain/base_best.pt \
+  --ckpt checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt \
   --group hc --split val --limit 5 --device cuda:0 \
   --out_dir results/rolling_smoke
 ```
 
-完整病理分析依赖 HC/MDD 各划分的全量滚动预测、健康训练参照拟合、偏离打分及混杂控制，不能用上面 5 人的检查缓存替代。步骤见[病理分析记录](results/pathology_analysis/run1/README.md)。独立临床结局读出位于 `models/twin_outcome.py`，需要另行训练和验证，不包含在当前两份预测权重的效果结论中。
+完整病理分析依赖 HC/MDD 各划分的全量滚动预测、健康训练参照拟合、偏离打分及混杂控制，不能用上面 5 人的检查缓存替代。历史结论见[实验结论与证据汇总](docs/实验结论与证据汇总.md)；当前仅保留完整 test 的偏离评分，重跑病理流水线需重新生成训练参照与缓存。独立临床结局读出位于 `models/twin_outcome.py`，需要另行训练和验证，不包含在当前两份预测权重的效果结论中。
+
+`analysis.evaluation_report` 根据已有评估产物生成分析报告；`analysis.evaluate_generation_test` 为历史自主生成评估入口，旧版权重报告已随过期结果清理，当前结果见[结果目录](results/README.md)。`analysis.test_visualization` 是历史独立测试集可视化流程，具体步骤见[可视化说明](docs/独立测试集可视化说明.md)。`analysis.audit_cached_predictions` 和 `analysis.audit_cached_generation` 分析已有预测缓存，需要另外提供对应缓存和权重。
 
 ## 7. 当前结果与解释边界
 
-以下指标来自 **HC 参照权重**在完整独立 test 划分上的滚动单步预测，先逐被试计算，再等权平均：
+### 7.1 先区分两个协议
 
-| 指标 | HC（222 人） | MDD（225 人） |
+- **滚动单步**（项目主协议）：每个 TR 都用真实观测历史预测下一点，再把逐点预测拼成完整序列；衡量“跟踪真实轨迹”的能力，**不是自主生成**。
+- **固定锚点多步 H1–8**：在单个 K64 锚点一次前向输出未来 8 步，未来真值不反馈；衡量多步外推/长程能力。
+- **单步（H1）** 是两个协议的交点，但锚点/样本不同；**单个时间点无法定义 FC**，FC 只在 8 步窗口（多步协议）或完整预测序列（滚动协议）上计算。
+
+### 7.2 指标定义
+
+- **空间 PCC**：同一时间点，预测与真实的 116 维 ROI 向量做 Pearson 相关，逐样本计算后被试等权。公式为
+  $r=\sum_i(p_i-\bar p)(t_i-\bar t)/\sqrt{\sum_i(p_i-\bar p)^2\sum_i(t_i-\bar t)^2}$，代码见 [train/losses.py:30](train/losses.py#L30)。
+- **时间 PCC**：每个 ROI 沿时间序列计算预测-真实相关，再对 ROI 和被试平均，衡量“时间形状”而非单时点空间 pattern。
+- **FC 边 PCC**：分别计算预测和真实的 Pearson FC 矩阵，取 6,670 条非对角上三角边，比较两张边向量的 Pearson 相关。
+- **组平均 FC 边 PCC**：先跨样本平均 FC 矩阵，再比较边。
+- MAE/MSE/RMSE 使用前 32 TR 固定校准后的 BOLD 尺度。
+
+### 7.3 滚动单步（完整 test）
+
+| 指标 | HC | MDD 微调 |
 |---|---:|---:|
-| MAE ↓ | 0.078864 | 0.080961 |
-| RMSE ↓ | 0.102733 | 0.105688 |
-| R² ↑ | 0.992388 | 0.991629 |
-| 逐 ROI 时间 PCC ↑ | 0.996208 | 0.995812 |
-| 逐时点空间 PCC ↑ | 0.994882 | 0.994403 |
-| FC 上三角 PCC ↑ | 0.997633 | 0.997384 |
+| 下一步 MAE ↓ | 0.090406 | 0.092031 |
+| 下一步 MSE ↓ | 0.014422 | 0.015494 |
+| 下一步 RMSE ↓ | 0.116932 | 0.119408 |
+| persistence MAE ↓ | 0.600366 | 0.596894 |
+| 相对 persistence 的 MAE 降幅 ↑ | 84.9% | 84.7% |
+| 整段时间 PCC ↑ | 0.995636 | 0.995224 |
+| 完整序列 FC 边 PCC ↑ | 0.997472 | 0.997215 |
+| 完整序列 FC MAE ↓ | 0.014002 | 0.014553 |
 
-MAE/RMSE 使用前 32 TR 固定校准后的尺度，不是原始扫描强度单位。时间 PCC 沿时间比较同一 ROI 的预测与真值；空间 PCC 在同一时点跨 ROI 比较；FC PCC 则先分别从预测序列与真实序列计算两张有符号 Pearson FC 矩阵，再比较 6,670 条非对角上三角边。
+滚动协议每个锚点都重新输入真实历史，因此时间 PCC/FC 很高，但这是跟踪能力，不是自主生成。
 
-滚动单步的每个预测点都重新输入真实历史，不能代表连续自主生成能力。已有 `K64 -> H32` 自由外推图来自 HC/MDD 各 20 人的 val/test 抽样，时间 PCC 均值约 0.093/0.128、FC PCC 均值约 0.277/0.263，尚不支持长程轨迹重建良好的结论；该抽样也不是完整独立 test。当前按项目方向继续研究健康参照偏离，保留此能力边界。
+### 7.4 固定锚点多步 H1–8（完整 test，8 锚点/被试）
 
-已有站点、年龄、性别匹配的病理分析中，模型偏离的 116 个 ROI 均未通过 FDR 校正，网络与全脑组间差异也不显著。当前尚未建立可靠的疾病定位或诊断标志物；高单步精度不能替代疾病分析的独立验证。结论与限制见[收档报告](docs/V2_CLOSING_REPORT.md)。
+| 指标 | HC | MDD 微调 |
+|---|---:|---:|
+| 单步 H1 MAE ↓ | 0.090648 | 0.091969 |
+| 单步 H1 MSE ↓ | 0.013370 | 0.013793 |
+| 单步 H1 空间 PCC ↑ | 0.993798 | 0.993521 |
+| H1–8 MAE ↓ | 0.534367 | 0.532069 |
+| H1–8 MSE ↓ | 0.451918 | 0.449535 |
+| H1–8 空间 PCC ↑ | 0.737308 | 0.737501 |
+| H1–8 R² ↑ | 0.387756 | 0.401180 |
+| H1–8 方差比 ↑ | 0.659 | 0.659 |
+| H1–8 方向准确率 ↑ | 0.824945 | 0.823830 |
+| H2–8 等权平均 MAE ↓ | 0.597756 | 0.594940 |
+| H2–8 等权平均空间 PCC ↑ | 0.700666 | 0.700927 |
+| FC MSE（8 步）↓ | 0.244646 | 0.246774 |
+| FC 边 PCC（8 步）↑ | 0.603448 | 0.601232 |
+| 组平均 FC 边 PCC ↑ | 0.982368 | 0.982881 |
+| 频域 L1 ↓ | 0.362376 | 0.358904 |
 
-详细指标见[预测性能汇总](results/prediction_metrics_20261026/README.md)和[完整 test FC 结果](results/fc_test_20261026/README.md)。[结果目录说明](results/README.md)列出当前保留产物；部分逐时点滚动与扰动中间缓存已清理，重新计算相关结果需先生成缓存。
+HC 的逐 horizon 退化：
+
+| HC test | H1 | H2 | H4 | H6 | H8 |
+|---|---:|---:|---:|---:|---:|
+| MAE ↓ | 0.0906 | 0.2546 | 0.6025 | 0.6664 | 0.8110 |
+| 空间 PCC ↑ | 0.9938 | 0.9507 | 0.7376 | 0.6754 | 0.4286 |
+| 方向准确率 ↑ | 0.9729 | 0.9223 | 0.8832 | 0.7489 | 0.6524 |
+
+MDD 的 H8 为 MAE 0.8018、空间 PCC 0.4359、方向准确率 0.6552，与 HC 接近。
+
+### 7.5 解释边界
+
+- **单步**：空间 PCC≈0.994、MAE≈0.09、方向≈0.97，可以认为较准确；相对 persistence 的 MAE 降幅约 85%。
+- **H1–8 多步**：平均 MAE≈0.53、空间 PCC≈0.74、方差比≈0.66；H4 以后明显退化，H8 空间 PCC≈0.43、方向≈0.65。**不能把单步精度当成多步能力**。
+- 滚动单步的完整序列时间 PCC≈0.995、FC≈0.997；固定锚点 H1–8 的 8 步时间 PCC 约 0.70。两者不能互相替代。
+- 8 步 FC 相比上一版权重改善约 11%，但完整序列 FC 基本不变（0.9975 vs 0.9976）。
+- 旧版权重上的站点匹配病理分析（0/116 ROI 通过 FDR）**尚未用当前 HC 参照重算**；在重新生成滚动预测、参照统计与偏离评分之前，不能把旧结论直接归到当前权重。
+- 当前尚未建立可靠的疾病定位或诊断标志物；高单步精度不能替代疾病分析的独立验证。结论与限制见[实验结论与证据汇总](docs/实验结论与证据汇总.md)。
+
+分协议汇总见 [单步与多步协议汇总](results/H1-8当前结果/单步与多步协议汇总.json)；原始 test 指标见 [HC](results/H1-8当前结果/健康对照/指标_测试集.json)、[MDD](results/H1-8当前结果/抑郁症/指标_测试集.json)；完整序列 FC 见 [HC](results/H1-8当前结果/功能连接_健康对照/功能连接汇总_测试集.json)、[MDD](results/H1-8当前结果/功能连接_抑郁症_微调/功能连接汇总_测试集.json)。
 
 ## 8. 文件结构
 
@@ -412,13 +455,12 @@ NeuroTwin/
 |   `-- paper_figs/                Existing figure reproduction code
 |-- tests/                        Implementation checks
 |-- checkpoints/
-|   |-- neurotwin_pretrain/        Current HC checkpoint
-|   `-- neurotwin_finetune/        Current MDD checkpoint
+|   `-- h1_8_v2/
+|       |-- neurotwin_pretrain/   Current HC checkpoint
+|       `-- neurotwin_finetune/   Current MDD checkpoint
 |-- data/                         Raw data, metadata and fixed split manifests
-|-- results/                      Retained metrics, analyses and figures
-|-- docs/                         Project status and research records
-|-- archive/checkpoints/          Historical H32 checkpoint
-`-- experiments/long_horizon/     Paused long-horizon experiment tools
+|-- results/                       Current H1-8 test results and summary
+`-- docs/                         Project status and research records
 ```
 
-研究状态与后续约定见 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)；已有实验记录见 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)。
+研究状态与文档导航见 [项目状态与工作范围](docs/项目状态与工作范围.md)；已有结论与证据见 [实验结论与证据汇总](docs/实验结论与证据汇总.md)。

@@ -13,8 +13,8 @@ from model import (MODEL_CONFIG, CONTRACT_FIELDS, config_value,
                       load_model_config, verify_checkpoint_contract)
 from utils.condition_schema import DROPOUT_SEED, MODEL_SEED, SAMPLING_SEED
 
-CKPT = MODEL_CONFIG.parent.parent / 'checkpoints' \
-    / 'neurotwin_finetune' / 'finetuned_best.pt'
+CKPT = MODEL_CONFIG.parent.parent \
+    / load_model_config()['weights']['finetune']['path']
 
 requires_ckpt = pytest.mark.skipif(
     not CKPT.exists(), reason='当前模型权重不在本机（权重不入版本库）')
@@ -24,8 +24,10 @@ def test_model_config_declares_contract():
     cfg = load_model_config()
     assert cfg['architecture']['dynamics_history_memory'] is True
     assert cfg['architecture']['dynamics_mode'] == 'graph_ode'
-    assert cfg['loss']['lambda_temporal_diff'] == 0.05
-    assert cfg['loss']['lambda_cross_head'] == 0.02
+    assert cfg['loss']['lambda_rec'] == 1.0
+    assert cfg['loss']['lambda_fc'] == 1.0
+    assert cfg['loss']['lambda_freq'] == 1.0
+    assert cfg['loss']['loss_weighting'] == 'uncertainty'
     assert cfg['training']['seed'] == MODEL_SEED
     assert cfg['training']['sampling_seed'] == SAMPLING_SEED
     assert cfg['training']['cond_dropout_seed'] == DROPOUT_SEED
@@ -35,7 +37,7 @@ def test_model_config_declares_contract():
     assert conditioning['finetune'] == {
         'condition_arm': 'cat', 'condition_group': 'mdd8'}
     main = cfg['weights']['finetune']
-    assert main['path'].startswith('checkpoints/neurotwin_finetune/')
+    assert main['path'].endswith('neurotwin_finetune/finetuned_best.pt')
     assert len(main['sha256']) == 64
 
 
@@ -104,8 +106,9 @@ def test_model_build_and_load():
     assert model.dynamics_history_memory is True
     assert model.one_step_head.memory_film is not None
     # 模型损失权重来自模型配置，与 checkpoint 快照在 build 内已交叉校验
-    assert cfg['loss']['lambda_temporal_diff'] == 0.05
-    assert cfg['loss']['lambda_cross_head'] == 0.02
+    assert cfg['loss']['lambda_rec'] == 1.0
+    assert cfg['loss']['lambda_fc'] == 1.0
+    assert cfg['loss']['lambda_freq'] == 1.0
     x = torch.randn(2, model.features, 1, 8)
     sc = torch.rand(model.features, model.features)
     profile = torch.randn(2, model.profile_dim)

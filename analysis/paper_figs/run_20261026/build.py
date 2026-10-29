@@ -306,7 +306,7 @@ def report(out:Path) -> None:
     pd.read_csv(RUN1/'param_dim_table.csv').to_csv(out/'table_d6_profile.csv',index=False)
     param=json_read(RUN1/'param_group_tests.json')
     (out/'table_d6_profile_summary.json').write_text(json.dumps(param,ensure_ascii=False,indent=2))
-    pd.DataFrame([{'analysis':'I4/T08','quantity':'far-horizon ODE MAE increase under old-history-block shuffle','value_percent':14.2,'source':'docs/EXPERIMENTS.md T08','status':'archival summary only; no blockwise arrays retained; no new shuffle inference'}]).to_csv(out/'table_i4_t08.csv',index=False)
+    pd.DataFrame([{'analysis':'I4/T08','quantity':'far-horizon ODE MAE increase under old-history-block shuffle','value_percent':14.2,'source':'docs/实验结论与证据汇总.md T08','status':'archival summary only; no blockwise arrays retained; no new shuffle inference'}]).to_csv(out/'table_i4_t08.csv',index=False)
     pd.DataFrame([{'analysis':'T04','coefficient':.948788,'test_far_mae_gain_percent':.0228,'decision':'not deployed'}, {'analysis':'S4/T18','coefficient':None,'test_far_mae_gain_percent':None,'decision':'archived negative; no rerun'}]).to_csv(out/'table_p5_calibration.csv',index=False)
     methods='''本次执行默认 T0/T1/T2，不重训、不调整模型/训练/配置、不写入权重、不执行 git 提交。所有新增产物位于带 run_20261026 的独立目录。既有 6 张图作为版式和数据入口参考，因标签及口径需要纠正，本目录重新渲染，原图不覆盖。
 
@@ -353,7 +353,7 @@ T1 复用已完成的 D2/D3 产物，独立核验原始均值差、AUC、临床 
         paragraphs += ['## 基础检查','', '[检查明细](CHECKS.json)。13 张 PNG 均为 300 dpi，PDF/数据/图注/启动脚本配套完整；报告链接可解析。40 人数组的维度、有限值、FC/MAE 和归一化谱已核验；116 ROI 重要性与逐批差值、FDR 一致；抽取 1 名 HC 重新前向与保存结果在 1e-6 内一致。原 92 个相关文件哈希一致。静态语法检查通过。未运行训练、完整实验或全量回归。', '', '[全部图览](overview.png) · [图库并排对照](reference_comparison.png)', '']
     (out/'REPORT.md').write_text('\n'.join(paragraphs))
     (out/'CAPTIONS_ZH.md').write_text('\n\n'.join(CAPTIONS.values())+'\n')
-    sources=[ROOT/'docs/ANALYSIS_PLAN.md',ROOT/'docs/PROJECT_STATUS.md',ROOT/'data/AAL116.xlsx',RUN1/'group_tests.json',RUN1/'roi_fdr_table.csv',RUN1/'clinical_partial_corr.csv',ROOT/'results/paper_figures/complete_20261026/sources/h32/manifest.json',ROOT/'results/paper_stats/run_20261026/fc_ridge_oof.npz']
+    sources=[ROOT/'docs/实验结论与证据汇总.md',ROOT/'docs/项目状态与工作范围.md',ROOT/'data/AAL116.xlsx',RUN1/'group_tests.json',RUN1/'roi_fdr_table.csv',RUN1/'clinical_partial_corr.csv',ROOT/'results/paper_figures/complete_20261026/sources/h32/manifest.json',ROOT/'results/paper_stats/run_20261026/fc_ridge_oof.npz']
     sources+=list(Path(__file__).parent.glob('*.py'))
     provenance={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
     (out/'provenance.json').write_text(json.dumps({'sources':provenance,'infer_manifest':manifest,'figure_ids':list(CAPTIONS),'tier_map':{'T0':['F0a','F0b','F1','F2','F5','F8','F10','D6 table','I4 table'],'T1':['F6','F7','F9'],'T2':['F3','F11','F12']},'excluded':['T3/F4','I5/F14'],'output_dpi':300},ensure_ascii=False,indent=2))

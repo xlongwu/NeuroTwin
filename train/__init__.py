@@ -1,8 +1,13 @@
 # coding=utf-8
 """训练基础设施：TFM 损失、SC 图正则、概率集合损失、优化器/调度器与 EMA。"""
 from train.losses import (
+    ForecastFidelityLoss,
     TFMDualLoss,
     compute_graph_regularization,
+    fc_mse,
+    fc_pattern_pcc,
+    frequency_l1,
+    masked_l1,
     pearson,
     spatial_pcc,
 )
@@ -19,8 +24,13 @@ from train.optim import (
 )
 
 __all__ = [
+    'ForecastFidelityLoss',
     'TFMDualLoss',
     'compute_graph_regularization',
+    'fc_mse',
+    'fc_pattern_pcc',
+    'frequency_l1',
+    'masked_l1',
     'pearson',
     'spatial_pcc',
     'ModelEMA',

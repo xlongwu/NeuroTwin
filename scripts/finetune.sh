@@ -36,23 +36,25 @@ if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
 fi
 
 # ---- 评估协议（不属于训练配方，保持脚本内单点定义）----
-eval_context_length=64
-eval_anchors_per_subject=16
-eval_rollout_tasks_per_subject="${EVAL_ROLLOUT_TASKS_PER_SUBJECT:-2}"
-eval_rollout_horizons="1,2,4,8,16"
+eval_context_length="${EVAL_CONTEXT_LENGTH:-64}"
+eval_anchors_per_subject="${EVAL_ANCHORS_PER_SUBJECT:-8}"
+train_samples_per_subject="${TRAIN_SAMPLES_PER_SUBJECT:-8}"
 
 # ---- 环境变量覆盖（消融/排程用）----
-# 微调启用时间差分/一致性时，HC 预训练也应使用相同开关，
-# 否则微调起点缺少对应监督。消融覆盖方式同 pretrain.sh：
-lambda_temporal_diff="${LAMBDA_TEMPORAL_DIFF:-$lambda_temporal_diff}"
-lambda_cross_head="${LAMBDA_CROSS_HEAD:-$lambda_cross_head}"
-cross_head_start_epoch="${CROSS_HEAD_START_EPOCH:-$cross_head_start_epoch}"
-cpm_horizon_weight="${CPM_HORIZON_WEIGHT:-$cpm_horizon_weight}"
-cpm_horizon_alpha="${CPM_HORIZON_ALPHA:-$cpm_horizon_alpha}"
-train_supervision_horizon="${TRAIN_SUPERVISION_HORIZON:-0}"
+lambda_rec="${LAMBDA_REC:-$lambda_rec}"
+lambda_fc="${LAMBDA_FC:-$lambda_fc}"
+lambda_freq="${LAMBDA_FREQ:-$lambda_freq}"
+loss_weighting="${LOSS_WEIGHTING:-$loss_weighting}"
 dynamics_history_memory="${DYNAMICS_HISTORY_MEMORY:-$dynamics_history_memory}"
 
 train_epochs="${TRAIN_EPOCHS:-$train_epochs}"
+lr_init="${LR_INIT:-$lr_init}"
+lr_peak="${LR_PEAK:-$lr_peak}"
+lr_final="${LR_FINAL:-$lr_final}"
+warmup_epochs="${WARMUP_EPOCHS:-$warmup_epochs}"
+weight_decay="${WEIGHT_DECAY:-$weight_decay}"
+grad_clip="${GRAD_CLIP:-$grad_clip}"
+ema_decay="${EMA_DECAY:-$ema_decay}"
 patience="${PATIENCE:-$patience}"
 # 数据加载并发（只影响吞吐，不影响训练结果）
 num_workers="${NUM_WORKERS:-6}"
@@ -60,6 +62,10 @@ pin_memory="${PIN_MEMORY:-False}"
 freeze_backbone_epochs="${FREEZE_BACKBONE_EPOCHS:-$freeze_backbone_epochs}"
 cpm_horizon="${CPM_HORIZON:-$cpm_horizon}"
 batch_size="${BATCH_SIZE:-$batch_size}"
+if [[ "$cpm_horizon" != "8" ]]; then
+  echo "[错误] 当前阶段只训练 H1–8，CPM_HORIZON 必须为 8（收到 $cpm_horizon）" >&2
+  exit 1
+fi
 
 # ---- 预检查 ----
 # graph_ode 路线用 raw + history_fc：只要求 Raw 目录与临床表，不要求 Mask，
@@ -89,11 +95,6 @@ ARGS=(
   --forecast_offsets "$forecast_offsets"
   --eval_context_length "$eval_context_length"
   --eval_anchors_per_subject "$eval_anchors_per_subject"
-  --eval_rollout_tasks_per_subject "$eval_rollout_tasks_per_subject"
-  --eval_rollout_horizons "$eval_rollout_horizons"
-  --fc_min_length 32
-  --eval_fc True
-  --eval_spectral False
   # ---- TFM 模型规模（与预训练严格一致）----
   --tfm_dim "$tfm_dim"
   --tfm_layers "$tfm_layers"
@@ -103,9 +104,6 @@ ARGS=(
   --tfm_one_step_hidden_dim "$tfm_one_step_hidden_dim"
   --tfm_patho_mode "$tfm_patho_mode"
   --cpm_horizon "$cpm_horizon"
-  --dynamics_metric_horizon "${DYNAMICS_METRIC_HORIZON:-8}"
-  --train_anchor_max_offset "${TRAIN_ANCHOR_MAX_OFFSET:-0}"
-  --eval_anchor_min_future_steps "${EVAL_ANCHOR_MIN_FUTURE_STEPS:-0}"
   --pretrained_horizon_policy "${PRETRAINED_HORIZON_POLICY:-require_match}"
   --split_file "${SPLIT_FILE:-}"
   --cpm_layers "$cpm_layers"
@@ -118,18 +116,10 @@ ARGS=(
   --sc_delta_a "$sc_delta_a"
   --sc_sinkhorn_iters "$sc_sinkhorn_iters"
   # ---- TFM 损失权重 ----
-  --lambda_one "$lambda_one"
-  --lambda_cpm "$lambda_cpm"
-  --lambda_pcc "$lambda_pcc"
+  --lambda_rec "$lambda_rec"
+  --lambda_fc "$lambda_fc"
+  --lambda_freq "$lambda_freq"
   --loss_weighting "$loss_weighting"
-  --cpm_gamma "$cpm_gamma"
-  --cpm_huber_delta "$cpm_huber_delta"
-  --train_supervision_horizon "$train_supervision_horizon"
-  --lambda_temporal_diff "$lambda_temporal_diff"
-  --lambda_cross_head "$lambda_cross_head"
-  --cross_head_start_epoch "$cross_head_start_epoch"
-  --cpm_horizon_weight "$cpm_horizon_weight"
-  --cpm_horizon_alpha "$cpm_horizon_alpha"
   --norm "$norm"
   --dropout "$dropout"
   # ---- 两阶段冻结（前期只训条件模块，后期解冻主干）----
@@ -148,11 +138,12 @@ ARGS=(
   --use_ema "$use_ema"
   --ema_decay "$ema_decay"
   --amp "$amp"
+  --compile "${COMPILE:-False}"
   --num_workers "$num_workers"       # 见文件顶部 PIN_MEMORY/NUM_WORKERS 说明
   --pin_memory "$pin_memory"
-  --eval_batch_size "${EVAL_BATCH_SIZE:-512}"  # 仅影响验证吞吐；降低 Val 峰值内存
-  --subject_cache_size 4096         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
-  --train_samples_per_subject 0
+  --eval_batch_size "${EVAL_BATCH_SIZE:-256}"  # 仅影响验证吞吐；降低 Val 峰值内存
+  --subject_cache_size "${SUBJECT_CACHE_SIZE:-4096}"         # 覆盖全部被试，消除每 epoch 对全宽 Raw mat 的重复 loadmat
+  --train_samples_per_subject "$train_samples_per_subject"
   --sampling_seed "$sampling_seed"
   --val_ratio "$val_ratio"
   --test_ratio "$test_ratio"
@@ -183,9 +174,10 @@ ARGS+=(
   --calibration_length "$calibration_length"
   --ode_steps "$ode_steps"
   --dynamics_dt "$dynamics_dt"
-  --lambda_dynamics "$lambda_dynamics"
-  --lambda_variance "$lambda_variance"
   --dynamics_history_memory "$dynamics_history_memory"
+  --state_feedback "${STATE_FEEDBACK:-False}"
+  --spatial_profile "${SPATIAL_PROFILE:-False}"
+  --condition_initial_state "${CONDITION_INITIAL_STATE:-False}"
 )
 
 if [[ -n "$DEVICE" ]]; then

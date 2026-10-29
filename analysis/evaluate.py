@@ -1,9 +1,8 @@
 # coding=utf-8
 """统一评估入口：从 checkpoint 重建完整模型 → 评估 → 落盘指标。
 
-唯一任务口径 next_timepoint（连续 BOLD context → 下一 TR 全脑状态），评估协议见
-analysis/next_point_eval.py：next-state 主指标 + persistence/trend/AR(1) baselines +
-free rollout + FC/频谱。
+唯一任务口径 next_timepoint（连续 BOLD context → 下一 TR 全脑状态）；当前阶段
+只评估 H1–8 短程轨迹，free rollout 与 rollout 长度上的 FC/频谱默认关闭。
 
 关键点（模型重建口径）：
   构造 NeuroTwinTFM 若只传部分参数，结构性变体（tfm_patch_len/cpm_horizon/
@@ -28,7 +27,6 @@ import torch
 from analysis.metrics import NETWORK_GROUPS
 from models.tfm import NeuroTwinTFM
 from utils.common import set_seed
-from utils.dataloader import NeuroTwinDataLoader
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -147,58 +145,6 @@ def build_model_from_args(args, device, condition_bundle=None):
     return NeuroTwinTFM(**kwargs).to(device)
 
 
-def build_eval_loader(args, eval_split, refresh_split_manifest=False):
-    """构建 next_timepoint 评估 DataLoader（与训练同一被试级 8:1:1 划分，版本化 manifest 复用）。"""
-    from analysis.next_point_eval import eval_horizons, eval_rollout_steps
-    from main import parse_pathology_fields
-    from utils.common import parse_int_list, resolve_forecast_offsets
-    horizons = eval_horizons(args)
-    loader = NeuroTwinDataLoader(
-        data_root=args.data_root, mode=args.mode, batch_size=args.batch_size,
-        pathology_input_dim=args.pathology_input_dim,
-        pathology_fields=parse_pathology_fields(args.pathology_fields),
-        pathology_missing=args.pathology_missing,
-        clinical_file=args.clinical_file,
-        total_windows=args.total_windows, seq_len=args.seq_len,
-        num_workers=args.num_workers, pin_memory=args.pin_memory,
-        seed=args.seed, val_ratio=args.val_ratio, test_ratio=args.test_ratio,
-        stratify_bins=args.stratify_bins,
-        cache_in_memory=args.cache_in_memory,
-        persistent_workers=args.persistent_workers,
-        prefetch_factor=args.prefetch_factor,
-        eval_batch_size=args.eval_batch_size,
-        refresh_split_manifest=bool(getattr(args, 'refresh_split_manifest', False)
-                                    or refresh_split_manifest),
-        task_mode='next_timepoint',
-        bold_source=getattr(args, 'bold_source', 'auto'),
-        random_context=getattr(args, 'random_context', True),
-        random_cutoff=getattr(args, 'random_cutoff', True),
-        train_samples_per_subject=int(getattr(args, 'train_samples_per_subject', 0)),
-        subject_cache_size=int(getattr(args, 'subject_cache_size', 256)),
-        sampling_seed=int(getattr(args, 'sampling_seed', 2024)),
-        context_min=args.context_min, context_max=args.context_max,
-        context_lengths=(parse_int_list(args.context_lengths, 'context_lengths')
-                         if getattr(args, 'context_lengths', None) else None),
-        forecast_offsets=resolve_forecast_offsets(args),
-        eval_context_length=(int(getattr(args, 'eval_context_length', 0) or 0)
-                             or int(args.context_max)),
-        eval_anchors_per_subject=int(getattr(args, 'eval_anchors_per_subject', 16)),
-        eval_rollout_tasks_per_subject=int(
-            getattr(args, 'eval_rollout_tasks_per_subject', 2)),
-        eval_rollout_steps=eval_rollout_steps(args, horizons),
-        train_rollout_steps=0,
-        eval_all_future_steps=int(getattr(args, 'cpm_horizon', 0) or 0),
-        # graph_ode 动态路线的数据参数（旧快照缺省时与 v5 行为一致）
-        num_rois=int(getattr(args, 'num_rois', 116)),
-        graph_source=str(getattr(args, 'graph_source', 'history_fc')),
-        calibration_length=int(getattr(args, 'calibration_length', 0) or 0),
-        control_manifest=(getattr(args, 'control_manifest', '') or None),
-    )
-    if eval_split == 'test':
-        return loader.get_test(), loader.get_test_subjects()
-    return loader.get_val(), loader.get_val_subjects()
-
-
 def _roi_network_labels(n_rois):
     """ROI 索引(0 基)→网络标签；未命名脑区归入 Other（NETWORK_GROUPS 为 1 基 AAL 索引）。"""
     labels = ['Other'] * n_rois
@@ -283,9 +229,10 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # None = 沿用 checkpoint 训练配置中的开关（显式传值可覆盖）
-    eval_rollout = getattr(args, 'eval_rollout', True) if eval_rollout is None else eval_rollout
-    eval_fc = getattr(args, 'eval_fc', True) if eval_fc is None else eval_fc
+    # None = 沿用 checkpoint 训练配置中的开关；当前阶段的 checkpoint 不记录
+    # rollout 开关，因此默认关闭长程自由 rollout 及其上的 FC/频谱分析。
+    eval_rollout = getattr(args, 'eval_rollout', False) if eval_rollout is None else eval_rollout
+    eval_fc = getattr(args, 'eval_fc', False) if eval_fc is None else eval_fc
     eval_spectral = (getattr(args, 'eval_spectral', False) if eval_spectral is None
                      else eval_spectral)
     spectral_tr = (getattr(args, 'eval_spectral_tr', 2.0) if spectral_tr is None
@@ -409,15 +356,15 @@ def main():
                     help='重新生成 subject_split_finetune.json 切分 manifest（默认复用）')
     # ---- next_timepoint 评估专用开关（默认沿用 checkpoint 训练配置） ----
     ap.add_argument('--rollout', dest='rollout', action='store_true', default=None,
-                    help='强制开启 free rollout')
+                    help='（历史分析）显式开启 free rollout；当前阶段默认关闭')
     ap.add_argument('--no_rollout', dest='rollout', action='store_false',
-                    help='跳过 free rollout')
+                    help='跳过 free rollout（当前阶段的默认行为）')
     ap.add_argument('--no_fc', dest='fc', action='store_false', default=None,
-                    help='跳过 FC 层面指标')
+                    help='跳过 rollout FC 指标（当前阶段的默认行为）')
     ap.add_argument('--fc', dest='fc', action='store_true',
-                    help='强制开启 FC 层面指标')
+                    help='（历史分析）在 free rollout 上额外计算 FC 指标')
     ap.add_argument('--spectral', dest='spectral', action='store_true', default=None,
-                    help='额外输出 Welch PSD 低频段一致性指标')
+                    help='（历史分析）额外输出 Welch PSD 低频段一致性指标')
     ap.add_argument('--spectral_tr', type=float, default=None,
                     help='频谱评估使用的 TR（秒）；默认沿用 checkpoint 配置')
     ap.add_argument('--direction_deadzone', type=float, default=None,

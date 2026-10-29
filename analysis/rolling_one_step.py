@@ -3,7 +3,7 @@
 
 协议（v2 研究计划 §3，与 checkpoint 正式口径对齐）：
 
-- 模型：HC 参照 ``checkpoints/neurotwin_pretrain/base_best.pt``
+- 模型：HC 参照 ``checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt``
   （从 ``config.args`` 快照 strict 重建，条件统计量 inherit，不重拟合）；
 - 数据：``NeuroTwinNextPointDataset`` raw 分支（``bold_source=raw``、
   ``calibration_length=32``、``graph_source=history_fc``，均取自快照）；
@@ -16,14 +16,14 @@
 - persistence 基线内建于同一次遍历（``x_last`` 即 persistence 预测），零额外前向。
 
 逐被试缓存（断点可续跑）：``<out_dir>/<group>/<subj>.npz``（err_abs / pred /
-true / x_last / cutoff，float32）+ ``manifest.json``（checkpoint SHA、K、锚点规则、
-方向死区、dtype）。汇总层（B2 护栏指标族，供 B3/B4 消费）：
+true / x_last / cutoff，float32）+ ``数据清单.json``（checkpoint SHA、K、锚点规则、
+方向死区、dtype；历史 ``manifest.json`` 可读取）。汇总层（B2 护栏指标族，供 B3/B4 消费）：
 
 - 逐被试逐 ROI：``mae_model / mae_persistence / mse_model / mse_persistence /
   improvement / delta_corr / dir_acc / n_valid_delta``；
-- 产物：``per_subject_<split>.csv``（被试级标量）、
-  ``per_subject_roi_mae_<split>.npz``（subjects × ROI 的 mae_model/mae_persistence，
-  供 normative_deviation 拟合与门槛检查）、``summary_<split>.json``。
+- 产物：``逐被试指标_<split>.csv``（被试级标量）、
+  ``逐被试_ROI误差_<split>.npz``（subjects × ROI 的 mae_model/mae_persistence，
+  供 normative_deviation 拟合与门槛检查）、``滚动单步汇总_<split>.json``。
 
 口径：improvement = 1 − mae_model/mae_persistence（判据 1）；delta_corr 为该被试
 该 ROI 上 corr(pred−x_last, true−x_last)（判据 2，有效变化点 ≥ ``min_points``
@@ -35,7 +35,7 @@ delta_corr / dir_acc / improvement 记 NaN 并计入无效池，不填理想值�
 
     # 5 被试冒烟（HC val）
     python -m analysis.rolling_one_step \
-      --ckpt checkpoints/neurotwin_pretrain/base_best.pt \
+      --ckpt checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt \
       --group hc --split val --limit 5 --device cuda:0
     # 全量：hc train/val/test 与 mdd train/val/test 依次执行
 """
@@ -58,7 +58,20 @@ DEFAULT_DEADZONE = 0.05
 DEFAULT_MIN_POINTS = 8
 #: 逐被试缓存目录（相对 out_dir）
 GROUP_SUBDIR = {'hc': 'hc', 'mdd': 'mdd'}
+#: 组目录缓存清单文件名；历史 manifest.json 仍可读取。
+MANIFEST_NAME = '数据清单.json'
+LEGACY_MANIFEST_NAME = 'manifest.json'
 EPS = 1e-12
+
+
+def manifest_path(group_dir: Path) -> Path:
+    """返回当前中文清单；若只有历史英文清单则回退。"""
+    group_dir = Path(group_dir)
+    preferred = group_dir / MANIFEST_NAME
+    legacy = group_dir / LEGACY_MANIFEST_NAME
+    if preferred.is_file() or not legacy.is_file():
+        return preferred
+    return legacy
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -280,7 +293,7 @@ def forward_subjects(model, view, subjects: Sequence[str], device,
         }
         np.savez_compressed(path, **payload)
         written.append(path)
-    _update_manifest(out_dir / GROUP_SUBDIR[group] / 'manifest.json', manifest,
+    _update_manifest(out_dir / GROUP_SUBDIR[group] / MANIFEST_NAME, manifest,
                      [p.stem for p in written])
     return written
 
@@ -325,13 +338,14 @@ def summarize_group(out_dir: Path, group: str, split: str,
     """
     import csv
     group_dir = out_dir / GROUP_SUBDIR[group]
-    manifest_path = group_dir / 'manifest.json'
-    if not manifest_path.exists():
-        raise FileNotFoundError(f'缺少 {manifest_path}；请先运行 rolling_one_step。')
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest_file = manifest_path(group_dir)
+    if not manifest_file.exists():
+        raise FileNotFoundError(f'缺少 {manifest_file}；请先运行 rolling_one_step。')
+    manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
     # 只把逐被试缓存当输入：排除本函数自己产出的 ROI-MAE 汇总 npz
     npzs = sorted(p for p in group_dir.glob('*.npz')
-                  if not p.name.startswith('per_subject_roi_mae'))
+                  if not (p.name.startswith('per_subject_roi_mae')
+                          or p.name.startswith('逐被试_ROI误差')))
     if subjects_filter is not None:
         members = {str(s) for s in subjects_filter}
         npzs = [p for p in npzs if p.stem in members]
@@ -355,11 +369,13 @@ def summarize_group(out_dir: Path, group: str, split: str,
 
     mae_m = np.stack(mae_m).astype(np.float32)     # [N_subj, F]
     mae_p = np.stack(mae_p).astype(np.float32)
-    stem = f'per_subject_roi_mae_{split}'
-    np.savez_compressed(group_dir / f'{stem}.npz', subjects=np.asarray(subj_ids),
+    from utils.common import split_label
+    split_cn = split_label(split)
+    np.savez_compressed(group_dir / f'逐被试_ROI误差_{split_cn}.npz',
+                        subjects=np.asarray(subj_ids),
                         mae_model=mae_m, mae_persistence=mae_p)
 
-    csv_path = group_dir / f'per_subject_{split}.csv'
+    csv_path = group_dir / f'逐被试指标_{split_cn}.csv'
     with csv_path.open('w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -387,7 +403,7 @@ def summarize_group(out_dir: Path, group: str, split: str,
         'note': 'CSV/summary/ROI-MAE 矩阵均已按该 split 的划分名单过滤；'
                 'B3/B4 直接消费 ROI-MAE 矩阵。',
     }
-    (group_dir / f'summary_{split}.json').write_text(
+    (group_dir / f'滚动单步汇总_{split_cn}.json').write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return summary
 
@@ -445,8 +461,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                 f'条件布局不一致：checkpoint={saved_hash}，重建后={now_hash}。')
 
     if ns.group == 'mdd':
-        # MDD 条件统计量继承 HC 快照（hc3 三字段，不重拟合）
-        loader_kwargs = _mdd_condition_kwargs(bundle)
+        cond_group = str(((bundle or {}).get('config') or {}).get('group', '') or '')
+        if cond_group.startswith('mdd'):
+            # MDD 微调权重自带 mdd8 条件配置与 train-only 统计量
+            from main import condition_loader_kwargs
+            loader_kwargs = condition_loader_kwargs(args, bundle)
+        else:
+            # HC 参照权重在 MDD 数据上评估：hc3 三字段继承 HC 快照
+            loader_kwargs = _mdd_condition_kwargs(bundle)
     else:
         from main import condition_loader_kwargs
         loader_kwargs = condition_loader_kwargs(args, bundle)

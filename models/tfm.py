@@ -272,6 +272,9 @@ class NeuroTwinTFM(nn.Module):
         personalized: bool = False,
         profile_dim: int = 32,
         dynamics_history_memory: bool = False,
+        state_feedback: bool = False,
+        spatial_profile: bool = False,
+        condition_initial_state: bool = False,
     ):
         super().__init__()
         if patch_len < 1 or context_max < patch_len:
@@ -304,10 +307,13 @@ class NeuroTwinTFM(nn.Module):
             raise ValueError(
                 f"当前结构只支持 graph_source=history_fc，收到 '{graph_source}'")
         self.personalized = bool(personalized)
+        if spatial_profile and not self.personalized:
+            raise ValueError('spatial_profile 需要 personalized=True')
         self.profile_dim = int(profile_dim) if self.personalized else 0
         if self.personalized and self.profile_dim < 1:
             raise ValueError(f'profile_dim 必须 >= 1，收到 {profile_dim}')
         self.dynamics_history_memory = bool(dynamics_history_memory)
+        self.state_feedback = bool(state_feedback)
         # 显式无条件声明用于对照分析，不隐式构建数值调制。
         self.condition_arm = (str(condition_arm)
                               if condition_arm is not None and str(condition_arm) != ''
@@ -358,6 +364,8 @@ class NeuroTwinTFM(nn.Module):
             condition_cfg = ConditioningConfig.from_dict(condition_config)
         self.conditioning_on = bool(condition_cfg is not None
                                      and condition_cfg.arm != 'none')
+        if condition_initial_state and not self.conditioning_on:
+            raise ValueError('condition_initial_state 需要启用字段条件编码')
         if self.condition_disabled:
             print('[condition] arm=none：绕过条件通路（不构建编码器，也不构建 '
                   'FiLM）。')
@@ -402,7 +410,8 @@ class NeuroTwinTFM(nn.Module):
             cond_dim=head_cond_dim or None,
             profile_dim=self.profile_dim or None,
             ode_steps=self.ode_steps,
-            history_memory=dynamics_history_memory)
+            history_memory=dynamics_history_memory,
+            state_feedback=self.state_feedback)
         self.cpm_head = CPMHorizonHead(
             dim=dim, horizon=cpm_horizon, num_heads=num_heads,
             num_layers=cpm_layers, dropout=dropout,
@@ -414,7 +423,11 @@ class NeuroTwinTFM(nn.Module):
         self.profile_encoder = None
         if self.personalized:
             self.profile_encoder = ProfileEncoder(
-                dim=dim, profile_dim=self.profile_dim, hidden=64)
+                dim=dim, profile_dim=self.profile_dim, hidden=64,
+                spatial_features=features if spatial_profile else 0)
+        self.initial_condition_film = None
+        if condition_initial_state and head_cond_dim:
+            self.initial_condition_film = ConditionFiLM(head_cond_dim, dim)
 
     # ------------------------------------------------------------------
     # 内部构件
@@ -460,14 +473,30 @@ class NeuroTwinTFM(nn.Module):
         → ``[B,F,F]``：取绝对值、清零对角。该图作为 SoftAnatomicalPrior 的输入，
         复用其混合、self-loop 与 Sinkhorn；它是**功能耦合图**，不默认称独立解剖 SC。
         """
+        return self._history_fc_signed(x_grid).abs()
+
+    def _history_fc_signed(self, x_grid: torch.Tensor) -> torch.Tensor:
         r = x_grid - x_grid.mean(dim=-1, keepdim=True)
         num = torch.bmm(r, r.transpose(1, 2))
         denom = torch.sqrt((r * r).sum(-1, keepdim=True) + 1e-6)   # [B,F,1]
         c_hist = num / (denom * denom.transpose(1, 2))
-        a_hist = c_hist.abs()
         f = x_grid.shape[1]
         eye = torch.eye(f, dtype=torch.bool, device=x_grid.device)
-        return a_hist.masked_fill(eye, 0.0)
+        return c_hist.masked_fill(eye, 0.0)
+
+    def _feedback_context(self, x_grid: torch.Tensor, signed_fc: Optional[torch.Tensor] = None):
+        if not self.state_feedback:
+            return None, None
+        corr = signed_fc if signed_fc is not None else self._history_fc_signed(x_grid)
+        corr = corr / corr.abs().sum(-1, keepdim=True).clamp_min(1e-6)
+        return x_grid.float().mean(-1), corr
+
+    def _initial_latent(self, tokens: torch.Tensor, cond: Optional[torch.Tensor]):
+        z = tokens[:, :, -1, :]
+        if self.initial_condition_film is not None and cond is not None:
+            scale, shift = self.initial_condition_film(cond)
+            z = z * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return z
 
     def _graph_input(self, x_grid: torch.Tensor, sc_matrix: torch.Tensor):
         """由可见历史构建功能耦合图。"""
@@ -495,8 +524,9 @@ class NeuroTwinTFM(nn.Module):
                 time_deltas: Optional[torch.Tensor] = None,
                 dynamics_horizon: Optional[int] = None,
                 calibration_bold: Optional[torch.Tensor] = None,
-                profile: Optional[torch.Tensor] = None):
-        """单次前向：one-step 主输出 + CPM 全 horizon 辅助输出。
+                profile: Optional[torch.Tensor] = None,
+                with_aux: bool = True):
+        """单次前向：Graph-ODE H1..H 轨迹 + 可选 CPM/方差辅助输出。
 
         Args:
             x: [B, F, 1, K] context（K ≤ context_max）
@@ -504,11 +534,14 @@ class NeuroTwinTFM(nn.Module):
             pathology_score: 保留的位置参数，仅接受 None；条件使用 condition。
             future_control: 仅接受 None；控制输入使用 controls。
             pathology_epoch: 当前训练 epoch（0 基）；保留的兼容参数。
+            with_aux: True 时同时计算 CPM 全 horizon 与方差头（旧接口）；
+                False 时跳过这两条辅助通路，只保留主 ODE 轨迹，训练路径使用。
         Returns:
             pred: [B, F, 1, 1] one-step 下一状态预测（原始空间，
                   供既有评估/损失直接消费）
             aux_info: dict：
-                ``cpm_pred``  [B, F, H] CPM 全 horizon 预测（原始空间）
+                ``dynamics_pred`` [B, F, H] Graph-ODE 轨迹（原始空间）
+                ``cpm_pred``  [B, F, H] CPM 全 horizon 预测（with_aux=True）
                 ``sc_prior``  SoftAnatomicalPrior 输出（图正则消费）
                 ``pathology_cond`` 条件向量（finetune；诊断用）
         """
@@ -522,10 +555,11 @@ class NeuroTwinTFM(nn.Module):
             x_grid = x_norm4[:, :, 0, :]
         cond = self._prepare_condition(pathology_score, condition, condition_epoch)
 
-        graph_input = self._graph_input(x_grid, sc_matrix)
+        signed_fc = self._history_fc_signed(x_grid) if self.state_feedback else None
+        graph_input = signed_fc.abs() if signed_fc is not None else self._graph_input(x_grid, sc_matrix)
         tokens, sc_info = self._encode(x_grid, graph_input)
         # One-Step / 图 ODE 头：最后 causal token 为初始 latent 状态
-        z_t = tokens[:, :, -1, :]                              # [B,F,D]
+        z_t = self._initial_latent(tokens, cond)                # [B,F,D]
         x_last_norm = x_grid[:, :, -1]                         # [B,F] = x_t（归一化）
 
         # ---- 受控图 ODE 分支（方案 §6.3.1）：同一次编码创建初始状态 ----
@@ -547,23 +581,21 @@ class NeuroTwinTFM(nn.Module):
         dyn_h = (int(dynamics_horizon)
                  if dynamics_horizon is not None else self.cpm_horizon)
         memory = self._history_memory(tokens)
+        q_anchor, signed_adj = self._feedback_context(x_grid, signed_fc)
         z_final, q_traj_norm, z_traj = self.one_step_head(
             z_t, x_last_norm, sc_info['A_eff'], cond=cond, profile=profile,
             controls=controls, time_deltas=time_deltas, horizon=dyn_h,
-            memory=memory)
+            memory=memory, q_anchor=q_anchor, signed_adj=signed_adj)
         del z_final   # forward 只消费 q 轨迹；latent 末状态经 state API 使用
         # 主输出 = 动态轨迹第一帧（反归一化后 [B,F,1,1]），不再额外加 x_last
         one_pred_norm = q_traj_norm[:, :, 0:1].unsqueeze(-1)
-        logvar_hf = self.one_step_head.variance_head(z_traj.detach())
         dyn_aux = {'dynamics_mean_norm': q_traj_norm,          # [B,F,H]
-                   'dynamics_logvar_norm': logvar_hf.permute(0, 2, 1),
                    'norm_stats': norm_stats}
+        if with_aux:
+            logvar_hf = self.one_step_head.variance_head(z_traj.detach())
+            dyn_aux['dynamics_logvar_norm'] = logvar_hf.permute(0, 2, 1)
         if profile is not None:
             dyn_aux['personal_profile'] = profile              # [B,profile_dim]
-
-        # CPM 头（§11）：ROI × Horizon 查询，一次输出整段未来
-        cpm_pred_norm = self.cpm_head(
-            tokens, self.patch_embed.roi_embed, cond)
 
         aux_info = {'sc_prior': sc_info}
         if cond is not None:
@@ -572,26 +604,34 @@ class NeuroTwinTFM(nn.Module):
         if self.rev_norm is not None:
             dyn_aux['dynamics_pred'] = self._denorm_3d(
                 dyn_aux['dynamics_mean_norm'], norm_stats)   # [B,F,H] 数据尺度
-            # 数据尺度 std：σ_norm · s / |a + eps|（复用实际 RevIN 分母，方案 §6.4；
-            # 是 abs(affine_weight + eps)，不是 abs(affine_weight) + eps）
-            sigma_norm = torch.exp(0.5 * dyn_aux['dynamics_logvar_norm'])
-            _, std_s = norm_stats                            # [B,F,1,1]
-            a_w = self.rev_norm.affine_weight                # [F]
-            denom = (a_w + self.rev_norm.eps).abs().view(1, -1, 1)
-            dyn_aux['dynamics_std'] = (sigma_norm
-                                       * std_s.to(sigma_norm.dtype)[:, :, 0, 0].unsqueeze(-1)
-                                       / denom)
+            if with_aux:
+                # 数据尺度 std：σ_norm · s / |a + eps|（复用实际 RevIN 分母，方案 §6.4；
+                # 是 abs(affine_weight + eps)，不是 abs(affine_weight) + eps）
+                sigma_norm = torch.exp(0.5 * dyn_aux['dynamics_logvar_norm'])
+                _, std_s = norm_stats                            # [B,F,1,1]
+                a_w = self.rev_norm.affine_weight                # [F]
+                denom = (a_w + self.rev_norm.eps).abs().view(1, -1, 1)
+                dyn_aux['dynamics_std'] = (sigma_norm
+                                           * std_s.to(sigma_norm.dtype)[:, :, 0, 0].unsqueeze(-1)
+                                           / denom)
         else:
             dyn_aux['dynamics_pred'] = dyn_aux['dynamics_mean_norm']
-            dyn_aux['dynamics_std'] = torch.exp(
-                0.5 * dyn_aux['dynamics_logvar_norm'])
+            if with_aux:
+                dyn_aux['dynamics_std'] = torch.exp(
+                    0.5 * dyn_aux['dynamics_logvar_norm'])
         aux_info.update(dyn_aux)
         if self.rev_norm is not None:
             one_pred = self.rev_norm(one_pred_norm, 'denorm', stats=norm_stats)
-            cpm_pred = self._denorm_3d(cpm_pred_norm, norm_stats)
         else:
-            one_pred, cpm_pred = one_pred_norm, cpm_pred_norm
-        aux_info['cpm_pred'] = cpm_pred                        # [B,F,H] 原始空间
+            one_pred = one_pred_norm
+        if with_aux:
+            # CPM 头（§11）：ROI × Horizon 查询，一次输出整段未来
+            cpm_pred_norm = self.cpm_head(
+                tokens, self.patch_embed.roi_embed, cond)
+            if self.rev_norm is not None:
+                aux_info['cpm_pred'] = self._denorm_3d(cpm_pred_norm, norm_stats)
+            else:
+                aux_info['cpm_pred'] = cpm_pred_norm
         return one_pred, aux_info
 
     # ------------------------------------------------------------------
@@ -731,8 +771,11 @@ class NeuroTwinTFM(nn.Module):
             x_grid = x_norm4[:, :, 0, :]
         else:
             x_grid = x[:, :, 0, :]
-        graph_input = self._graph_input(x_grid, sc_matrix)
+        signed_fc = self._history_fc_signed(x_grid) if self.state_feedback else None
+        graph_input = signed_fc.abs() if signed_fc is not None else self._graph_input(x_grid, sc_matrix)
         tokens, sc_info = self._encode(x_grid, graph_input)
+        if signed_fc is not None:
+            sc_info['signed_fc'] = signed_fc
         return tokens, x_grid, norm_stats, sc_info
 
     def _symmetrize_adj(self, a_eff: torch.Tensor) -> torch.Tensor:
@@ -802,10 +845,12 @@ class NeuroTwinTFM(nn.Module):
             profile = None
         tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
             history, sc_matrix, cond)
-        state = {'z': tokens[:, :, -1, :], 'q': x_grid[:, :, -1],
+        q_anchor, signed_adj = self._feedback_context(x_grid, sc_info.get('signed_fc'))
+        state = {'z': self._initial_latent(tokens, cond), 'q': x_grid[:, :, -1],
                  'adj': self._symmetrize_adj(sc_info['A_eff']),
                  'cond': cond, 'profile': profile,
                  'memory': self._history_memory(tokens),
+                 'q_anchor': q_anchor, 'signed_adj': signed_adj,
                  'norm_stats': norm_stats, 'history': history}
         return state
 
@@ -828,7 +873,8 @@ class NeuroTwinTFM(nn.Module):
         z_new, q_new = self.one_step_head.integrate_interval(
             state['z'], state['q'], state['adj'], dt,
             cond=state['cond'], profile=state['profile'], control=control,
-            memory=state.get('memory'))
+            memory=state.get('memory'), q_anchor=state.get('q_anchor'),
+            signed_adj=state.get('signed_adj'))
         x_new = self._denorm_q(q_new, state['norm_stats'])     # [B,F] 数据尺度
         history_new = torch.cat(
             [state['history'][:, 1:, :], x_new.unsqueeze(1)], dim=1)
@@ -861,9 +907,11 @@ class NeuroTwinTFM(nn.Module):
         tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
             history_new, sc_matrix, state['cond'])
         new_state = dict(state)
-        new_state.update({'z': tokens[:, :, -1, :], 'q': x_grid[:, :, -1],
+        q_anchor, signed_adj = self._feedback_context(x_grid, sc_info.get('signed_fc'))
+        new_state.update({'z': self._initial_latent(tokens, state['cond']), 'q': x_grid[:, :, -1],
                           'adj': self._symmetrize_adj(sc_info['A_eff']),
                           'memory': self._history_memory(tokens),
+                          'q_anchor': q_anchor, 'signed_adj': signed_adj,
                           'norm_stats': norm_stats, 'history': history_new})
         return new_state
 

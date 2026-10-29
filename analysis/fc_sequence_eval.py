@@ -18,6 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
+from analysis.rolling_one_step import manifest_path
+from utils.common import split_label
+
 
 def fc_edges(series: np.ndarray) -> np.ndarray:
     """Return signed Pearson FC edges from a [time, ROI] sequence.
@@ -67,7 +70,7 @@ def summarize(values) -> dict:
 
 
 def evaluate_cache(cache_dir: Path, split_file: Path, split: str) -> tuple:
-    manifest = json.loads((cache_dir / 'manifest.json').read_text())
+    manifest = json.loads(manifest_path(cache_dir).read_text())
     splits = json.loads(split_file.read_text())
     subjects = splits[split]
     others = {s for k in ('train', 'val', 'test') if k != split for s in splits[k]}
@@ -122,10 +125,11 @@ def main() -> None:
     ns = ap.parse_args()
     rows, summary = evaluate_cache(ns.cache_dir, ns.split_file, ns.split)
     ns.out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = ns.out_dir / f'per_subject_fc_{ns.split}.csv'
-    json_path = ns.out_dir / f'fc_summary_{ns.split}.json'
+    split_cn = split_label(ns.split)
+    csv_path = ns.out_dir / f'逐被试功能连接_{split_cn}.csv'
+    json_path = ns.out_dir / f'功能连接汇总_{split_cn}.json'
     if csv_path.exists() or json_path.exists():
-        raise FileExistsError('Results already exist; choose a new --out-dir')
+        raise FileExistsError('结果已存在；请指定新的 --out-dir，避免覆盖既有结果')
     with csv_path.open('w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()

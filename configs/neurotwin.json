@@ -1,9 +1,9 @@
 {
   "_meta": {
     "name": "neurotwin",
-    "description": "固定结构：历史编码、功能图先验、个体 profile、Graph-ODE、CPM 与逐 ROI 方差读出。预训练与微调共享此配方。",
+    "description": "固定结构：历史编码、功能图先验、个体 profile 与 Graph-ODE。当前阶段只训练/评估 H1–8，目标为重建、FC 与频域三项。",
     "status": "current",
-    "notes": "预训练与微调分别使用 hc3/demo 和 mdd8/cat；保留训练随机种子、损失权重及优化参数。"
+    "notes": "预训练与微调分别使用 hc3/demo 和 mdd8/cat；保留训练随机种子、损失权重及优化参数。H9–32 与 CPM/方差辅助监督暂不启用；选模判据为 H1–8 被试级 MAE + FC MSE，FC 在 8 步未来序列上估计。"
   },
   "architecture": {
     "model_arch": "tfm",
@@ -41,20 +41,11 @@
     "dynamics_history_memory": true
   },
   "loss": {
-    "name": "temporal_difference_and_head_consistency",
-    "lambda_one": 1.0,
-    "lambda_cpm": 1.0,
-    "lambda_pcc": 0.1,
-    "lambda_dynamics": 0.5,
-    "lambda_variance": 0.05,
-    "lambda_temporal_diff": 0.05,
-    "lambda_cross_head": 0.02,
-    "cross_head_start_epoch": 5,
-    "loss_weighting": "uncertainty",
-    "cpm_gamma": 1.0,
-    "cpm_huber_delta": 1.0,
-    "cpm_horizon_weight": "gamma",
-    "cpm_horizon_alpha": 0.5
+    "name": "h1_8_reconstruction_fc_frequency",
+    "lambda_rec": 1.0,
+    "lambda_fc": 1.0,
+    "lambda_freq": 1.0,
+    "loss_weighting": "uncertainty"
   },
   "data_and_split": {
     "data_root": "data/",
@@ -86,15 +77,15 @@
     "sampling_seed": 20261009,
     "cond_dropout_seed": 20261008,
     "split_seed": 2024,
-    "batch_size": 256,
-    "train_epochs": 150,
-    "lr_init": 5e-05,
-    "lr_peak": 0.0001,
-    "lr_final": 5e-05,
-    "warmup_epochs": 15,
+    "batch_size": 128,
+    "train_epochs": 30,
+    "lr_init": 2e-05,
+    "lr_peak": 5e-05,
+    "lr_final": 1e-05,
+    "warmup_epochs": 3,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
-    "patience": 20,
+    "patience": 12,
     "freeze_backbone_epochs": 10,
     "backbone_lr_scale": 0.2,
     "use_ema": true,
@@ -106,23 +97,24 @@
     ]
   },
   "evaluation_protocol": {
-    "primary": "val/test ODE H1–H8 被试级 MAE（metric_mae_dynamics_h1_8_subject）",
-    "final_eval": "python -m analysis.evaluate --ckpt checkpoints/neurotwin_finetune/finetuned_best.pt --out_dir results/evaluation --splits test",
-    "metrics_reference": "analysis/next_point_eval.py"
+    "primary": "val 选模 = H1–8 被试级 MAE + FC MSE（等权相加，越低越好）；test 报告单步 MAE、H1–8 MAE、FC PCC/MSE 与频域 L1",
+    "final_eval": "python -m analysis.evaluate --ckpt checkpoints/h1_8_v2/neurotwin_finetune/finetuned_best.pt --out_dir results/evaluation --splits test",
+    "metrics_reference": "main.evaluate_tfm"
   },
   "weights": {
     "pretrain": {
       "role": "hc_pretrain",
-      "path": "checkpoints/neurotwin_pretrain/base_best.pt",
-      "sha256": "0e252be1af1750b35bd26a2112f66f6a0cb2ad6fa4249b7334d9cffdbb78d255"
+      "path": "checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt",
+      "sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc",
+      "note": "2026-10-28 三损失 H1–8 重训（30 epoch 完整跑完）；val 联合判据 0.7865 = MAE 0.5424 + FC MSE 0.2442。"
     },
     "finetune": {
       "role": "mdd_finetune",
-      "path": "checkpoints/neurotwin_finetune/finetuned_best.pt",
-      "sha256": "ff0b2d991dcad3c27d548837a4218a5f7521011b8477c8028784d377a2e0aada",
+      "path": "checkpoints/h1_8_v2/neurotwin_finetune/finetuned_best.pt",
+      "sha256": "f89f57026bb789b0fb8e131a8042e7f220b2e2e827521b988ff3398806ecf4ac",
       "arch_version": 6,
       "params_total": 6244019,
-      "note": "2026-10-21 训练，epoch 22/23 早停，val ODE H1–H8 subject MAE=0.5329；完整 config.args 快照内嵌于 checkpoint。该权重由学习率调度修复前的配方训练，修复仅对后续重训生效。"
+      "note": "2026-10-28 从 h1_8_v2 HC 权重重训（30 epoch；epoch 19 为联合判据 best，val 0.7857 = MAE 0.5363 + FC MSE 0.2493）；主干冻结 10 轮，解冻后早停计数重置。"
     }
   }
 }

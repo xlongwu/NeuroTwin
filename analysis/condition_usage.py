@@ -1,10 +1,10 @@
 # coding=utf-8
-"""v2 B5：FiLM 条件使用量量化（HC val，冻结权重，只读）。
+"""v2 B5：FiLM 条件使用量量化（冻结权重，只读）。
 
-问题：HC 参照模型对 Sex/Age/education（hc3）条件的实际使用量有多大？
+问题：模型对 checkpoint 规定的条件字段（HC 为 hc3，MDD 为 mdd8）的实际使用量有多大？
 若近零，则「条件使用近零」即为最终结论，不再开敏感性分析支线（v2 §6.6）。
 
-对 HC val 每被试（全部 K=64 锚点，lag-1）：
+对指定组和划分的每名被试（全部 K=64 锚点，lag-1）：
 
 1. **FiLM 幅度**（ODE 头）：``‖γ(c)‖₂``、``‖β(c)‖₂``（``one_step_head.film``
    直接消费条件嵌入 c）；
@@ -20,8 +20,11 @@
 用法::
 
     python -m analysis.condition_usage \
-      --ckpt checkpoints/neurotwin_pretrain/base_best.pt \
+      --ckpt checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt \
       --split val --device cuda:0
+    # MDD 使用微调权重与 mdd8 条件：
+    python -m analysis.condition_usage --ckpt checkpoints/neurotwin_finetune/finetuned_best.pt \
+      --group mdd --split test --device cuda:0 --out_json <新结果.json> --out_csv <新结果.csv>
 """
 import argparse
 import csv
@@ -121,29 +124,30 @@ def run_condition_usage(model, loader, subjects, view, device, batch_size: int,
             None, {'cond_z': batch['cond_z'].to(device),
                    'cond_code': batch['cond_code'].to(device),
                    'cond_mask': batch['cond_mask'].to(device)}, None)
-        fn = film_norms(model, cond_emb)
-        an = adarms_norms(model, cond_emb)
         for i, sid in enumerate(batch['subj_id']):
-            e = acc.setdefault(str(sid), {'dp': [], 'sig': [], 'mae_c': [], 'mae_0': []})
+            sid = str(sid)
+            if sid not in acc:
+                # Conditions are subject-level; a batch may contain multiple subjects.
+                acc[sid] = {'dp': [], 'sig': [], 'mae_c': [], 'mae_0': [],
+                            'film': film_norms(model, cond_emb[i:i + 1]),
+                            'adarms': adarms_norms(model, cond_emb[i:i + 1])}
+            e = acc[sid]
             e['dp'].append(float(np.abs(pred_c[i] - pred_0[i]).mean()))
             e['sig'].append(float(np.abs(true[i] - x_last[i]).mean()))
             e['mae_c'].append(float(np.abs(pred_c[i] - true[i]).mean()))
             e['mae_0'].append(float(np.abs(pred_0[i] - true[i]).mean()))
-            e.setdefault('film', []).append(fn)
-            e.setdefault('adarms', []).append(an)
 
     rows = []
     for sid in [str(s) for s in subjects]:
         if sid not in acc:
             raise ValueError(f'视图中没有被试 {sid} 的锚点。')
         e = acc[sid]
-        mean_over = lambda key: float(np.mean([v[key] for v in e['film']]))
-        ad = e['adarms'][0]
+        ad = e['adarms']
         dp, sig = float(np.mean(e['dp'])), float(np.mean(e['sig']))
         rows.append({
             'subject': sid,
-            'ode_film_gamma': mean_over('ode_film_gamma'),
-            'ode_film_beta': mean_over('ode_film_beta'),
+            'ode_film_gamma': e['film']['ode_film_gamma'],
+            'ode_film_beta': e['film']['ode_film_beta'],
             'encoder_adarms_gamma': ad['encoder_adarms_gamma'],
             'encoder_adarms_beta': ad['encoder_adarms_beta'],
             'delta_pred_abs': dp,
@@ -170,6 +174,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True)
+    ap.add_argument('--group', default='hc', choices=['hc', 'mdd'])
     ap.add_argument('--split', default='val', choices=['train', 'val', 'test'])
     ap.add_argument('--context_length', type=int, default=64)
     ap.add_argument('--batch_size', type=int, default=64)
@@ -193,11 +198,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise RuntimeError(f'权重加载不完整：{compat}')
 
     loader = _build_loader_with_condition(
-        args, 'hc', data_root, ns.context_length, ns.batch_size, ns.num_workers,
+        args, ns.group, data_root, ns.context_length, ns.batch_size, ns.num_workers,
         condition_loader_kwargs(args, bundle))
     subjects = get_split_subjects(loader, ns.split)
-    log.info('[B5] group=hc split=%s | 被试 %d | 设备 %s',
-             ns.split, len(subjects), device)
+    log.info('[B5] group=%s split=%s | 被试 %d | 设备 %s',
+             ns.group, ns.split, len(subjects), device)
     view = build_dense_view(loader, subjects, ns.context_length)
     rows = run_condition_usage(model, loader, subjects, view, device,
                                ns.batch_size, ns.num_workers)
@@ -205,9 +210,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     def col(key):
         vals = np.asarray([r[key] for r in rows], dtype=np.float64)
         ok = np.isfinite(vals)
-        return {'mean': float(vals[ok].mean()) if ok.any() else float('nan'),
-                'median': float(np.median(vals[ok])) if ok.any() else float('nan'),
-                'max': float(vals[ok].max()) if ok.any() else float('nan'),
+        return {'mean': float(vals[ok].mean()) if ok.any() else None,
+                'median': float(np.median(vals[ok])) if ok.any() else None,
+                'max': float(vals[ok].max()) if ok.any() else None,
                 'n_valid': int(ok.sum())}
 
     summary = {k: col(k) for k in (
@@ -215,10 +220,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         'encoder_adarms_beta', 'delta_pred_abs', 'delta_pred_relative',
         'mae_cond', 'mae_zero_cond')}
     rel = summary['delta_pred_relative']
+    if rel['median'] is None:
+        raise ValueError('条件敏感度的信号尺度均无效，无法计算相对敏感度。')
     near_zero = bool(rel['median'] < 0.01)
     payload = {
         'analysis': 'B5 FiLM 条件使用量（v2 §6.6）',
-        'checkpoint': str(ns.ckpt), 'group': 'hc', 'split': ns.split,
+        'checkpoint': str(ns.ckpt), 'group': ns.group, 'split': ns.split,
         'n_subjects': len(rows),
         'zero_condition_def': '全缺失编码：cond_z=0、cond_code=Unknown(0)、cond_mask=0',
         'summary': summary,

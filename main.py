@@ -33,8 +33,10 @@ from utils.common import (parse_int_list, resolve_forecast_offsets,
 from models.conditioning import ConditioningConfig
 from models.tfm import NeuroTwinTFM
 from utils.condition_schema import DROPOUT_SEED, parse_extra_codes
-from train.losses import (TFMDualLoss, compute_graph_regularization, spatial_pcc,
-                          compute_cpm_mask)
+from train.losses import (ForecastFidelityLoss, complete_sequence_mask,
+                          correlation_matrix, fc_mse_per_sample, fc_pattern_pcc,
+                          frequency_l1_per_sample, masked_l1_per_sample,
+                          spatial_pcc)
 from train.optim import (ModelEMA, build_optimizer, build_scheduler,
                          check_pretrain_config_compat, count_trainable_params,
                          load_backbone_only, load_backbone_weights,
@@ -181,20 +183,6 @@ def dynamics_extras(batch, device):
     return cal, ctl
 
 
-def _normalized_future(model, fut: torch.Tensor, norm_stats):
-    """用当前历史的 RevIN 统计量归一化未来真值（方差损失目标，方案 §9）。
-
-    fut: [B,F,H]（数据尺度）→ [B,F,H]（归一化空间）。norm_stats 为 None
-    （--norm 关闭 RevIN）时直接返回原值，不再另行估计统计量。
-    """
-    if norm_stats is None:
-        return fut
-    revin = getattr(model, 'rev_norm', None)
-    if revin is None:
-        return fut
-    return revin.normalize_with(fut.unsqueeze(-1), norm_stats).squeeze(-1)
-
-
 def condition_loader_kwargs(args, bundle=None):
     """从 checkpoint 快照推导评估/推理 DataLoader 的条件参数（与训练同口径）。
 
@@ -302,8 +290,7 @@ def parse_pathology_fields(fields):
     return parsed or None
 
 
-#: graph_ode 路线的 checkpoint 主判据默认口径：H1..H8 全 ROI、先被试内再跨被试等权平均
-#: 实际步数由 ``--dynamics_metric_horizon`` 决定，键名由 :func:`dynamics_metric_key` 派生
+#: 当前阶段的监督/评估时程：H1..H8 全 ROI、先被试内再跨被试等权平均
 DYNAMICS_CKPT_HORIZON = 8
 
 
@@ -319,6 +306,21 @@ def dynamics_metric_name(horizon: int) -> str:
     if int(horizon) < 1:
         raise ValueError(f'horizon 必须 >= 1，收到 {horizon}')
     return f'val graph-ODE H1-{int(horizon)} subject MAE'
+
+
+def selection_metric_key(horizon: int) -> str:
+    """checkpoint 联合判据键名：H1–N MAE + FC MSE（两者同为零误差最优）。"""
+    if int(horizon) < 1:
+        raise ValueError(f'horizon 必须 >= 1，收到 {horizon}')
+    return f'metric_selection_h1_{int(horizon)}_mae_plus_fc_mse'
+
+
+def selection_metric(metrics: dict, horizon: int) -> tuple:
+    """联合选模分数与分项；FC MSE 与 MAE 同为 C 空间误差，直接等权相加。"""
+    mae = float(metrics[dynamics_metric_key(horizon)])
+    fc = float(metrics['metric_fc_mse'])
+    return mae + fc, mae, fc
+
 
 
 def apply_train_supervision_horizon(mask: torch.Tensor, horizon: int):
@@ -470,226 +472,119 @@ def _format_loss_weight(name, info):
 
 @torch.no_grad()
 def evaluate_tfm(model, data_loader, criterion, device, args,
-                 rollout_steps=0, rollout_horizons=None,
-                 pathology_epoch=None, loss_epoch=None):
-    """TFM 的验证/测试循环：one-step 指标 + CPM 逐 horizon + Graph-ODE 多步判据。
+                 pathology_epoch=None):
+    """H1–8 验证：单步、短程轨迹、FC 与频域指标。
 
-    指标键（``metric_mae_next`` 等）供日志与 checkpoint 判据复用，另加：
-      - ``cpm_mae_H{h}``：CPM 头在 t+h 处的逐元素 MAE（元素数归一）；
-      - ``cpm_persistence_mae_H{h}``：persistence 基线在同一 horizon 的 MAE；
-      - ``metric_cpm_mae``：CPM 全 horizon 平均 MAE；
-      - ``metric_mae_dynamics_h1_N_subject``（N=--dynamics_metric_horizon）：
-        Graph-ODE 持续推进（``aux_info['dynamics_pred']``，不用 CPM 输出替代）
-        在 H1..N、全部 ROI 上的逐锚点 MAE，**只纳入 future_mask 显示具备完整
-        N 步真值的锚点**，先被试内平均、再跨被试等权平均。graph_ode 路线的
-        checkpoint 判据即此指标（越低越好）；配套计数键
-        ``..._n_subjects`` / ``..._n_anchors`` / ``..._n_subjects_without_full_anchor``
-        / ``..._n_anchors_total``。整轮验证集没有有效锚点时直接报错，不回退。
-
-    聚合口径：单步 ``metric_mae_next`` 与多步主判据均采用
-    **先被试内平均、再跨被试平均**，与最终评估 analysis/next_point_eval.py 的
-    subject 口径一致，避免 batch 均值权重随末位小 batch / task 数变化影响
-    微小收益下的选权重；batch 均值另存 ``metric_mae_next_batchmean`` 供追溯。
-    其余指标仍为 batch 均值（仅用于趋势观察）。
+    Checkpoint 判据为 ``metric_selection_h1_N_mae_plus_fc_mse``：
+    H1–N 被试级 MAE 与 FC MSE 等权相加；两项先被试内平均、再跨被试等权。
+    FC/频域只统计具备完整 H1–8 真值的锚点。
     """
     model.eval()
+    horizon = int(getattr(args, 'cpm_horizon', DYNAMICS_CKPT_HORIZON) or
+                  DYNAMICS_CKPT_HORIZON)
     meters = defaultdict(list)
-    subj_mae_acc = defaultdict(lambda: [0.0, 0])     # subj -> [Σ逐样本MAE, n]
-    # graph_ode 多步主判据的累积：只统计具备完整 H 步真值的锚点
-    dyn_metric_horizon = resolve_dynamics_metric_horizon(args)
-    dyn_subj_acc = defaultdict(lambda: [0.0, 0])     # subj -> [Σ锚点MAE, n_完整锚点]
-    dyn_subjects_seen = set()                         # 验证集中出现过的被试
-    dyn_anchor_total = 0                              # 遍历过的锚点总数（含不完整）
-    rollout_acc = defaultdict(lambda: [0.0, 0, 0])
-    cpm_acc = defaultdict(lambda: [0.0, 0, 0])       # h -> [Σ|err|, Σw, n_elem]
-    rollout_hs = [int(h) for h in (rollout_horizons or []) if int(h) <= int(rollout_steps)]
-    horizon = int(getattr(model, 'cpm_horizon', 0) or args.cpm_horizon)
-    dyn_horizon = (max(horizon, dyn_metric_horizon))
-    pbar = make_pbar(data_loader, len(data_loader), '[Val-TFM]')
+    subject_values = defaultdict(lambda: defaultdict(list))
 
+    def add_subject(metric, sid, value):
+        if value is not None and math.isfinite(float(value)):
+            subject_values[metric][str(sid)].append(float(value))
+
+    pbar = make_pbar(data_loader, len(data_loader), '[Val-TFM]')
+    fc_sum_pred = None
+    fc_sum_true = None
+    fc_group_n = 0
     for batch in pbar:
         bx, by, bl, bm, bs, bp = next_point_batch(batch, device)
         cond = condition_batch(batch, device)
         bcal, bctl = dynamics_extras(batch, device)
         fut = batch['future'].to(device, non_blocking=True)          # [B,F,R]
         fmask = batch['future_mask'].to(device, non_blocking=True)   # [B,R]
-        outputs, aux_info = model(bx, bs, bp,
-                                  pathology_epoch=pathology_epoch,
-                                  condition=cond,
-                                  condition_epoch=None,              # 验证：关闭随机 Dropout
-                                  controls=(bctl[:, :dyn_horizon] if bctl is not None else None),
-                                  calibration_bold=bcal,
-                                  **({'dynamics_horizon': dyn_horizon}
-                                     if dyn_horizon > horizon else {}))
-        cpm_pred = aux_info['cpm_pred']                              # [B,F,H]
-        cpm_target = fut[:, :, :horizon]                             # [B,F,H]
-        if bctl is not None:
-            # graph_ode：CPM 是无控制辅助预测，从首个非零未来控制起屏蔽监督
-            cpm_mask = compute_cpm_mask(bctl[:, :horizon], fmask[:, :horizon])
-        else:
-            cpm_mask = fmask[:, :horizon]                            # [B,H]
-        dyn_kwargs = {}
-        if aux_info.get('dynamics_pred', None) is not None:
-            norm_stats = aux_info.get('norm_stats', None)
-            dyn_kwargs = dict(
-                dynamics_pred=aux_info['dynamics_pred'][:, :, :horizon],
-                dynamics_target=cpm_target,                          # 数据尺度 [B,F,H]
-                dynamics_mask=fmask[:, :horizon],                    # 完整 future_mask
-                dynamics_target_norm=_normalized_future(model, cpm_target, norm_stats),
-            )
-            for key in ('dynamics_mean_norm', 'dynamics_logvar_norm'):
-                value = aux_info.get(key)
-                dyn_kwargs[key] = value[:, :, :horizon] if value is not None else None
-        total_loss, loss_stats = criterion(outputs, by, cpm_pred,
-                                           cpm_target, cpm_mask,
-                                           context_last=bl, epoch=loss_epoch,
-                                           **dyn_kwargs)
-        graph_reg, graph_stats = compute_graph_regularization(
-            aux_info, device,
-            sparsity_weight=args.sc_sparsity_weight,
-            entropy_weight=args.sc_entropy_weight,
-            temporal_weight=args.sc_temporal_weight,
-        )
-        total_loss = total_loss + graph_reg
+        controls = bctl[:, :horizon] if bctl is not None else None
+        outputs, aux_info = model(
+            bx, bs, None,
+            pathology_epoch=pathology_epoch, condition=cond,
+            condition_epoch=None, controls=controls, calibration_bold=bcal,
+            dynamics_horizon=horizon, with_aux=False)
+        dyn_pred = aux_info['dynamics_pred'][:, :, :horizon]         # [B,F,H]
+        target = fut[:, :, :horizon]
+        mask = fmask[:, :horizon]
+        total_loss, loss_stats = criterion(dyn_pred, target, mask)
 
         b, f, h, _ = outputs.shape
         if bm is None:
             bm = torch.ones(b, h, device=outputs.device, dtype=outputs.dtype)
-        w4 = bm.view(b, 1, h, 1)
-        mae = _masked_l1_weighted(outputs, by, bm)
-        # 主判据的被试内聚合：逐样本 masked MAE → 按被试累积（§5.3 统一口径）
-        per_sample_mae = ((outputs - by).abs() * w4.expand_as(outputs)
-                          ).sum(dim=(1, 2, 3)) / \
-            w4.expand_as(outputs).sum(dim=(1, 2, 3)).clamp_min(1e-8)   # [B]
+        w4 = bm.view(b, 1, h, 1).expand_as(outputs)
+        mae_next = (((outputs - by).abs() * w4).sum(dim=(1, 2, 3))
+                    / w4.sum(dim=(1, 2, 3)).clamp_min(1e-8))
+        rmse_next = (((((outputs - by) ** 2) * w4).sum(dim=(1, 2, 3))
+                      / w4.sum(dim=(1, 2, 3)).clamp_min(1e-8)).sqrt())
+        pcc_next = spatial_pcc(outputs, by).mean(dim=1)              # [B]
+        h_mae = masked_l1_per_sample(dyn_pred, target, mask)          # [B]
+        x_t = bx[:, :, 0, -1].unsqueeze(-1).expand(-1, -1, horizon)  # [B,F,H]
+        pers_mae = masked_l1_per_sample(x_t, target, mask)
+
+        complete = complete_sequence_mask(mask, horizon)
+        has_complete = bool(complete.any())
+        fc_mse_v = fc_pcc_v = freq_v = None
+        if has_complete:
+            fc_mse_v = fc_mse_per_sample(dyn_pred[complete], target[complete])
+            fc_pcc_v = fc_pattern_pcc(dyn_pred[complete], target[complete])
+            freq_v = frequency_l1_per_sample(dyn_pred[complete], target[complete])
+            # 组平均 FC（跨样本后取边相关）比单样本 8 步 FC PCC 稳定，
+            # 作为“网络相似性”的主报告指标。
+            if fc_sum_pred is None:
+                n_rois = int(dyn_pred.shape[1])
+                fc_sum_pred = torch.zeros(n_rois, n_rois, dtype=torch.float64)
+                fc_sum_true = torch.zeros_like(fc_sum_pred)
+            fc_sum_pred += correlation_matrix(
+                dyn_pred[complete]).double().sum(0).cpu()
+            fc_sum_true += correlation_matrix(
+                target[complete]).double().sum(0).cpu()
+            fc_group_n += int(complete.sum())
+
         subj_ids = batch.get('subj_id', None)
-        if subj_ids is not None:
-            for i, sid in enumerate(subj_ids):
-                acc = subj_mae_acc[str(sid)]
-                acc[0] += float(per_sample_mae[i].item())
-                acc[1] += 1
-        # ---- 多步主判据累积：本次前向的 Graph-ODE 轨迹（不额外推理、不用 CPM 替代）----
-        if aux_info.get('dynamics_pred', None) is not None:
-            if subj_ids is None:
-                raise KeyError(
-                    'batch 缺少 subj_id：graph_ode 多步判据必须先按被试平均再跨被试等权'
-                    '平均，不能用 batch 均值替代。')
-            dyn_pred = aux_info['dynamics_pred']                       # [B,F,H] 数据尺度
-            dyn_anchor_mae, dyn_full = dynamics_anchor_mae(
-                dyn_pred, fut, fmask, horizon=dyn_metric_horizon)
-            dyn_anchor_total += int(dyn_pred.shape[0])
-            for i, sid in enumerate(subj_ids):
-                sid = str(sid)
-                dyn_subjects_seen.add(sid)
-                if bool(dyn_full[i]):
-                    acc = dyn_subj_acc[sid]
-                    acc[0] += float(dyn_anchor_mae[i].item())
-                    acc[1] += 1
-        rmse = (((outputs - by) ** 2) * w4.expand_as(outputs)).sum() / \
-            (w4.expand_as(outputs).sum().clamp_min(1e-8))
-        rmse = rmse.clamp_min(0).sqrt()
-        pcc_spatial = ((spatial_pcc(outputs, by) * bm).sum()
-                       / bm.sum().clamp_min(1e-8))
-        x_t = bx[:, :, 0, -1:].unsqueeze(-1)                         # [B,F,1,1]
-        x_prev = bx[:, :, 0, -2:-1].unsqueeze(-1)
-        pers = x_t.expand(b, f, h, 1)
-        trend = (x_t + (x_t - x_prev)).expand(b, f, h, 1)
-        pers_mae = _masked_l1_weighted(pers, by, bm)
-        trend_mae = _masked_l1_weighted(trend, by, bm)
+        if subj_ids is None:
+            raise KeyError('batch 缺少 subj_id：验证指标必须先按被试聚合')
+        for i, sid in enumerate(subj_ids):
+            add_subject('mae_next', sid, mae_next[i].item())
+            add_subject('rmse_next', sid, rmse_next[i].item())
+            add_subject('pcc_next', sid, pcc_next[i].item())
+            if complete[i]:
+                add_subject(f'mae_h1_{horizon}', sid, h_mae[i].item())
+                add_subject(f'persistence_h1_{horizon}', sid, pers_mae[i].item())
+        if has_complete:
+            for local, i in enumerate(complete.nonzero(as_tuple=False).squeeze(1).tolist()):
+                sid = subj_ids[i]
+                add_subject('fc_mse', sid, fc_mse_v[local].item())
+                add_subject('fc_pcc', sid, fc_pcc_v[local].item())
+                add_subject('freq_l1', sid, freq_v[local].item())
 
-        # CPM 逐 horizon MAE（元素数归一，与 next-state MAE 同口径）
-        cpm_mae_sum = 0.0
-        cpm_mae_weight = 0.0
-        for hi in range(horizon):
-            mh = cpm_mask[:, hi].unsqueeze(1)                        # [B,1] 广播到 ROI
-            n = float(mh.sum().item())
-            if n <= 0:
-                continue
-            err = (cpm_pred[:, :, hi] - cpm_target[:, :, hi]).abs()  # [B,F]
-            wsum = float((err * mh).sum().item())
-            cpm_acc[hi + 1][0] += wsum
-            cpm_acc[hi + 1][1] += n
-            cpm_acc[hi + 1][2] += n * f
-            cpm_mae_sum += wsum
-            cpm_mae_weight += n * f
-            # persistence 基线在同一 horizon 的 MAE（x̂=x_t）
-            pers_err = (x_t[:, :, 0, 0] - cpm_target[:, :, hi]).abs()
-            cpm_acc.setdefault(f'pers_{hi + 1}', [0.0, 0, 0])
-            cpm_acc[f'pers_{hi + 1}'][0] += float((pers_err * mh).sum().item())
-            cpm_acc[f'pers_{hi + 1}'][1] += n
-            cpm_acc[f'pers_{hi + 1}'][2] += n * f
-        metric_cpm_mae = (cpm_mae_sum / cpm_mae_weight) if cpm_mae_weight > 0 else 0.0
-
-        for k, v in {**loss_stats, **graph_stats,
-                     'metric_total': total_loss.detach(),
-                     'metric_mae_next': mae.detach(),
-                     'metric_rmse_next': rmse.detach(),
-                     'metric_pcc_next': pcc_spatial.detach(),
-                     'metric_persistence_mae': pers_mae.detach(),
-                     'metric_trend_mae': trend_mae.detach(),
-                     'metric_cpm_mae': torch.tensor(metric_cpm_mae)}.items():
+        for k, v in {**loss_stats, 'metric_total': total_loss.detach()}.items():
             meters[k].append(v.detach())
-        pbar_metrics(pbar, MAE=f"{float(mae):.4f}",
-                     PCC=f"{float(pcc_spatial):.4f}",
-                     CPM=f"{metric_cpm_mae:.4f}")
+        pbar_metrics(
+            pbar, MAE=f'{h_mae.mean():.4f}',
+            FC=(f'{fc_mse_v.mean():.4f}' if fc_mse_v is not None else 'NA'),
+            Freq=(f'{freq_v.mean():.4f}' if freq_v is not None else 'NA'))
 
-        # ---- free rollout（one-step 头自回归；中间不使用真值）----
-        if rollout_hs and 'rollout_flag' in batch:
-            rf = batch['rollout_flag'].bool()
-            rf_gpu = rf.to(device)
-            if rf_gpu.any():
-                hist = bx[rf_gpu][:, :, 0, :].transpose(1, 2).contiguous()   # [n,K,F]
-                roll = model.rollout_next_states(
-                    hist, bs[rf_gpu], (bp[rf_gpu] if bp is not None else None),
-                    steps=int(rollout_steps),
-                    pathology_epoch=pathology_epoch,
-                    condition=_index_condition(cond, rf_gpu),
-                    controls=(bctl[rf_gpu][:, :int(rollout_steps)]
-                              if bctl is not None else None),
-                    calibration_bold=(bcal[rf_gpu] if bcal is not None else None))
-                fut_r = batch['future'][rf].transpose(1, 2).contiguous().to(
-                    device).float()                                  # [n,R,F]
-                fmask_r = batch['future_mask'][rf].to(device).float()  # [n,R]
-                for rh in rollout_hs:
-                    ok = fmask_r[:, rh - 1] > 0
-                    k = int(ok.sum())
-                    if k:
-                        rollout_acc[rh][0] += float(
-                            (roll[ok, rh - 1, :] - fut_r[ok, rh - 1, :]).abs().sum())
-                        rollout_acc[rh][1] += k
-                        rollout_acc[rh][2] += k * int(roll.shape[-1])
-
-    for hi, (err_sum, _n_tasks, n_elem) in cpm_acc.items():
-        if isinstance(hi, int) and n_elem:
-            meters[f'cpm_mae_H{hi}'].append(torch.tensor(err_sum / n_elem))
-    for key, (err_sum, _n_tasks, n_elem) in cpm_acc.items():
-        if isinstance(key, str) and key.startswith('pers_') and n_elem:
-            meters[f'cpm_persistence_mae_H{key.split("_")[1]}'].append(
-                torch.tensor(err_sum / n_elem))
-    for rh, (err_sum, _n_tasks, n_elem) in rollout_acc.items():
-        if n_elem:
-            meters[f'rollout_mae_H{rh}'].append(torch.tensor(err_sum / n_elem))
     result = {k: torch.stack(vs).mean().item() for k, vs in meters.items()}
-    if subj_mae_acc:
-        # 主判据改为先被试内、再跨被试平均（与最终评估口径一致，§5.3）
-        subj_means = [s / n for s, n in subj_mae_acc.values() if n > 0]
-        result['metric_mae_next_batchmean'] = result['metric_mae_next']
-        result['metric_mae_next'] = sum(subj_means) / len(subj_means)
-        result['metric_mae_next_n_subjects'] = float(len(subj_means))
-    if dyn_anchor_total:
-        # 多步主判据：无完整 H 步锚点时由聚合函数直接报错，不静默缺键
-        dyn_key = dynamics_metric_key(dyn_metric_horizon)
-        metric_value, n_subj, n_anchors = aggregate_dynamics_subject_metric(
-            dyn_subj_acc, dyn_anchor_total, horizon=dyn_metric_horizon)
-        result[dyn_key] = metric_value
-        result[f'{dyn_key}_n_subjects'] = float(n_subj)
-        result[f'{dyn_key}_n_anchors'] = float(n_anchors)
-        result[f'{dyn_key}_n_subjects_without_full_anchor'] = float(
-            len(dyn_subjects_seen) - n_subj)
-        result[f'{dyn_key}_n_anchors_total'] = float(dyn_anchor_total)
+    for key, per_subject in subject_values.items():
+        usable = [sum(v) / len(v) for v in per_subject.values() if v]
+        if usable:
+            result[f'metric_{key}'] = float(sum(usable) / len(usable))
+            result[f'metric_{key}_n_subjects'] = float(len(usable))
+    if f'metric_mae_h1_{horizon}' in result:
+        result[dynamics_metric_key(horizon)] = result[f'metric_mae_h1_{horizon}']
+    if fc_group_n:
+        iu = torch.triu_indices(fc_sum_pred.shape[0], fc_sum_pred.shape[0], offset=1)
+        a = (fc_sum_pred / fc_group_n)[iu[0], iu[1]]
+        b = (fc_sum_true / fc_group_n)[iu[0], iu[1]]
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = a.norm() * b.norm()
+        if float(denom) > 0:
+            result['metric_fc_group_pcc'] = float((a * b).sum() / denom)
+            result['metric_fc_group_n_samples'] = float(fc_group_n)
     return result
-
-
-
 
 def check_seed_separation(args):
     """方案 §四：模型 seed / 采样 seed / Condition Dropout seed 必须是三条独立随机流。
@@ -716,6 +611,12 @@ def check_seed_separation(args):
 
 def _resume_argument_mismatches(saved_args: dict, current_args: dict) -> dict:
     """Compare effective training arguments, ignoring path/entry-point-only values."""
+    # Training states saved before the optional optimization arms have the same
+    # baseline semantics as these disabled defaults.
+    saved_args = {
+        'state_feedback': False, 'spatial_profile': False,
+        'condition_initial_state': False, **saved_args,
+    }
     ignored = {
         'checkpoint_dir', 'name', 'pretrained_weight', 'condition_inherit_stats',
         'resume_training_state', 'save_training_state', 'eval_after_train',
@@ -786,15 +687,12 @@ def main(args):
     # 任务维度解析：next_timepoint（in_window=1, pred_window=1, seq_len=context_max）。
     # 模型/数据/损失共用同一口径。
     dims = resolve_task_dims(args)
+    horizon = int(dims['cpm_horizon'])
+    if horizon != DYNAMICS_CKPT_HORIZON:
+        raise ValueError(
+            f'当前阶段只训练与评估 H1–{DYNAMICS_CKPT_HORIZON}，'
+            f'cpm_horizon 必须为 {DYNAMICS_CKPT_HORIZON}，收到 {horizon}')
     forecast_offsets = resolve_forecast_offsets(args)
-    eval_rollout_horizons = (parse_int_list(args.eval_rollout_horizons,
-                                            'eval_rollout_horizons')
-                             or [1, 2, 4, 8, 16])
-    needs_long_rollout = bool(args.eval_fc or args.eval_spectral)
-    auto_steps = max(eval_rollout_horizons)
-    if needs_long_rollout:
-        auto_steps = max(auto_steps, int(args.fc_min_length))
-    eval_rollout_steps = int(args.eval_rollout_steps) or auto_steps
 
     print('=' * 50)
     if args.mode == 'pretrain':
@@ -821,8 +719,7 @@ def main(args):
              if args.context_lengths else "（连续区间随机采样）")
           + f" | 评估固定 K_eval={int(args.eval_context_length) or args.context_max} | "
           f"anchors/被试={args.eval_anchors_per_subject} | "
-          f"rollout: R={eval_rollout_steps}, horizons={eval_rollout_horizons}, "
-          f"锚点/被试={args.eval_rollout_tasks_per_subject}")
+          f"监督/评估时程=H1–{horizon} | 指标=单步 MAE、H1–{horizon} MAE、FC、频域")
 
     cond_enabled = bool(getattr(args, 'condition_arm', None) not in (None, '', 'none'))
     if args.pretrained_horizon_policy != 'require_match' and (
@@ -892,12 +789,12 @@ def main(args):
         forecast_offsets=forecast_offsets,
         eval_context_length=(int(args.eval_context_length) or args.context_max),
         eval_anchors_per_subject=args.eval_anchors_per_subject,
-        eval_rollout_tasks_per_subject=args.eval_rollout_tasks_per_subject,
-        eval_rollout_steps=eval_rollout_steps,
-        train_rollout_steps=dims['cpm_horizon'],
-        train_anchor_max_offset=(args.train_anchor_max_offset or dims['cpm_horizon']),
-        eval_all_future_steps=max(dims['cpm_horizon'], resolve_dynamics_metric_horizon(args)),
-        eval_anchor_min_future_steps=args.eval_anchor_min_future_steps,
+        eval_rollout_tasks_per_subject=0,
+        eval_rollout_steps=0,
+        train_rollout_steps=horizon,
+        train_anchor_max_offset=horizon,
+        eval_all_future_steps=horizon,
+        eval_anchor_min_future_steps=horizon,
         # graph_ode 动态路线的数据参数（方案 §4）：raw 源、可见历史 FC、
         # 校准前缀与控制 manifest；旧默认值下这些参数不改变任何行为
         num_rois=args.num_rois,
@@ -967,9 +864,17 @@ def main(args):
         personalized=args.personalized,
         profile_dim=args.profile_dim,
         dynamics_history_memory=args.dynamics_history_memory,
+        state_feedback=args.state_feedback,
+        spatial_profile=args.spatial_profile,
+        condition_initial_state=args.condition_initial_state,
     ).to(device)
     migration_report = (resume_progress_data.get('study', {}).get('pretrained_migration')
                         if resume_progress_data is not None else None)
+    if args.mode == 'pretrain' and getattr(args, 'init_weight', ''):
+        from analysis.checkpoint import load_checkpoint_compat
+        model, compat = load_checkpoint_compat(
+            model, args.init_weight, device, strict=True)
+        print(f'[pretrain] 热启动权重已加载: {args.init_weight} | compat={compat}')
 
     if args.mode == 'finetune':
         if resume_metadata is None and not os.path.exists(args.pretrained_weight):
@@ -980,8 +885,16 @@ def main(args):
         saved_layout = None
         same_group_arm = False
         if cond_enabled and resume_metadata is None:
-            from analysis.evaluate import load_condition_bundle
+            from analysis.evaluate import load_condition_bundle, load_train_args
             bundle = load_condition_bundle(args.pretrained_weight)
+            saved_model_args = load_train_args(args.pretrained_weight)
+            feature_flags = ('state_feedback', 'spatial_profile', 'condition_initial_state')
+            mismatched_flags = {key: (bool(getattr(saved_model_args, key, False)),
+                                      bool(getattr(args, key)))
+                                for key in feature_flags
+                                if bool(getattr(saved_model_args, key, False)) != bool(getattr(args, key))}
+            if mismatched_flags:
+                raise ValueError(f'预训练与微调模型结构开关不一致：{mismatched_flags}')
             if bundle is not None:
                 saved_layout = (bundle.get('meta') or {}).get('layout_hash')
             if saved_layout and getattr(model, 'conditioner', None) is not None:
@@ -1049,24 +962,7 @@ def main(args):
           f"| rank={args.sc_prior_rank} | delta_a={args.sc_delta_a} "
           f"| sinkhorn_iters={args.sc_sinkhorn_iters}")
 
-    # TFM 双目标损失（方案 §20）：L_one = Huber + λ_pcc(1-PCC)；
-    # L_CPM = γ 加权逐 horizon Huber。不再使用数学等价的 abs+delta 双计。
-
-    if args.temporal_mode == 'adaptive' and args.adaptive_delta_scale <= 0:
-        # Read only MDD-train subjects, in the calibrated data space used by loss.
-        # This does not iterate the random training sampler or consume its RNG.
-        import numpy as np
-        delta_sum, delta_count = 0.0, 0
-        for subject_id in dl.get_train_subjects():
-            series = dl.base_dataset.get_series(subject_id)
-            differences = np.abs(np.diff(series, axis=-1))
-            delta_sum += float(differences.sum(dtype=np.float64))
-            delta_count += differences.size
-        if not delta_count or delta_sum <= 0:
-            raise ValueError('train-only delta scale is empty or zero')
-        args.adaptive_delta_scale = delta_sum / delta_count
-        print(f'[loss] train-only mean absolute delta scale={args.adaptive_delta_scale:.8g}')
-
+    # 当前阶段的训练目标只有三项：H1–8 重建、FC、频域。
     if resume_metadata is not None:
         saved_args = resume_progress_data['study']['args']
         mismatches = _resume_argument_mismatches(saved_args, vars(args))
@@ -1082,38 +978,14 @@ def main(args):
         if resume_progress_data.get('study', {}).get('mode') != args.mode:
             raise ValueError('训练状态 mode 与当前入口不一致')
 
-    criterion = TFMDualLoss(
-        lambda_one=args.lambda_one, lambda_cpm=args.lambda_cpm,
-        lambda_pcc=args.lambda_pcc, cpm_gamma=args.cpm_gamma,
-        huber_delta=args.cpm_huber_delta,
-        lambda_dynamics=args.lambda_dynamics,
-        lambda_variance=args.lambda_variance,
-        weighting=getattr(args, 'loss_weighting', 'fixed'),
-        lambda_temporal_diff=args.lambda_temporal_diff,
-        lambda_temporal_pcc=getattr(args, 'lambda_temporal_pcc', 0.0),
-        lambda_cross_head=args.lambda_cross_head,
-        cpm_horizon_weight=args.cpm_horizon_weight,
-        cpm_horizon_alpha=args.cpm_horizon_alpha,
-        cross_head_start_epoch=args.cross_head_start_epoch,
-        temporal_mode=args.temporal_mode,
-        temporal_lags=tuple(map(int, args.temporal_lags.split(','))),
-        temporal_scale_weights=tuple(map(float, args.temporal_scale_weights.split(','))),
-        adaptive_delta_alpha=args.adaptive_delta_alpha,
-        adaptive_delta_clip=args.adaptive_delta_clip,
-        adaptive_delta_scale=args.adaptive_delta_scale,
-        dynamics_horizon_weight=args.dynamics_horizon_weight,
-        horizon_weight_power=args.horizon_weight_power,
+    criterion = ForecastFidelityLoss(
+        lambda_rec=args.lambda_rec, lambda_fc=args.lambda_fc,
+        lambda_freq=args.lambda_freq,
+        weighting=getattr(args, 'loss_weighting', 'uncertainty'),
     ).to(device)
-    print(f"[TFM] 损失: lambda_one={args.lambda_one} "
-          f"lambda_cpm={args.lambda_cpm} lambda_pcc={args.lambda_pcc} "
-          f"cpm_gamma={args.cpm_gamma} huber_delta={args.cpm_huber_delta} | "
-          f"lambda_dynamics={args.lambda_dynamics} "
-          f"lambda_variance={args.lambda_variance} | "
-          f"lambda_temporal_diff={args.lambda_temporal_diff} "
-          f"lambda_temporal_pcc={args.lambda_temporal_pcc} "
-          f"lambda_cross_head={args.lambda_cross_head} "
-          f"cpm_horizon_weight={args.cpm_horizon_weight}（α={args.cpm_horizon_alpha}）| "
-          f"cpm_horizon={args.cpm_horizon}（One-Step + CPM 双头，方案 §9/§20）")
+    print(f"[TFM] 损失: H1–{horizon} 重建 L1={args.lambda_rec} | "
+          f"FC MSE={args.lambda_fc} | 频域 L1={args.lambda_freq} | "
+          f"weighting={criterion.weighting}")
     if criterion.weighting == 'uncertainty':
         n_log_s = len(list(criterion.log_s.parameters()))
         print(f"[TFM] 损失权重: 同方差不确定性加权（Kendall CVPR 2018，"
@@ -1127,8 +999,7 @@ def main(args):
     print(f"[TFM] One-Step 条件模式: 模型生效 tfm_patho_mode={model.tfm_patho_mode}"
           f"（args 值 {args.tfm_patho_mode}）"
           f" | OS FiLM: {'on' if getattr(model.one_step_head, 'film', None) is not None else 'off'}"
-          f" | CPM FiLM: {'on' if getattr(model.cpm_head, 'film', None) is not None else 'off'}"
-)
+          f" | 训练路径跳过 CPM/方差辅助头（with_aux=False）")
 
     backbone_unfrozen = (args.mode == 'pretrain')
     optimizer = build_optimizer(model, criterion, args)
@@ -1159,13 +1030,12 @@ def main(args):
         print("[next_timepoint] torch.compile(dynamic=True) 已启用（变长 K 符号化，"
               "首个 epoch 含一次性编译耗时属预期）。")
 
-    # 主 checkpoint 判据（prompt §三十八：不使用单纯 PCC 选模型）：
-    #   graph_ode → 验证集 H1..N 被试级多步 MAE（本阶段改动，越低越好）
-    # 两个口径数值量纲不同、不可互相比较；同一 run 内判据固定，不继承另一口径的历史 best。
-    dyn_metric_horizon = resolve_dynamics_metric_horizon(args)
+    # 主 checkpoint 判据：验证集 H1–8 被试级 MAE + FC MSE（两者越低越好）。
+    # 只按 MAE 选模会在 FC/频域持续改善时停在第 1 个 epoch，丢掉网络保真度增益。
+    dyn_metric_horizon = horizon
     dyn_metric_key = dynamics_metric_key(dyn_metric_horizon)
-    ckpt_metric_key = dyn_metric_key
-    ckpt_metric_name = dynamics_metric_name(dyn_metric_horizon)
+    ckpt_metric_key = selection_metric_key(dyn_metric_horizon)
+    ckpt_metric_name = f'{dynamics_metric_name(dyn_metric_horizon)} + FC MSE'
     selector = CheckpointSelector(ckpt_metric_key, ckpt_metric_name,
                                   patience=args.patience)
     print(f"[next_timepoint] checkpoint 选择判据: {ckpt_metric_name}"
@@ -1303,12 +1173,14 @@ def main(args):
                 and epoch >= args.freeze_backbone_epochs):
             set_finetune_trainability(model, backbone_unfrozen=True)
             backbone_unfrozen = True
+            # 冻结阶段只训练条件模块，不能决定解冻后的收敛；早停计数从解冻轮重新开始
+            selector.counter = 0
             # 解冻只追加新可训练参数：已训练条件参数的 Adam 状态与 LR 进度必须保留
             added, names = unfreeze_while_preserving_state(model, optimizer, args)
             scheduler.sync_param_groups()
             print(f"Epoch {epoch+1}: 已解冻主干，新增可训练参数 numel={added} "
                   f"groups={names}，可训练参数量 = {count_trainable_params(model)}"
-                  f"（沿用现有 optimizer 状态与 scheduler 进度）")
+                  f"（沿用现有 optimizer 状态与 scheduler 进度；早停计数已重置）")
 
         model.train()
         # 轨迹任务：每 epoch 重新打乱分桶 sampler（同 batch 内 L 一致的约束保持不变）
@@ -1332,44 +1204,20 @@ def main(args):
             if by_roll is not None: by_roll = by_roll.to(device, non_blocking=True)
             if bm_roll is not None: bm_roll = bm_roll.to(device, non_blocking=True)
 
+            if by_roll is None or bm_roll is None:
+                raise KeyError(
+                    '训练 batch 缺少 future/future_mask：H1–8 重建、FC 与频域'
+                    '监督都需要未来轨迹')
             with torch.amp.autocast('cuda', enabled=amp_enabled):
-                outputs, aux_info = model(bx, bs, bp,
-                                          pathology_epoch=epoch,
-                                          condition=cond,
-                                          condition_epoch=epoch,
-                                          controls=bctl,
-                                          calibration_bold=bcal)
-                # CPM 目标：训练视图 future_steps=cpm_horizon → by_roll [B,F,H]。
-                # graph_ode 有控制序列时，CPM 监督从首个非零未来控制起屏蔽
-                # （受控区间的 CPM 辅助预测没有真值对应，方案 §9）。
-                cpm_mask_train = bm_roll
-                if bctl is not None and bm_roll is not None:
-                    cpm_mask_train = compute_cpm_mask(bctl, bm_roll)
-                cpm_mask_train = apply_train_supervision_horizon(
-                    cpm_mask_train, args.train_supervision_horizon)
-                dynamics_mask_train = apply_train_supervision_horizon(
-                    bm_roll, args.train_supervision_horizon)
-                dyn_kwargs = {}
-                if aux_info.get('dynamics_pred', None) is not None and by_roll is not None:
-                    dyn_kwargs = dict(
-                        dynamics_pred=aux_info['dynamics_pred'],
-                        dynamics_target=by_roll,                     # 数据尺度 [B,F,H]
-                        dynamics_mask=dynamics_mask_train,
-                        dynamics_mean_norm=aux_info.get('dynamics_mean_norm', None),
-                        dynamics_logvar_norm=aux_info.get('dynamics_logvar_norm', None),
-                        dynamics_target_norm=_normalized_future(
-                            model, by_roll, aux_info.get('norm_stats', None)),
-                    )
+                outputs, aux_info = model(
+                    bx, bs, None,
+                    pathology_epoch=epoch, condition=cond,
+                    condition_epoch=epoch, controls=bctl,
+                    calibration_bold=bcal, dynamics_horizon=horizon,
+                    with_aux=False)
                 total_loss, loss_stats = criterion(
-                    outputs, by, aux_info['cpm_pred'], by_roll,
-                    cpm_mask_train, context_last=bl, epoch=epoch, **dyn_kwargs)
-                graph_reg, graph_stats = compute_graph_regularization(
-                    aux_info, device,
-                    sparsity_weight=args.sc_sparsity_weight,
-                    entropy_weight=args.sc_entropy_weight,
-                    temporal_weight=args.sc_temporal_weight,
-                )
-                total_loss = total_loss + graph_reg
+                    aux_info['dynamics_pred'][:, :, :horizon],
+                    by_roll[:, :, :horizon], bm_roll[:, :horizon])
 
 
             scaler.scale(total_loss).backward()
@@ -1387,34 +1235,22 @@ def main(args):
             # Counts batches that invoked scaler/optimizer step, including AMP-skipped updates.
             global_step += 1
 
-            for k, v in {**loss_stats, **graph_stats,
+            for k, v in {**loss_stats,
                          'metric_total': total_loss.detach()}.items():
                 train_meters[k].append(v.detach())
             live['metric_total'] += float(total_loss.item())
-            live['loss_one'] += float(loss_stats['loss_one'].item())
-            live['loss_cpm'] += float(loss_stats['loss_cpm'].item())
-            postfix = {
-                'Loss': f"{live['metric_total']/step:.4f}",
-                'One': f"{live['loss_one']/step:.4f}",
-                'CPM': f"{live['loss_cpm']/step:.4f}",
-            }
-            if 'loss_dynamics' in loss_stats:
-                live['_dyn'] = live.get('_dyn', 0.0) + float(loss_stats['loss_dynamics'].item())
-                postfix['Dyn'] = f"{live['_dyn']/step:.4f}"
-            if 'loss_variance' in loss_stats:
-                live['_var'] = live.get('_var', 0.0) + float(loss_stats['loss_variance'].item())
-                postfix['Var'] = f"{live['_var']/step:.4f}"
-            if 'loss_crps' in loss_stats:
-                live['_crps'] = live.get('_crps', 0.0) + float(loss_stats['loss_crps'].item())
-                postfix['CRPS'] = f"{live['_crps']/step:.4f}"
-            pbar_metrics(pbar, **postfix)
+            live['loss_rec'] += float(loss_stats['loss_rec'].item())
+            live['loss_fc'] += float(loss_stats['loss_fc'].item())
+            live['loss_freq'] += float(loss_stats['loss_freq'].item())
+            pbar_metrics(
+                pbar, Loss=f"{live['metric_total']/step:.4f}",
+                Rec=f"{live['loss_rec']/step:.4f}",
+                FC=f"{live['loss_fc']/step:.4f}",
+                Freq=f"{live['loss_freq']/step:.4f}")
 
         eval_model  = ema.ema if ema is not None else model
         val_metrics = evaluate_tfm(eval_model, val_data, criterion, device,
-                                   args, rollout_steps=eval_rollout_steps,
-                                   rollout_horizons=eval_rollout_horizons,
-                                   pathology_epoch=epoch,
-                                   loss_epoch=epoch)
+                                   args, pathology_epoch=epoch)
         scheduler.step()
 
         train_metrics = {k: torch.stack(vs).mean().item() for k, vs in train_meters.items()}
@@ -1422,49 +1258,33 @@ def main(args):
                         for i, g in enumerate(optimizer.param_groups)}
         lr_text = ' | '.join(f"{k}: {v:.2e}" for k, v in group_lrs.items())
 
-        # TFM 口径：one-step 主指标 + CPM 全 horizon 指标 + trivial baseline
+        def _val(key, fmt='.4f'):
+            return format(val_metrics[key], fmt) if key in val_metrics else 'NA'
+
         tqdm.write(
             f"Epoch {epoch+1:03d} | {lr_text} | "
             f"backbone={'unfrozen' if backbone_unfrozen else 'frozen'} | "
             f"Train Total: {train_metrics['metric_total']:.4f} | "
-            f"one: {train_metrics['loss_one']:.4f} | "
-            f"cpm: {train_metrics['loss_cpm']:.4f} | "
-            f"Val Total: {val_metrics['metric_total']:.4f} | "
-            f"Val next MAE: {val_metrics['metric_mae_next']:.4f} | "
-            f"Val next PCC(sp): {val_metrics['metric_pcc_next']:.4f} | "
-            f"Val CPM MAE: {val_metrics['metric_cpm_mae']:.4f} | "
-            f"Val persistence MAE: {val_metrics['metric_persistence_mae']:.4f} | "
-            f"Val trend MAE: {val_metrics['metric_trend_mae']:.4f}"
-            + (f" | Val CRPS: {val_metrics['metric_crps_dynamics']:.4f}"
-               if 'metric_crps_dynamics' in val_metrics else "")
-        )
-        cpm_h_log = [f"H{h}: {val_metrics[f'cpm_mae_H{h}']:.4f}"
-                     for h in range(1, int(args.cpm_horizon) + 1)
-                     if f'cpm_mae_H{h}' in val_metrics]
-        if cpm_h_log:
-            tqdm.write("[TFM/CPM] val MAE per horizon | " + ' | '.join(cpm_h_log))
-        roll_log = [f"H{h}: {val_metrics[f'rollout_mae_H{h}']:.4f}"
-                    for h in (eval_rollout_horizons or [])
-                    if f'rollout_mae_H{h}' in val_metrics]
-        if roll_log:
-            tqdm.write(f"[NextPoint] val rollout MAE (free, R={eval_rollout_steps}) | "
-                       + ' | '.join(roll_log))
-        is_best, cur_metric = selector.step(val_metrics)
-
-        if dyn_metric_key in val_metrics:
-            dyn_text = (
-                f"{val_metrics[dyn_metric_key]:.4f}"
-                f"(被试={val_metrics[f'{dyn_metric_key}_n_subjects']:.0f}, "
-                f"完整{dyn_metric_horizon}步锚点={val_metrics[f'{dyn_metric_key}_n_anchors']:.0f}, "
-                f"无完整锚点被试="
-                f"{val_metrics[f'{dyn_metric_key}_n_subjects_without_full_anchor']:.0f})")
-        else:
-            dyn_text = 'N/A（本配置无 Graph-ODE dynamics 轨迹）'
+            f"rec: {train_metrics['loss_rec']:.4f} | "
+            f"fc: {train_metrics['loss_fc']:.4f} | "
+            f"freq: {train_metrics['loss_freq']:.4f}")
         tqdm.write(
-            f"[NextPoint] 单步 MAE={val_metrics['metric_mae_next']:.4f} | "
-            f"多步 MAE={dyn_text} | 选优指标 {ckpt_metric_name}={cur_metric:.4f} | "
+            f"[Val] total={_val('metric_total')} | next MAE={_val('metric_mae_next')} | "
+            f"next PCC(sp)={_val('metric_pcc_next')} | "
+            f"H1–{horizon} MAE={_val(dyn_metric_key)} | "
+            f"FC PCC={_val('metric_fc_pcc')} | FC MSE={_val('metric_fc_mse')} | "
+            f"FC grpPCC={_val('metric_fc_group_pcc')} | "
+            f"Freq L1={_val('metric_freq_l1')} | "
+            f"persistence H1–{horizon}={_val(f'metric_persistence_h1_{horizon}')}")
+        selection_score, selection_mae, selection_fc = selection_metric(
+            val_metrics, horizon)
+        val_metrics[ckpt_metric_key] = selection_score
+        is_best, cur_metric = selector.step(val_metrics)
+        tqdm.write(
+            f"[Select] {ckpt_metric_name}={cur_metric:.4f} "
+            f"(MAE={selection_mae:.4f} + FC MSE={selection_fc:.4f}) | "
             f"model vs persistence ΔMAE="
-            f"{val_metrics['metric_persistence_mae'] - val_metrics['metric_mae_next']:+.4f}")
+            f"{val_metrics.get(f'metric_persistence_h1_{horizon}', float('nan')) - selection_mae:+.4f}")
         if criterion.weighting == 'uncertainty':
             # 学习到的任务权重演化（收敛监控）：weight=exp(-log_s)
             tqdm.write("[LossW] " + ' | '.join(
@@ -1480,6 +1300,8 @@ def main(args):
             meta = {'args': vars(args), 'epoch': int(epoch),
                     'epoch_1based': int(epoch + 1),
                     'val_metric': float(cur_metric),
+                    'val_mae_h1_8': float(selection_mae),
+                    'val_fc_mse': float(selection_fc),
                     'ckpt_metric_key': selector.metric_key,
                     'ckpt_metric_name': selector.metric_name,
                     'backbone_unfrozen': bool(backbone_unfrozen)}
@@ -1525,71 +1347,30 @@ def main(args):
                                   ema.ema if ema else model,
                                   meta=_ckpt_meta())
 
-        # TensorBoard
+        # TensorBoard：只记录当前阶段的三项损失与四类指标。
         tb_scalars = [
             ('Train/Total', train_metrics['metric_total']),
-            ('Train/One', train_metrics['loss_one']),
-            ('Train/CPM', train_metrics['loss_cpm']),
+            ('Train/Rec', train_metrics['loss_rec']),
+            ('Train/FC', train_metrics['loss_fc']),
+            ('Train/Freq', train_metrics['loss_freq']),
             ('Val/Total', val_metrics['metric_total']),
             ('Val/Next_MAE', val_metrics['metric_mae_next']),
             ('Val/Next_RMSE', val_metrics['metric_rmse_next']),
             ('Val/Next_PCC', val_metrics['metric_pcc_next']),
-            ('Val/CPM_MAE', val_metrics['metric_cpm_mae']),
-            ('Val/Persistence_MAE', val_metrics['metric_persistence_mae']),
-            ('Val/Trend_MAE', val_metrics['metric_trend_mae']),
+            (f'Val/H1_{horizon}_MAE', val_metrics[dyn_metric_key]),
+            (f'Val/Selection_H1_{horizon}', val_metrics[ckpt_metric_key]),
+            (f'Val/Persistence_H1_{horizon}_MAE', val_metrics[f'metric_persistence_h1_{horizon}']),
         ]
-        if dyn_metric_key in val_metrics:
-            tb_scalars.append(
-                (f'Val/Dynamics_MAE_H1_{dyn_metric_horizon}_Subject',
-                 val_metrics[dyn_metric_key]))
-        if 'metric_crps_dynamics' in val_metrics:
-            tb_scalars.append(('Val/Dynamics_CRPS',
-                               val_metrics['metric_crps_dynamics']))
-        if 'metric_energy_dynamics' in val_metrics:
-            tb_scalars.append(('Val/Dynamics_EnergyScore',
-                               val_metrics['metric_energy_dynamics']))
-        if 'metric_variogram_dynamics' in val_metrics:
-            tb_scalars.append(('Val/Dynamics_VariogramScore',
-                               val_metrics['metric_variogram_dynamics']))
-        for key in ('metric_temporal_variogram_p05', 'metric_probability_joint'):
+        for key, tag in (('metric_fc_pcc', 'Val/FC_PCC'),
+                         ('metric_fc_mse', 'Val/FC_MSE'),
+                         ('metric_fc_group_pcc', 'Val/FC_Group_PCC'),
+                         ('metric_freq_l1', 'Val/Freq_L1')):
             if key in val_metrics:
-                tb_scalars.append((f'Val/{key}', val_metrics[key]))
-        if 'loss_temporal_pcc' in train_metrics:
-            writer.add_scalar('Train/Temporal_PCC', train_metrics['loss_temporal_pcc'], epoch)
-        for key in ('loss_temporal_variogram', 'loss_probability_joint'):
-            if key in train_metrics:
-                writer.add_scalar(f'Train/{key}', train_metrics[key], epoch)
-        for h, key in sorted((h, f'rollout_mae_H{h}')
-                             for h in (eval_rollout_horizons or [])):
-            if key in val_metrics:
-                tb_scalars.append((f'Val/Rollout_MAE_H{h}', val_metrics[key]))
+                tb_scalars.append((tag, val_metrics[key]))
         for tag, val in tb_scalars:
             writer.add_scalar(tag, val, epoch)
         for name, lr in group_lrs.items():
             writer.add_scalar(f'LR/{name}', lr, epoch)
-        if 'loss_crps' in train_metrics:
-            writer.add_scalar('Train/CRPS', train_metrics['loss_crps'], epoch)
-        for tag, key in [('Train/Graph_Sparsity', 'graph_sparsity'),
-                          ('Train/Graph_Entropy', 'graph_entropy'),
-                          ('Train/Graph_Temporal', 'graph_temporal'),
-                          ('Train/RECC_Loss', 'recc_loss'),
-                          ('Train/Pair_RECC_Loss', 'pair_recc_loss'),
-                          ('Train/Router_Balance', 'router_balance'),
-                          ('Train/Router_ZLoss', 'router_zloss'),
-                          ('Train/Router_Entropy', 'router_entropy'),
-                          ('Train/Expert_Diversity', 'expert_diversity'),
-                          ('Train/Expert_DzCos', 'expert_dz_cos')]:
-            if key in train_metrics:
-                writer.add_scalar(tag, train_metrics[key], epoch)
-        for tag, key in [('Val/Router_Top1_Agreement', 'router_top1_agreement'),
-                         ('Val/Router_Top2_Recall', 'router_top2_recall'),
-                         ('Val/Router_Regret', 'router_regret'),
-                         ('Val/Router_Competence_Spearman', 'router_competence_spearman'),
-                         ('Val/Competence_Entropy', 'competence_entropy'),
-                         ('Val/Oracle_Best_Expert_Gap', 'oracle_best_expert_gap'),
-                         ('Val/Oracle_Best_Pair_Gap', 'oracle_best_pair_gap')]:
-            if key in val_metrics:
-                writer.add_scalar(tag, val_metrics[key], epoch)
         if criterion.weighting == 'uncertainty':
             # 可学习任务权重的收敛曲线
             for name, v in criterion.get_loss_weights().items():
@@ -1617,10 +1398,11 @@ def main(args):
         eval_dir = os.path.join(save_dir, 'eval')
         try:
             summary = _eval_variant(best_path, eval_dir, eval_splits=('test',),
-                                    seed=args.seed)
+                                    seed=args.seed, eval_rollout=False,
+                                    eval_fc=False)
             print(f"[post-train eval] test_PCC={summary.get('test_pcc')} "
-                  f"test_MAE={summary.get('test_mae')}")
-            print(f"[post-train eval] 详细指标见: {eval_dir}/metrics_test.json")
+                  f"test_MAE={summary.get('test_mae')}（仅单步；H1–8/FC 见训练日志）")
+            print(f"[post-train eval] 详细指标见: {eval_dir}/指标_测试集.json")
         except Exception as e:
             print(f"[post-train eval] 自动评估失败（训练产物不受影响）: {type(e).__name__}: {e}\n"
                   f"可手动复评: python -m analysis.evaluate --ckpt {best_path} --out_dir {eval_dir}")
@@ -1631,7 +1413,7 @@ def main(args):
 
 
 #: 微调的默认健康预训练起点；训练脚本也可用 HC_WEIGHT 显式覆盖。
-DEFAULT_PRETRAINED_WEIGHT = './checkpoints/neurotwin_pretrain/base_best.pt'
+DEFAULT_PRETRAINED_WEIGHT = './checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt'
 
 
 def parse_args():
@@ -1646,6 +1428,8 @@ def parse_args():
                    help='起点权重路径。finetune 必填；pretrain 一律留空。'
                         '省略时按历史入口回填 '
                         f'{DEFAULT_PRETRAINED_WEIGHT}。')
+    p.add_argument('--init_weight', default='',
+                   help='pretrain 可选热启动权重（仅加载兼容权重，不改变训练目标）。')
     p.add_argument('--save_training_state', action='store_true',
                    help='每个完整 epoch 后原子保存可续训状态 training_state.pt。')
     p.add_argument('--resume_training_state', default='',
@@ -1701,7 +1485,7 @@ def parse_args():
                    help='条件适配器（adapter）参数组的学习率缩放（历史键；'
                         '未设 --condition_lr_scale 时作为其回退值）。')
 
-    # ---------- 条件注入（docs/EXPERIMENTS.md）----------
+    # ---------- 条件注入（docs/实验结论与证据汇总.md）----------
     # default=None 是「未声明」哨兵，与显式 ``--condition_arm none`` 语义不同：
     # 未声明保持 legacy 行为（tfm_patho_mode 决定要不要建 HAMD FiLM），显式 none
     # 是「结构性地不建条件通路」，必须连 legacy FiLM 一起关掉（§三）。
@@ -1821,38 +1605,26 @@ def parse_args():
     p.add_argument('--tfm_one_step_hidden_dim', type=int, default=256,
                    help='TFM One-Step 状态转移头的 MLP 隐层宽度。')
     p.add_argument('--cpm_horizon', type=int, default=8,
-                   help='CPM 全 horizon 预测步数 H（方案 §8：推荐 {4,8,16}，'
-                        '首选 8）。')
-    p.add_argument('--train_supervision_horizon', type=int, default=0,
-                   help='仅限制训练 loss 的有效 horizon；0 保持完整输入范围，'
-                        '正数只监督 H1..Hn，不截短 CPM/ODE 前向、未来数据或验证。')
+                   help='Graph-ODE 预测步数 H；当前阶段固定为 8（H1–8），'
+                        '传入其他值会直接报错。')
     p.add_argument('--cpm_layers', type=int, default=2,
                    help='CPM ROI×Horizon 查询解码器的交叉注意力层数。')
     p.add_argument('--cpm_intervention', type=str2bool, default=False,
                    help='构建 future-known covariate（intervention lookahead）嵌入'
                         '接口（方案 §12.4/§13）。V1 默认关闭：无真实干预数据，'
                         '仅保留接口，不作为治疗预测任务训练（方案 §13.1）。')
-    p.add_argument('--lambda_one', type=float, default=1.0,
-                   help='TFM 损失：one-step Huber 项权重（方案 §20.1）。')
-    p.add_argument('--lambda_cpm', type=float, default=1.0,
-                   help='TFM 损失：CPM 轨迹项权重（0 可退化为纯 one-step 的 '
-                        '单步目标，方案 §24）。')
-    p.add_argument('--lambda_pcc', type=float, default=0.1,
-                   help='损失：spatial PCC 惩罚项权重（1 - 逐 ROI 空间相关）。')
-    p.add_argument('--cpm_gamma', type=float, default=1.0,
-                   help='CPM 逐 horizon 损失权重衰减 γ（w_h=γ^(h-1)；1=均匀，'
-                        '方案 §20.2）。须在 (0, 1] 内。')
-    p.add_argument('--cpm_huber_delta', type=float, default=1.0,
-                   help='TFM Huber 损失的过渡阈值 δ（原始空间 BOLD 量纲，'
-                        'z-score 后单位方差取 1.0）。')
+    p.add_argument('--lambda_rec', type=float, default=1.0,
+                   help='H1–8 重建 L1 的 warm-start 权重。')
+    p.add_argument('--lambda_fc', type=float, default=1.0,
+                   help='H1–8 FC 相关矩阵 MSE 的 warm-start 权重。')
+    p.add_argument('--lambda_freq', type=float, default=1.0,
+                   help='H1–8 rFFT 幅度 L1 的 warm-start 权重。')
     p.add_argument('--loss_weighting', default='uncertainty',
                    choices=['uncertainty', 'fixed'],
-                   help='任务损失聚合方式：uncertainty=同方差不确定性自动加权'
+                   help='三项损失的聚合方式：uncertainty=同方差不确定性自动加权'
                         '（Σ exp(-log_s_i)·L_i + log_s_i，log_s_i 为可学习参数，'
                         '初始有效权重等于对应 --lambda_*，Kendall et al. '
-                        'CVPR 2018）；fixed=固定权重（历史行为）。仅作用于 '
-                        'TFMDualLoss 的 one/CPM/dynamics/variance 四个任务项；'
-                        'SC 图正则等其余项仍由各自 λ 控制。')
+                        'CVPR 2018）；fixed=固定权重。')
 
     # ---------- One-Step 头病理条件模式 ----------
     p.add_argument('--tfm_patho_mode', default='film',
@@ -1883,12 +1655,6 @@ def parse_args():
                    help='采样/分桶随机种子（训练采样可复现；评估协议本身与随机性无关）。')
     p.add_argument('--subject_cache_size', type=int, default=256,
                    help='数据集每个 worker 的被试级缓存上限（0=不缓存）。')
-    p.add_argument('--eval_fc', type=str2bool, default=True,
-                   help='评估是否输出 FC 层面指标。')
-    p.add_argument('--eval_spectral', type=str2bool, default=False,
-                   help='评估是否输出 Welch PSD 低频段一致性指标（可选）。')
-    p.add_argument('--eval_spectral_tr', type=float, default=2.0,
-                   help='频谱评估使用的 TR（秒），默认 2.0 s（REST-meta-MDD 常用值）。')
 
     # ---------- Next-Timepoint Prediction（连续 BOLD → 下一 TR 全脑状态） ----------
     p.add_argument('--context_min', type=int, default=16,
@@ -1913,19 +1679,6 @@ def parse_args():
                         '评估协议对每个被试使用同一 K_eval 与确定性 anchor，禁止随机位置。')
     p.add_argument('--eval_anchors_per_subject', type=int, default=16,
                    help='每个被试评估的 next-state 预测点数量（等间隔确定性选取；0=枚举全部）。')
-    p.add_argument('--eval_anchor_min_future_steps', type=int, default=0,
-                   help='评估锚点必须拥有的完整未来步数；0 保持原 H8 协议。')
-    p.add_argument('--train_anchor_max_offset', type=int, default=0,
-                   help='训练锚点所需未来长度；0 使用 cpm_horizon，对照可统一为 32。')
-    p.add_argument('--eval_rollout_tasks_per_subject', type=int, default=2,
-                   help='每个被试参与 free rollout / FC / 频谱评估的 anchor 数（0=不做 rollout）。')
-    p.add_argument('--eval_rollout_horizons', default='1,2,4,8,16',
-                   help='free rollout 的评估 horizon 列表（逗号分隔）。')
-    p.add_argument('--eval_rollout_steps', type=int, default=0,
-                   help='单次 rollout 的滚动步数 R；0=自动取 max(horizons) 并在启用 FC/频谱时'
-                        '抬到 --fc_min_length（FC 需要更长的轨迹）。')
-    p.add_argument('--fc_min_length', type=int, default=32,
-                   help='FC/频谱评估所需的最小 rollout 长度（prompt §二十二；短于该长度不计算 FC）。')
     p.add_argument('--load_backbone_only', type=str2bool, default=False,
                    help='finetune 时只加载主干权重（预测头 / 条件模块保持随机初始化），'
                         '并显式打印 loaded/missing/reinitialized 清单。')
@@ -1950,6 +1703,12 @@ def parse_args():
     p.add_argument('--dynamics_history_memory', type=str2bool, default=False,
                    help='向量场加入固定历史记忆 FiLM（编码 token 的 patch 维均值，'
                         'rollout 期间不变；零初始化，默认 False 不构建模块）。')
+    p.add_argument('--state_feedback', type=str2bool, default=False,
+                   help='Graph-ODE 使用 BOLD 状态恢复项和带符号历史图反馈。')
+    p.add_argument('--spatial_profile', type=str2bool, default=False,
+                   help='增加保留 ROI 顺序的个体校准表示。')
+    p.add_argument('--condition_initial_state', type=str2bool, default=False,
+                   help='用条件 FiLM 调制初始隐状态。')
     p.add_argument('--calibration_length', type=int, default=0,
                    help='基线校准前缀长度（TR 数；bold_source=raw 时必须 >=1，'
                         '同时决定合法锚点下界与 calibration_bold 输出）。')
@@ -1957,46 +1716,6 @@ def parse_args():
                    help='控制序列 manifest CSV（表头 subject_id,controls_path；'
                         '相对路径相对 manifest 所在目录；NPZ 键 u，[T,F] 逐区间控制）。'
                         '空=无控制（controls=None，不伪造刺激标签）。')
-    p.add_argument('--lambda_dynamics', type=float, default=0.5,
-                   help='graph_ode 动态多步损失权重（h=2..H masked Huber+PCC；默认 0.5）。')
-    p.add_argument('--lambda_variance', type=float, default=0.05,
-                   help='方差读出高斯 NLL 损失权重（只更新 VarianceHead；默认 0.05）。')
-    # ---- P0 损失扩展：时间差分 / 双头一致性 / horizon 权重策略 ----
-    # 默认 λ=0、策略=gamma，与既有训练行为逐位一致；启用后为固定权重项，
-    # 不进入 weighting='uncertainty' 聚合（只作用于 one/CPM/dynamics/variance）。
-    p.add_argument('--loss_experiment_id', default='')
-    p.add_argument('--temporal_mode', choices=['standard', 'adaptive', 'multiscale'], default='standard')
-    p.add_argument('--temporal_lags', default='1')
-    p.add_argument('--temporal_scale_weights', default='1.0')
-    p.add_argument('--adaptive_delta_alpha', type=float, default=0.5)
-    p.add_argument('--adaptive_delta_clip', type=float, default=3.0)
-    p.add_argument('--adaptive_delta_scale', type=float, default=0.0,
-                   help='Positive fixed train-only scale; 0 estimates mean absolute delta on train subjects.')
-    p.add_argument('--dynamics_horizon_weight', type=str2bool, default=False)
-    p.add_argument('--horizon_weight_power', type=float, default=1.0)
-    p.add_argument('--lambda_temporal_pcc', type=float, default=0.0,
-                   help='Fixed weight for CPM+ODE future-trajectory temporal PCC; 0 disables. '
-                        'At least 3 valid future points and nonconstant targets are required.')
-    p.add_argument('--lambda_temporal_diff', type=float, default=0.0,
-                   help='P0 一阶时间差分 Huber 权重（CPM + graph_ode 轨迹，'
-                        '第一步参考真值历史末帧 x_t；0=禁用）。')
-    p.add_argument('--lambda_cross_head', type=float, default=0.0,
-                   help='P0 双预测头一致性权重（CPM 学生 ← sg(Graph-ODE) 教师；'
-                        '0=禁用，仅 graph_ode 路线生效）。')
-    p.add_argument('--cpm_horizon_weight', default='gamma',
-                   choices=['gamma', 'increasing'],
-                   help='CPM 逐 horizon 权重策略：gamma=γ^(h-1)（由 --cpm_gamma '
-                        '控制，默认）；increasing=远期递增 1+α(h-1)/(H-1)。')
-    p.add_argument('--cpm_horizon_alpha', type=float, default=0.5,
-                   help='--cpm_horizon_weight=increasing 时的 α（默认 0.5）。')
-    p.add_argument('--cross_head_start_epoch', type=int, default=0,
-                   help='双头一致性预热门控：epoch < 该值时暂不启用（默认 0=全程启用）。')
-    p.add_argument('--dynamics_metric_horizon', type=int,
-                   default=DYNAMICS_CKPT_HORIZON,
-                   help='graph_ode 选优指标覆盖的预测步数 N（H1..N，默认 8）；'
-                        '指标键名随 N 变化（metric_mae_dynamics_h1_N_subject），'
-                        '且只纳入具备完整 N 步真值的锚点。确定性 Graph-ODE 可自由推进'
-                        '超过 cpm_horizon，训练监督范围仍由 cpm_horizon 决定。')
 
 
     from model import load_model_config

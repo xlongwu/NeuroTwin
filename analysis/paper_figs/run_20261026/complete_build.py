@@ -453,7 +453,7 @@ def main(default_figure: str | None = None) -> None:
             '在上一批 13 张图的基础上补齐 F4、F13、F14 与 D6 附图，共 16 张主图及 1 张附图；保留全部真实输入、统计数据和中文图注。旧目录不覆盖。','',
             '新增计算复用 HC base、固定种子和原条件统计；HC/MDD 全 val 滚动评估使用全部锚点。历史块和 ROI 扰动仅描述模型结构性质，不作新的组间推断。F2 保持历史 H32 权重口径，其余 HC base H32 结果属于外推。','',
             '[全部图览](overview.png) · [新增图与图库示例对照](reference_comparison.png) · [检查记录](CHECKS.json)','',
-            '原方案中的“默认不执行”项在用户追加“执行完整可视化”后授权执行；设置见 [执行登记](../../../docs/VISUALIZATION_COMPLETION_PREREG.md)。','']
+            '原方案中的“默认不执行”项在用户追加“执行完整可视化”后授权执行；设置见 [执行登记](../../../docs/可视化复现设置.md)。','']
     rolling_summary={g:json_read(ns.infer_dir/f'rolling/{g}/summary_val.json') for g in ('hc','mdd')}
     history=pd.read_csv(ns.out_dir/'fig_f13_history_attribution.csv')
     last=history[history.block==8].groupby('segment').relative_mae_change_percent.mean()

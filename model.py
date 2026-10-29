@@ -51,19 +51,10 @@ CONTRACT_FIELDS = (
     (('architecture', 'personalized'), 'personalized'),
     (('architecture', 'profile_dim'), 'profile_dim'),
     (('architecture', 'dynamics_history_memory'), 'dynamics_history_memory'),
-    (('loss', 'lambda_one'), 'lambda_one'),
-    (('loss', 'lambda_cpm'), 'lambda_cpm'),
-    (('loss', 'lambda_pcc'), 'lambda_pcc'),
-    (('loss', 'lambda_dynamics'), 'lambda_dynamics'),
-    (('loss', 'lambda_variance'), 'lambda_variance'),
-    (('loss', 'lambda_temporal_diff'), 'lambda_temporal_diff'),
-    (('loss', 'lambda_cross_head'), 'lambda_cross_head'),
-    (('loss', 'cross_head_start_epoch'), 'cross_head_start_epoch'),
+    (('loss', 'lambda_rec'), 'lambda_rec'),
+    (('loss', 'lambda_fc'), 'lambda_fc'),
+    (('loss', 'lambda_freq'), 'lambda_freq'),
     (('loss', 'loss_weighting'), 'loss_weighting'),
-    (('loss', 'cpm_gamma'), 'cpm_gamma'),
-    (('loss', 'cpm_huber_delta'), 'cpm_huber_delta'),
-    (('loss', 'cpm_horizon_weight'), 'cpm_horizon_weight'),
-    (('loss', 'cpm_horizon_alpha'), 'cpm_horizon_alpha'),
     (('training', 'seed'), 'seed'),
     (('training', 'sampling_seed'), 'sampling_seed'),
     (('training', 'cond_dropout_seed'), 'cond_dropout_seed'),
@@ -195,8 +186,9 @@ def main():
     print(f'[model] dynamics_mode=graph_ode | history_memory='
           f'{model.dynamics_history_memory}')
     print(f'[model] 模型构建并 strict 加载成功 | 参数量={n_params}')
-    print(f'[model] λ_temporal_diff={cfg["loss"]["lambda_temporal_diff"]} | '
-          f'λ_cross_head={cfg["loss"]["lambda_cross_head"]}')
+    print(f'[model] λ_rec={cfg["loss"]["lambda_rec"]} | '
+          f'λ_fc={cfg["loss"]["lambda_fc"]} | '
+          f'λ_freq={cfg["loss"]["lambda_freq"]}')
     return 0
 
 

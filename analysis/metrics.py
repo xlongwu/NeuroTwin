@@ -103,6 +103,39 @@ def load_hamd_data(normalized_path: str, original_path: str) -> Dict[str, Dict[s
 #  §1 评估指标计算
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def autocorrelation(series: np.ndarray, lags: int = 5) -> np.ndarray:
+    """计算各 ROI 在指定滞后下的 Pearson 自相关，返回 [lags, ROI]。"""
+    result = []
+    for lag in range(1, lags + 1):
+        a, b = series[:-lag], series[lag:]
+        a, b = a - a.mean(axis=0), b - b.mean(axis=0)
+        denom = np.sqrt(np.sum(a * a, axis=0) * np.sum(b * b, axis=0))
+        result.append(np.divide(np.sum(a * b, axis=0), denom,
+                                out=np.full(denom.shape, np.nan), where=denom > 0))
+    return np.asarray(result)
+
+
+def gaussian_crps(mean: np.ndarray, std: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """计算高斯预测分布的逐元素连续排序概率得分。"""
+    from scipy.special import ndtr
+
+    if not np.isfinite(std).all() or np.any(std <= 0):
+        raise ValueError('Gaussian standard deviation must be finite and positive')
+    z = (target - mean) / std
+    return std * (z * (2 * ndtr(z) - 1) + 2 * np.exp(-z * z / 2) / np.sqrt(2 * np.pi) - 1 / np.sqrt(np.pi))
+
+
+def fc_similarity(left: List[np.ndarray], right: List[np.ndarray]) -> np.ndarray:
+    """计算两组 FC 边向量之间的 Pearson 相似度矩阵。"""
+    left, right = np.stack(left), np.stack(right)
+    left = left - left.mean(axis=1, keepdims=True)
+    right = right - right.mean(axis=1, keepdims=True)
+    denom = np.linalg.norm(left, axis=1)[:, None] * np.linalg.norm(right, axis=1)[None, :]
+    if np.any(denom == 0) or not np.isfinite(denom).all():
+        raise ValueError('Undefined FC fingerprint correlation')
+    return left @ right.T / denom
+
+
 def pearson_per_sample(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """计算每个样本的皮尔逊相关系数"""
     b = pred.shape[0]
