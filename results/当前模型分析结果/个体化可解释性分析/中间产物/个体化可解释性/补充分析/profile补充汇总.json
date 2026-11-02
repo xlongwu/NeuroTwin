@@ -1,0 +1,38 @@
+[
+  {
+    "group": "hc",
+    "subjects": 222,
+    "reference_norm": 5.403355121612549,
+    "observed_profile_norm_min": 5.446710586547852,
+    "observed_profile_norm_max": 5.641046524047852,
+    "reference_outside_test_range_dimensions": 27,
+    "profile_l2_distance_median": 0.36330917477607727,
+    "delta_mae_mean": -0.00010835997090907767,
+    "relative_output_median": 0.002539069624617696,
+    "later_pearson_median": 0.9984633384844495,
+    "between_subject_pearson_median": 0.9957571807835045,
+    "same_site_pearson_median": 0.9985842966326643,
+    "n_with_same_site_peer": 218,
+    "later_cosine_median": 0.9984686620410766,
+    "n_with_later_segments": 222,
+    "max_cached_profile_difference": 0.0
+  },
+  {
+    "group": "mdd",
+    "subjects": 225,
+    "reference_norm": 5.406352996826172,
+    "observed_profile_norm_min": 5.441821575164795,
+    "observed_profile_norm_max": 5.642752170562744,
+    "reference_outside_test_range_dimensions": 27,
+    "profile_l2_distance_median": 0.3869461715221405,
+    "delta_mae_mean": -0.00014799008204136044,
+    "relative_output_median": 0.00203645508736372,
+    "later_pearson_median": 0.9984395060782791,
+    "between_subject_pearson_median": 0.9943945196732783,
+    "same_site_pearson_median": 0.9985470891533788,
+    "n_with_same_site_peer": 222,
+    "later_cosine_median": 0.9984694064612709,
+    "n_with_later_segments": 225,
+    "max_cached_profile_difference": 0.0
+  }
+]

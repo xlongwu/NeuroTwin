@@ -1,0 +1,20 @@
+{
+  "gate": "B4 校准质量门槛（v2 §7 触发器 T1）",
+  "split": "val",
+  "group": "hc",
+  "n_subjects": 222,
+  "criteria": {
+    "min_improvement": 0.01,
+    "alpha": 0.01,
+    "n_perm": 10000,
+    "seed": 2024,
+    "test": "被试级配对符号翻转置换（单侧，H1: 模型 MAE 更低）"
+  },
+  "mae_model_subject_equal_weight": 0.09291805239404721,
+  "mae_persistence_subject_equal_weight": 0.6048402589297084,
+  "improvement": 0.8463758802060071,
+  "permutation_p": 9.999000099990002e-05,
+  "passed": true,
+  "action_on_fail": "停止偏离分析，回到方向重议（唯一预登记例外）；不得继续 fit/score 与组间检验。",
+  "source": "results/H1-8分析_20261028/02_病理分析/滚动缓存_健康对照/hc/逐被试_ROI误差_验证集.npz"
+}

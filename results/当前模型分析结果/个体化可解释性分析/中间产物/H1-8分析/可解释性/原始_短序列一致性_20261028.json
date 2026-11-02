@@ -1,0 +1,22 @@
+{
+  "hc": {
+    "n_subjects": 222,
+    "chance_identification": 0.0045045045045045045,
+    "pca_variance_ratio": [
+      0.7419665455818176,
+      0.24357229471206665
+    ],
+    "identity": "within group, first-anchor predicted H1–8 FC vs observed H1–8 FC; 6670 edges",
+    "profile": "first 32 vs second 32 TR within same scan; not longitudinal repeatability"
+  },
+  "mdd": {
+    "n_subjects": 225,
+    "chance_identification": 0.0044444444444444444,
+    "pca_variance_ratio": [
+      0.7979283928871155,
+      0.19486196339130402
+    ],
+    "identity": "within group, first-anchor predicted H1–8 FC vs observed H1–8 FC; 6670 edges",
+    "profile": "first 32 vs second 32 TR within same scan; not longitudinal repeatability"
+  }
+}

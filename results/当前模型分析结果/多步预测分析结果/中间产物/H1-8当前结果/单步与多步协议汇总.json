@@ -1,0 +1,250 @@
+{
+  "_meta": {
+    "purpose": "把滚动单步（项目主协议）与固定锚点 H1–8（多步能力）分开报告",
+    "single_step_note": "单步是固定锚点协议的 H1，也是滚动协议的逐点预测；单 TR 无法定义 FC，FC 只出现在 8 步窗口或完整序列协议中"
+  },
+  "protocols": {
+    "rolling_one_step": {
+      "HC": {
+        "definition": "每个 TR 用真实观测历史预测下一点并拼接为完整序列；MAE/MSE 为逐点误差，时间 PCC 逐 ROI 沿完整序列计算，FC 在完整预测序列上计算。不是自主生成。",
+        "n_subjects": 222,
+        "mae_subject_equal": 0.09040579944849014,
+        "persistence_mae_subject_equal": 0.6003661155700684,
+        "improvement_vs_persistence": 0.8494164347648621,
+        "delta_corr_subject_equal": 0.9887963468468468,
+        "cache": {
+          "n_subjects_from_cache": 222,
+          "mae_subject_equal": 0.09040579595911226,
+          "mse_subject_equal": 0.014421810793434195,
+          "rmse_subject_equal_mean_of_subject_rmse": 0.11693240258546082,
+          "temporal_pcc_subject_equal": 0.9956359273288803,
+          "amplitude_ratio_subject_equal": 1.0214059437802772
+        },
+        "full_sequence_fc": {
+          "fc_edge_pcc": 0.997471760671168,
+          "fc_mae": 0.01400187642923301,
+          "fc_rmse": 0.01770457489433316,
+          "n_subjects": 222
+        }
+      },
+      "MDD": {
+        "definition": "每个 TR 用真实观测历史预测下一点并拼接为完整序列；MAE/MSE 为逐点误差，时间 PCC 逐 ROI 沿完整序列计算，FC 在完整预测序列上计算。不是自主生成。",
+        "n_subjects": 225,
+        "mae_subject_equal": 0.09203136712312698,
+        "persistence_mae_subject_equal": 0.5968939661979675,
+        "improvement_vs_persistence": 0.8467472195625305,
+        "delta_corr_subject_equal": 0.9883176800000001,
+        "cache": {
+          "n_subjects_from_cache": 225,
+          "mae_subject_equal": 0.09203136655045233,
+          "mse_subject_equal": 0.015493810917523169,
+          "rmse_subject_equal_mean_of_subject_rmse": 0.11940821105704785,
+          "temporal_pcc_subject_equal": 0.9952244736340086,
+          "amplitude_ratio_subject_equal": 1.0200528538947358
+        },
+        "full_sequence_fc": {
+          "fc_edge_pcc": 0.9972151711169847,
+          "fc_mae": 0.014553355475417876,
+          "fc_rmse": 0.018421421341404683,
+          "n_subjects": 225
+        }
+      }
+    },
+    "fixed_anchor_multi_step": {
+      "HC": {
+        "single_step_H1": {
+          "definition": "单个 K64 锚点预测 t+1；空间 PCC 为同一步跨 116 ROI 的 Pearson 相关",
+          "n_subjects": 222,
+          "n_tasks": 1776,
+          "mae": 0.09064802462309349,
+          "mse": 0.013370208555694546,
+          "rmse": 0.11562961798645945,
+          "pcc_spatial": 0.9937984266839311,
+          "r2": 0.9840466649396516,
+          "direction_accuracy": 0.9729154540000887,
+          "variance_ratio": 1.0352286756137918
+        },
+        "multi_step_H1_8": {
+          "definition": "单个 K64 锚点一次前向输出 H1–8，未来真值不反馈；空间 PCC 为每个时点跨 116 ROI 的 Pearson 相关，FC 在预测/真实 8 步序列上计算（单 TR 无 FC）",
+          "per_horizon": {
+            "H1": {
+              "mae": 0.09064802462309349,
+              "mse": 0.013370208555694546,
+              "rmse": 0.11562961798645945,
+              "pcc_spatial": 0.9937984266839311,
+              "direction_accuracy": 0.9729154540000887
+            },
+            "H2": {
+              "mae": 0.25461098851865865,
+              "mse": 0.10468901765882185,
+              "rmse": 0.32355682292113985,
+              "pcc_spatial": 0.9507447562907144,
+              "direction_accuracy": 0.9222648145625653
+            },
+            "H3": {
+              "mae": 0.4621486863512778,
+              "mse": 0.341322010808287,
+              "rmse": 0.5842277045881058,
+              "pcc_spatial": 0.8422043890122192,
+              "direction_accuracy": 0.8932012160240715
+            },
+            "H4": {
+              "mae": 0.6025030271857756,
+              "mse": 0.5727065934790476,
+              "rmse": 0.7567738060206944,
+              "pcc_spatial": 0.7375749227636218,
+              "direction_accuracy": 0.883222245450519
+            },
+            "H5": {
+              "mae": 0.6452762528367468,
+              "mse": 0.652357790488169,
+              "rmse": 0.8076866907954897,
+              "pcc_spatial": 0.7120497523668393,
+              "direction_accuracy": 0.8363702290107622
+            },
+            "H6": {
+              "mae": 0.6664325611251118,
+              "mse": 0.6994960181260886,
+              "rmse": 0.8363587855257387,
+              "pcc_spatial": 0.6753990580960242,
+              "direction_accuracy": 0.7489071963142682
+            },
+            "H7": {
+              "mae": 0.7422967631278288,
+              "mse": 0.8725610083729153,
+              "rmse": 0.9341097410759163,
+              "pcc_spatial": 0.5581168803607712,
+              "direction_accuracy": 0.690286457935772
+            },
+            "H8": {
+              "mae": 0.8110229279681099,
+              "mse": 1.0396800024148882,
+              "rmse": 1.0196469989240826,
+              "pcc_spatial": 0.4285731330597367,
+              "direction_accuracy": 0.6523907895409721
+            }
+          },
+          "aggregate_H1_8": {
+            "mae": 0.5343674039670753,
+            "mse": 0.4519184100837215,
+            "rmse": 0.6722487709797033,
+            "pcc_spatial": 0.7373076648292322,
+            "r2": 0.38775626780549416,
+            "direction_accuracy": 0.8249448003548774,
+            "variance_ratio": 0.6593576132957766
+          },
+          "aggregate_H2_8_equal_horizon_mean": {
+            "mae": 0.5977558867305014,
+            "pcc_spatial": 0.7006661274214181,
+            "direction_accuracy": 0.8038061355484185,
+            "note": "H2–H8 逐 horizon 指标的等权平均，仅用于与 H1 单步对照"
+          },
+          "fc_H1_8": {
+            "fc_mse": 0.2446458665528209,
+            "fc_edge_pcc": 0.603447793152284,
+            "fc_group_pcc": 0.9823679430728672,
+            "freq_l1": 0.3623763074141902,
+            "n_subjects": 222
+          }
+        }
+      },
+      "MDD": {
+        "single_step_H1": {
+          "definition": "单个 K64 锚点预测 t+1；空间 PCC 为同一步跨 116 ROI 的 Pearson 相关",
+          "n_subjects": 225,
+          "n_tasks": 1800,
+          "mae": 0.0919689059750773,
+          "mse": 0.013793132204696804,
+          "rmse": 0.11744416632892757,
+          "pcc_spatial": 0.9935208385771521,
+          "r2": 0.9835228188987406,
+          "direction_accuracy": 0.971882648714986,
+          "variance_ratio": 1.0309685920235616
+        },
+        "multi_step_H1_8": {
+          "definition": "单个 K64 锚点一次前向输出 H1–8，未来真值不反馈；空间 PCC 为每个时点跨 116 ROI 的 Pearson 相关，FC 在预测/真实 8 步序列上计算（单 TR 无 FC）",
+          "per_horizon": {
+            "H1": {
+              "mae": 0.0919689059750773,
+              "mse": 0.013793132204696804,
+              "rmse": 0.11744416632892757,
+              "pcc_spatial": 0.9935208385771521,
+              "direction_accuracy": 0.971882648714986
+            },
+            "H2": {
+              "mae": 0.256873548974594,
+              "mse": 0.10711923135989432,
+              "rmse": 0.327290744384705,
+              "pcc_spatial": 0.9492842415954236,
+              "direction_accuracy": 0.9210953082517714
+            },
+            "H3": {
+              "mae": 0.4617886493908489,
+              "mse": 0.3427293532578974,
+              "rmse": 0.585430912455003,
+              "pcc_spatial": 0.8390527258447424,
+              "direction_accuracy": 0.8930277890092103
+            },
+            "H4": {
+              "mae": 0.5957737322483221,
+              "mse": 0.5625402065779602,
+              "rmse": 0.7500268039063406,
+              "pcc_spatial": 0.7388083362012499,
+              "direction_accuracy": 0.8802075987821971
+            },
+            "H5": {
+              "mae": 0.6394474763394338,
+              "mse": 0.6410771321085029,
+              "rmse": 0.8006729245506575,
+              "pcc_spatial": 0.7104743900685621,
+              "direction_accuracy": 0.830584283746805
+            },
+            "H6": {
+              "mae": 0.6671905286215501,
+              "mse": 0.7022940624834342,
+              "rmse": 0.8380298696845084,
+              "pcc_spatial": 0.6734292320886148,
+              "direction_accuracy": 0.7453052412209488
+            },
+            "H7": {
+              "mae": 0.7417189960215463,
+              "mse": 0.87455776326947,
+              "rmse": 0.9351779313421965,
+              "pcc_spatial": 0.5595083929862542,
+              "direction_accuracy": 0.6933458885454121
+            },
+            "H8": {
+              "mae": 0.8017868166020486,
+              "mse": 1.0195292779534917,
+              "rmse": 1.009717424804332,
+              "pcc_spatial": 0.4359299785590006,
+              "direction_accuracy": 0.6551888777112503
+            }
+          },
+          "aggregate_H1_8": {
+            "mae": 0.5320685817716776,
+            "mse": 0.4495351797551444,
+            "rmse": 0.6704738471820839,
+            "pcc_spatial": 0.737501016990125,
+            "r2": 0.4011804198771339,
+            "direction_accuracy": 0.8238297044978227,
+            "variance_ratio": 0.6585960824607775
+          },
+          "aggregate_H2_8_equal_horizon_mean": {
+            "mae": 0.5949399640283348,
+            "pcc_spatial": 0.7009267567634068,
+            "direction_accuracy": 0.8026792838953708,
+            "note": "H2–H8 逐 horizon 指标的等权平均，仅用于与 H1 单步对照"
+          },
+          "fc_H1_8": {
+            "fc_mse": 0.24677380392741827,
+            "fc_edge_pcc": 0.6012320682903131,
+            "fc_group_pcc": 0.9828809701310263,
+            "freq_l1": 0.3589042904559109,
+            "n_subjects": 225
+          }
+        }
+      }
+    }
+  }
+}

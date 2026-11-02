@@ -1,0 +1,33 @@
+{
+  "group": "hc",
+  "split": "test",
+  "n_subjects_cached": 222,
+  "n_subjects_this_split": 222,
+  "anchor_total": 25264,
+  "anchors_per_subject_min_median_max": [
+    86,
+    86,
+    176
+  ],
+  "deadzone": 0.05,
+  "min_points": 8,
+  "mae_model_subject_equal_weight": 0.09040579944849014,
+  "mae_persistence_subject_equal_weight": 0.6003661155700684,
+  "improvement_subject_equal_weight": 0.8494164347648621,
+  "improvement_median": 0.8536003232002258,
+  "dir_acc_mean": 0.9725716486486485,
+  "delta_corr_mean": 0.9887963468468468,
+  "delta_corr_valid_fraction_mean": 1.0,
+  "manifest_protocol": {
+    "checkpoint_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc",
+    "context_length": 64,
+    "calibration_length": 32,
+    "bold_source": "raw",
+    "graph_source": "history_fc",
+    "anchor_rule": "全部合法锚点 t∈[max(K-1,calib-1), T-2]，不抽稀",
+    "dtype": "float32",
+    "deadzone": 0.05,
+    "min_points": 8
+  },
+  "note": "CSV/summary/ROI-MAE 矩阵均已按该 split 的划分名单过滤；B3/B4 直接消费 ROI-MAE 矩阵。"
+}

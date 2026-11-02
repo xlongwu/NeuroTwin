@@ -1,0 +1,14 @@
+{
+  "HC": {
+    "n_subjects": 222,
+    "n_samples": 222,
+    "anchor": "first K64; predict H1–8",
+    "checkpoint_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc"
+  },
+  "MDD": {
+    "n_subjects": 225,
+    "n_samples": 225,
+    "anchor": "first K64; predict H1–8",
+    "checkpoint_sha256": "f89f57026bb789b0fb8e131a8042e7f220b2e2e827521b988ff3398806ecf4ac"
+  }
+}

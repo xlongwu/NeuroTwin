@@ -1,0 +1,16 @@
+{
+  "comparison": "HC val vs HC test",
+  "n_val": 222,
+  "n_test": 222,
+  "n_shared_sites": 38,
+  "n_val_in_shared_sites": 220,
+  "n_test_in_shared_sites": 210,
+  "n_perm": 10000,
+  "seed": 2024,
+  "fdr_q": 0.05,
+  "roi_significant": 0,
+  "network_significant": 0,
+  "passed_roi_negative_control": true,
+  "statistic": "within-site mean difference weighted by site size / total cohort size; val minus test",
+  "single_group_sites": "excluded from permutation statistic"
+}

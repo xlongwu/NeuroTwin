@@ -1,0 +1,17 @@
+{
+  "scope": "each group first test subject, first anchor, ROI 1, repeat 1; separate single-sample GPU replay",
+  "groups": {
+    "hc": {
+      "other_roi_unchanged": true,
+      "last_frame_unchanged": true,
+      "saved_vs_replay_max_abs": 4.76837158203125e-07,
+      "effective_graph_max_abs_change": 0.07738731056451797
+    },
+    "mdd": {
+      "other_roi_unchanged": true,
+      "last_frame_unchanged": true,
+      "saved_vs_replay_max_abs": 4.76837158203125e-07,
+      "effective_graph_max_abs_change": 0.09365417808294296
+    }
+  }
+}

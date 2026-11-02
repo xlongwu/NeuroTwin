@@ -1485,7 +1485,7 @@ def parse_args():
                    help='条件适配器（adapter）参数组的学习率缩放（历史键；'
                         '未设 --condition_lr_scale 时作为其回退值）。')
 
-    # ---------- 条件注入（docs/实验结论与证据汇总.md）----------
+    # ---------- 条件注入（docs/分析结果/实验结论与证据汇总.md）----------
     # default=None 是「未声明」哨兵，与显式 ``--condition_arm none`` 语义不同：
     # 未声明保持 legacy 行为（tfm_patho_mode 决定要不要建 HAMD FiLM），显式 none
     # 是「结构性地不建条件通路」，必须连 legacy FiLM 一起关掉（§三）。

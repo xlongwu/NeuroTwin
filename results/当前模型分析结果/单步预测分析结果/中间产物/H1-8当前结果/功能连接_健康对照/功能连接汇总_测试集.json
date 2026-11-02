@@ -1,0 +1,53 @@
+{
+  "split": "test",
+  "group": "hc",
+  "n_subjects": 222,
+  "checkpoint": "checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt",
+  "checkpoint_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc",
+  "split_file": "data/subject_split_pretrain.json",
+  "split_file_sha256": "d81c7dff86415364bff026af5634cb419f1202e31ff56ae258a61e795611e5d7",
+  "protocol": {
+    "prediction": "ODE lag-1, true observed history refreshed at every anchor",
+    "context_length": 64,
+    "calibration_length": 32,
+    "bold_source": "raw",
+    "graph_source": "history_fc",
+    "fc": "signed temporal Pearson FC; strict upper triangle excluding diagonal",
+    "correlation": "Pearson across FC edges within each subject",
+    "aggregation": "equal subject weight; population SD; invalid values excluded and counted",
+    "constant_roi": "incident edges excluded, undefined FC correlation reported as NaN",
+    "limitation": "Rolling one-step FC fidelity does not measure autonomous generation fidelity"
+  },
+  "timepoints": {
+    "n_valid": 222,
+    "mean": 113.8018018018018,
+    "std": 35.308631468990264,
+    "median": 86.0,
+    "min": 86.0,
+    "max": 176.0
+  },
+  "fc_pcc": {
+    "n_valid": 222,
+    "mean": 0.997471760671168,
+    "std": 0.00151170626628026,
+    "median": 0.9977775574901486,
+    "min": 0.9865761152737071,
+    "max": 0.9992913768132544
+  },
+  "fc_mae": {
+    "n_valid": 222,
+    "mean": 0.01400187642923301,
+    "std": 0.003375810143958037,
+    "median": 0.013663344337946044,
+    "min": 0.00793256583811712,
+    "max": 0.03244318582718098
+  },
+  "fc_rmse": {
+    "n_valid": 222,
+    "mean": 0.01770457489433316,
+    "std": 0.004198077737545031,
+    "median": 0.01733925705859292,
+    "min": 0.010745387383613261,
+    "max": 0.03991236315061177
+  }
+}

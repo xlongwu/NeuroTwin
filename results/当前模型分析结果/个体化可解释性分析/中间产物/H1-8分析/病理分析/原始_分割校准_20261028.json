@@ -1,0 +1,11 @@
+{
+  "split": "HC train only; shuffled sorted IDs",
+  "seed": 2024,
+  "fit_n": 1422,
+  "calibration_n": 356,
+  "alpha": 0.1,
+  "rank_1_based": 322,
+  "n_rois": 116,
+  "interpretation": "absolute residual split conformal; conditional on exchangeability; no test coverage evaluated",
+  "separate_from": "all-HC-train z reference used for existing group tests"
+}

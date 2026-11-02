@@ -1,0 +1,14 @@
+{
+  "analysis": "static FC ridge",
+  "split": "train only",
+  "n_hc": 1778,
+  "n_mdd": 1803,
+  "n_features": 6670,
+  "folds": 5,
+  "seed": 2024,
+  "fold_assignment": "within site and group, seeded shuffled round-robin",
+  "alpha": 1.0,
+  "solver": "lsqr",
+  "oof_auc": 0.5660360466588931,
+  "limitation": "train-only OOF; no independent test-set AUC; exploratory baseline, not model selection"
+}

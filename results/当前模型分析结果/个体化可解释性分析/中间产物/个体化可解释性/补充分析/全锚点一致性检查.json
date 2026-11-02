@@ -1,0 +1,16 @@
+{
+  "hc": {
+    "subjects": 222,
+    "anchors_per_subject": 7,
+    "baseline_h1_max_abs": 0.0,
+    "perturbed_h1_max_abs": 0.0,
+    "first_anchor_h18_max_abs": 0.0
+  },
+  "mdd": {
+    "subjects": 225,
+    "anchors_per_subject": 7,
+    "baseline_h1_max_abs": 0.0,
+    "perturbed_h1_max_abs": 0.0,
+    "first_anchor_h18_max_abs": 0.0
+  }
+}

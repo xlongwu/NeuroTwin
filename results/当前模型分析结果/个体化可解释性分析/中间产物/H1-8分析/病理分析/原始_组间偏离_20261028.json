@@ -1,0 +1,38 @@
+{
+  "n_pairs": 1504,
+  "n_sites": 36,
+  "n_perm": 10000,
+  "n_boot": 10000,
+  "seed": 2024,
+  "roi_significant": 0,
+  "network_significant": 0,
+  "max_abs_delta_z": 0.09967188558886769,
+  "whole_brain": {
+    "delta_z": -0.02004126556678199,
+    "p": 0.17578242175782421,
+    "ci_low": -0.04894725671209245,
+    "ci_high": 0.009148416979058945
+  },
+  "dispersion_variance_ratio": 1.0224657308370013,
+  "dispersion_p": 0.9056094390560944,
+  "dispersion_test": "two-sided matched-pair label swaps; absolute log variance ratio",
+  "unmatched": [
+    {
+      "split": "all",
+      "n_hc": 2222,
+      "n_mdd": 2253,
+      "n_hc_shared_sites": 2057,
+      "n_mdd_shared_sites": 2253,
+      "n_roi_fdr": 0
+    },
+    {
+      "split": "test",
+      "n_hc": 222,
+      "n_mdd": 225,
+      "n_hc_shared_sites": 210,
+      "n_mdd_shared_sites": 219,
+      "n_roi_fdr": 0
+    }
+  ],
+  "caveat": "matched pairs span train/val/test; HC train scores are cross-fitted, not independent test-only"
+}

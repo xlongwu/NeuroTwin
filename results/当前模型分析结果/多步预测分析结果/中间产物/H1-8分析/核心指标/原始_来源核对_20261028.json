@@ -1,0 +1,46 @@
+{
+  "hc": {
+    "checkpoint_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc",
+    "split_sha256": "d81c7dff86415364bff026af5634cb419f1202e31ff56ae258a61e795611e5d7",
+    "fc_checkpoint_hash_matches": true,
+    "fc_split_hash_matches": true,
+    "n_test": 222,
+    "fc_n_subjects": 222
+  },
+  "mdd": {
+    "checkpoint_sha256": "f89f57026bb789b0fb8e131a8042e7f220b2e2e827521b988ff3398806ecf4ac",
+    "split_sha256": "83b41b07ceb1a1dd9da7937fce29f619822187d5097c0f3a5db6593b50b23695",
+    "fc_checkpoint_hash_matches": true,
+    "fc_split_hash_matches": true,
+    "n_test": 225,
+    "fc_n_subjects": 225
+  },
+  "健康对照": {
+    "test_subject_set_matches": true,
+    "manifest_condition_group": "hc3",
+    "checkpoint_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc"
+  },
+  "抑郁症_健康参照": {
+    "test_subject_set_matches": true,
+    "manifest_condition_group": "hc3",
+    "checkpoint_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc"
+  },
+  "抑郁症_微调": {
+    "test_subject_set_matches": true,
+    "manifest_condition_group": "hc3",
+    "checkpoint_sha256": "f89f57026bb789b0fb8e131a8042e7f220b2e2e827521b988ff3398806ecf4ac"
+  },
+  "mdd_condition_audit": {
+    "subject": "IS001-1-0001",
+    "actual_condition_group_recomputed": "mdd8",
+    "max_abs_prediction_difference": 1.6689300537109375e-06,
+    "scope": "single subject; not proof for all cached subjects"
+  },
+  "mdd_condition_aggregate_audit": {
+    "n_subjects": 225,
+    "measure": "per-subject lag-1 MAE: mdd8 B5 full-condition rerun versus existing rolling cache subject summary",
+    "max_abs_difference": 5.011252525999321e-07,
+    "mean_abs_difference": 2.51817031961532e-07,
+    "limitation": "MAE agreement does not prove equality of all per-anchor predictions"
+  }
+}

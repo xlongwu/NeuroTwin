@@ -1,0 +1,13 @@
+{
+  "n_pairs": 1504,
+  "fit_hc_train": 1778,
+  "n_perm": 10000,
+  "n_boot": 10000,
+  "seed": 2024,
+  "roi_significant": 0,
+  "negative_control_roi_significant": 0,
+  "max_abs_delta": 0.0595468770013665,
+  "model_t2_increment": false,
+  "baseline": "six history descriptors; first 64 TR; HC-train reference",
+  "limitation": "HC train subjects are scored in-sample for descriptor reference; model HC train z is cross-fitted"
+}

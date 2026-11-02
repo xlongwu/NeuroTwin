@@ -1,0 +1,15 @@
+{
+  "subjects": 1,
+  "samples": 2784,
+  "elapsed_seconds": 6.2,
+  "cpu_gpu_baseline_max_abs": 9.5367431640625e-07,
+  "indices_block_and_final_value_checks": "passed",
+  "prediction_shape": [
+    8,
+    116,
+    3,
+    116
+  ],
+  "finite": "passed",
+  "note": "single GPU pilot, approximate runtime, no analysis effects evaluated"
+}

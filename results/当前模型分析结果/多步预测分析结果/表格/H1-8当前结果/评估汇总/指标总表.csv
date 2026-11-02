@@ -1,0 +1,61 @@
+category,metric,protocol,aggregation,HC,MDD,direction,unit,definition,n_subjects_HC,n_subjects_MDD
+core,mae_h1,fixed_anchor_H1,subject_mean,0.09064802462309349,0.0919689059750773,down,BOLD units,固定锚点 H1 单步；逐 ROI/时点后按被试等权,222,225
+core,mse_h1,fixed_anchor_H1,subject_mean,0.013370208555694546,0.013793132204696804,down,BOLD^2,固定锚点 H1 单步,222,225
+core,pcc_spatial_h1,fixed_anchor_H1,subject_mean,0.9937984266839311,0.9935208385771521,up,unitless,同一时点跨 116 ROI 的 Pearson r,222,225
+core,r2_h1,fixed_anchor_H1,subject_mean,0.9840466649396516,0.9835228188987406,up,unitless,相对逐 ROI 均值的解释方差,222,225
+core,direction_accuracy_h1,fixed_anchor_H1,subject_mean,0.9729154540000887,0.971882648714986,up,fraction,相邻帧一阶差分符号一致率，|Δy|<=0.05 不计,222,225
+core,variance_ratio_h1,fixed_anchor_H1,subject_mean,1.0352286756137918,1.0309685920235616,closer_to_one,ratio,预测方差 / 真实方差,222,225
+core,mae_h1_8,fixed_anchor_H1_8,subject_mean,0.5343674039670753,0.5320685817716776,down,BOLD units,固定锚点 H1–8；单 anchor 一次前向，未来真值不反馈；逐时点后按被试等权,222,225
+core,mse_h1_8,fixed_anchor_H1_8,subject_mean,0.4519184100837215,0.4495351797551444,down,BOLD^2,固定锚点 H1–8,222,225
+core,rmse_h1_8,fixed_anchor_H1_8,subject_mean,0.6722487709797033,0.6704738471820839,down,BOLD units,固定锚点 H1–8,222,225
+core,pcc_spatial_h1_8,fixed_anchor_H1_8,subject_mean,0.7373076648292322,0.737501016990125,up,unitless,每个时点跨 116 ROI 的 Pearson r,222,225
+core,r2_h1_8,fixed_anchor_H1_8,subject_mean,0.38775626780549416,0.4011804198771339,up,unitless,H1–8 相对逐 ROI 均值的解释方差,222,225
+core,direction_accuracy_h1_8,fixed_anchor_H1_8,subject_mean,0.8249448003548774,0.8238297044978227,up,fraction,相邻帧一阶差分符号一致率，|Δy|<=0.05 不计,222,225
+core,variance_ratio_h1_8,fixed_anchor_H1_8,subject_mean,0.6593576132957766,0.6585960824607775,closer_to_one,ratio,预测方差 / 真实方差,222,225
+fc,fc_mse,fixed_anchor_H1_8,subject_mean,0.2446458665528209,0.24677380392741827,down,unitless,预测/真实 8 步序列 Pearson FC 非对角边 MSE,222,225
+fc,fc_edge_pcc,fixed_anchor_H1_8,subject_mean,0.603447793152284,0.6012320682903131,up,unitless,"每个 anchor 的 FC 上三角 6,670 条边 Pearson r，再按被试等权",222,225
+fc,fc_group_pcc,fixed_anchor_H1_8,subject_mean,0.9823679430728672,0.9828809701310263,up,unitless,"先跨 anchor 平均 FC，再比较 6,670 条边",222,225
+fc,freq_l1,fixed_anchor_H1_8,subject_mean,0.3623763074141902,0.3589042904559109,down,unitless,8 步正交 rFFT 幅度谱 L1；训练项同口径，不是 Welch PSD,222,225
+fc,median_subject_edge_r,fixed_anchor_H1_8,median_subject,0.7461909934581681,0.7459162167532764,up,unitless,按单 anchor FC 边 r 的中位被试，其 8 anchor 平均 FC 的边 r,222,225
+fc,rolling_subject_edge_r_mean,rolling_full_sequence,subject_mean,0.997471760671168,0.9972151711169847,up,unitless,每个被试整段预测/真实序列的 FC 边 r，再等权平均,222,225
+rolling,mae,rolling_one_step,subject_mean,0.09040579944849014,0.09203136712312698,down,BOLD units,每个 TR 用真实历史预测下一点；被试等权,222,225
+rolling,persistence_mae,rolling_one_step,subject_mean,0.6003661155700684,0.5968939661979675,down,BOLD units,同一锚点用 x_t 作为预测,222,225
+rolling,improvement_vs_persistence,rolling_one_step,subject_mean,0.8494164347648621,0.8467472195625305,up,fraction,1 - MAE_model / MAE_persistence,222,225
+rolling,delta_corr,rolling_one_step,subject_mean,0.9887963468468468,0.9883176800000001,up,unitless,预测变化与真实变化的逐 ROI 相关,222,225
+rolling,temporal_pcc,rolling_full_sequence,subject_mean,0.9956359273288803,0.9952244736340086,up,unitless,沿完整序列逐 ROI 的时间 Pearson r，再按被试等权,222,225
+rolling,full_sequence_fc_edge_pcc,rolling_full_sequence,subject_mean,0.997471760671168,0.9972151711169847,up,unitless,"整段预测/真实序列 FC 上三角 6,670 条边 Pearson r",222,225
+psd,psd_shape_r,fixed_anchor_H1_8,per_anchor,0.907321987482046,0.9024923103044308,up,unitless,逐 ROI 在非 DC 频点上的谱形 Pearson r，再对 ROI/被试平均,222,225
+psd,psd_roi_r,fixed_anchor_H1_8,per_anchor,0.20777880643468805,0.19594816359417977,up,unitless,逐频点跨 116 ROI 的归一化功率分布相关，再对频点/被试平均,222,225
+psd,psd_mae_norm,fixed_anchor_H1_8,per_anchor,0.07018467047732105,0.07188595668412745,down,unitless,逐 ROI 归一化 PSD 的 MAE,222,225
+psd,psd_mae_log10,fixed_anchor_H1_8,per_anchor,0.5642746970275635,0.5714941259390778,down,decades,非 DC 频点 log10 PSD 的 MAE；对高频误差更敏感,222,225
+psd,rel_band_power_mae,fixed_anchor_H1_8,per_anchor,0.13509280008247104,0.13822862496599556,down,fraction,0.01–0.1 Hz 相对功率 MAE,222,225
+psd,psd_shape_r,fixed_anchor_H1_8,subject_average,0.9930372241262538,0.9916501131572596,up,unitless,逐 ROI 在非 DC 频点上的谱形 Pearson r，再对 ROI/被试平均,222,225
+psd,psd_roi_r,fixed_anchor_H1_8,subject_average,0.4703947805094661,0.46021360547592244,up,unitless,逐频点跨 116 ROI 的归一化功率分布相关，再对频点/被试平均,222,225
+psd,psd_mae_norm,fixed_anchor_H1_8,subject_average,0.02299511898728507,0.02408314749598503,down,unitless,逐 ROI 归一化 PSD 的 MAE,222,225
+psd,psd_mae_log10,fixed_anchor_H1_8,subject_average,0.24757729900312853,0.25739699456426834,down,decades,非 DC 频点 log10 PSD 的 MAE；对高频误差更敏感,222,225
+psd,rel_band_power_mae,fixed_anchor_H1_8,subject_average,0.04515156822765733,0.04724456600017018,down,fraction,0.01–0.1 Hz 相对功率 MAE,222,225
+psd,psd_shape_r,rolling_full_sequence,subject_full_sequence,0.9962560935761825,0.9959225180426875,up,unitless,逐 ROI 在非 DC 频点上的谱形 Pearson r，再对 ROI/被试平均,222,225
+psd,psd_roi_r,rolling_full_sequence,subject_full_sequence,0.6361038108801976,0.633807232290508,up,unitless,逐频点跨 116 ROI 的归一化功率分布相关，再对频点/被试平均,222,225
+psd,psd_mae_norm,rolling_full_sequence,subject_full_sequence,0.004174405879861264,0.004285609280276629,down,unitless,逐 ROI 归一化 PSD 的 MAE,222,225
+psd,psd_mae_log10,rolling_full_sequence,subject_full_sequence,1.1898876385645822,1.1951374832789103,down,decades,非 DC 频点 log10 PSD 的 MAE；对高频误差更敏感,222,225
+psd,rel_band_power_mae,rolling_full_sequence,subject_full_sequence,0.004992136804634487,0.006089737319594456,down,fraction,0.01–0.1 Hz 相对功率 MAE,222,225
+probability,crps_h1,fixed_anchor_H1_8,subject_mean,0.13673460392935857,0.13746831741390958,down,BOLD units,高斯边际 CRPS，H1；逐 ROI 后按被试等权,222,225
+probability,crps_h8,fixed_anchor_H1_8,subject_mean,0.596555589354253,0.588163418819507,down,BOLD units,高斯边际 CRPS，H8,222,225
+probability,crps_h1_8,fixed_anchor_H1_8,subject_mean,0.40729938031316876,0.40536246107684243,down,BOLD units,高斯边际 CRPS，H1–8 全部时点,222,225
+probability,crps_climatology_N01,fixed_anchor_H1_8,subject_mean,0.6799545290099608,0.6727837232417531,down,BOLD units,固定边际参照，非条件模型,222,225
+probability,crps_persistence_N01,fixed_anchor_H1_8,subject_mean,0.9494390195856491,0.9392406271563636,down,BOLD units,均值取 x_t、标准差取 1 的参照,222,225
+probability,gaussian_nll,fixed_anchor_H1_8,subject_mean,1.0844674400045529,1.0708808526893456,down,nats,逐元素高斯负对数似然,222,225
+probability,coverage_50,fixed_anchor_H1_8,element_pooled,0.6269555519959614,0.6322653256704981,closer_to_nominal,fraction,名义 50% 区间的实际覆盖率（全部 H1–8 元素合并）,222,225
+probability,coverage_90,fixed_anchor_H1_8,element_pooled,0.912682146046909,0.9177783764367816,closer_to_nominal,fraction,名义 90% 区间的实际覆盖率（全部 H1–8 元素合并）,222,225
+probability,coverage_95,fixed_anchor_H1_8,element_pooled,0.9459720361525319,0.9496354166666666,closer_to_nominal,fraction,名义 95% 区间的实际覆盖率（全部 H1–8 元素合并）,222,225
+probability,z_std,fixed_anchor_H1_8,element_pooled,0.9582964815380199,0.9377728212510679,closer_to_one,ratio,(y-mu)/sigma 的标准差；理想约 1,222,225
+probability,pit_ks_uniform,fixed_anchor_H1_8,element_pooled,0.0690515285306334,0.071987171086315,down,statistic,"PIT 与 Uniform(0,1) 的 KS 统计量；锚点重叠，仅描述性",222,225
+probability,z_std_h1,fixed_anchor_H1,element_pooled,0.2632575349471979,0.26455094419995895,closer_to_one,ratio,该 horizon 的 z 标准差,222,225
+probability,coverage_90_h1,fixed_anchor_H1,element_pooled,0.9997039064926996,0.9997078544061303,closer_to_nominal,fraction,该 horizon 的 90% 区间覆盖率,222,225
+probability,z_std_h8,fixed_anchor_H8,element_pooled,1.045118973082234,1.0153405187688878,closer_to_one,ratio,该 horizon 的 z 标准差,222,225
+probability,coverage_90_h8,fixed_anchor_H8,element_pooled,0.8911395231438335,0.8996886973180077,closer_to_nominal,fraction,该 horizon 的 90% 区间覆盖率,222,225
+variogram,vs_indep,fixed_anchor_H1_8,subject_mean,18.97928220414303,13.968963200141184,down,BOLD^4,"跨 ROI 相关设为 0；p=2，w=1，6,670 条边上均值",222,225
+variogram,vs_pred_fc,fixed_anchor_H1_8,subject_mean,13.604270005732385,12.068579598179268,down,BOLD^4,"跨 ROI 相关取预测 8 步轨迹 FC；p=2，w=1，6,670 条边上均值",222,225
+variogram,vs_oracle_fc,fixed_anchor_H1_8,subject_mean,13.881228769366128,12.250649529706635,down,BOLD^4,"跨 ROI 相关取真实 8 步轨迹 FC；oracle plug-in；p=2，w=1，6,670 条边上均值",222,225
+variogram,vs_pred_fc_h1,fixed_anchor_H1,subject_mean,1.5218138890718484,1.251015576404623,down,BOLD^4,"H1 的预测 FC copula；p=2，w=1，6,670 条边上均值",222,225
+variogram,vs_pred_fc_h8,fixed_anchor_H8,subject_mean,21.909892272707584,20.430538674617807,down,BOLD^4,"H8 的预测 FC copula；p=2，w=1，6,670 条边上均值",222,225

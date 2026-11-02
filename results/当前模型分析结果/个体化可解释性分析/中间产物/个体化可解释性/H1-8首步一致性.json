@@ -1,0 +1,12 @@
+{
+  "hc": {
+    "subjects": 222,
+    "baseline_max_abs": 0.0,
+    "perturbed_max_abs": 0.0
+  },
+  "mdd": {
+    "subjects": 225,
+    "baseline_max_abs": 0.0,
+    "perturbed_max_abs": 0.0
+  }
+}
