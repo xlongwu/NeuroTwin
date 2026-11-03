@@ -89,7 +89,8 @@ class GraphODEDynamicsHead(nn.Module):
                  residual_strength: float = 0.1,
                  diffusion_init: float = 0.05,
                  history_memory: bool = False,
-                 state_feedback: bool = False):
+                 state_feedback: bool = False,
+                 readout_init_std: float = 0.0):
         super().__init__()
         if dim < 1 or hidden_dim < 1:
             raise ValueError(f'dim/hidden_dim 必须为正：{dim}/{hidden_dim}')
@@ -102,6 +103,8 @@ class GraphODEDynamicsHead(nn.Module):
         self.cond_dim = int(cond_dim) if cond_dim else 0
         self.profile_dim = int(profile_dim) if profile_dim else 0
         self.state_feedback = bool(state_feedback)
+        self.personal_dynamics = None
+        self.pathology_dynamics = None
 
         # ---- 神经残差：W1 Xavier / W2 std=0.01 / bias 零 ----
         self.norm_z = nn.LayerNorm(self.dim)
@@ -142,7 +145,12 @@ class GraphODEDynamicsHead(nn.Module):
 
         # ---- 连续 BOLD 速率读出（零初始化 → 初始 persistence）----
         self.decode_rate = nn.Linear(self.dim, 1)
-        nn.init.zeros_(self.decode_rate.weight)
+        if readout_init_std < 0:
+            raise ValueError('readout_init_std must be nonnegative')
+        if readout_init_std > 0:
+            nn.init.normal_(self.decode_rate.weight, std=readout_init_std)
+        else:
+            nn.init.zeros_(self.decode_rate.weight)
         nn.init.zeros_(self.decode_rate.bias)
 
         # ---- 逐 ROI 方差读出 ----
@@ -179,7 +187,9 @@ class GraphODEDynamicsHead(nn.Module):
                q: Optional[torch.Tensor] = None,
                q_anchor: Optional[torch.Tensor] = None,
                signed_adj: Optional[torch.Tensor] = None,
-               return_terms: bool = False):
+               return_terms: bool = False,
+               personal_parameters: Optional[dict] = None,
+               pathology_parameters: Optional[dict] = None):
         """dz/dt：``-κ·LZ + 0.1·R + s⊙G·u``（含 历史记忆 FiLM）。
 
         Args:
@@ -217,11 +227,21 @@ class GraphODEDynamicsHead(nn.Module):
             kappa_logit = kappa_logit + self.kappa_cond(cond)
         if self.kappa_personal is not None and profile is not None:
             kappa_logit = kappa_logit + self.kappa_personal(profile)
-        kappa = F.softplus(kappa_logit)                        # [B,1]
+        if personal_parameters is not None:
+            kappa_logit = kappa_logit + personal_parameters['kappa_delta']
+        kappa = F.softplus(kappa_logit)                        # [B,1] 或 [B,F]
 
         diffusion = -kappa.unsqueeze(-1) * lz
         residual = self.residual_strength * r
         out = diffusion + residual
+        individual = pathology = None
+        if personal_parameters is not None:
+            individual = (self.personal_dynamics.residual(v, personal_parameters)
+                          - personal_parameters['gamma'].unsqueeze(-1) * z)
+            out = out + individual
+        if pathology_parameters is not None:
+            pathology = self.pathology_dynamics.residual(v, pathology_parameters)
+            out = out + pathology
         feedback = None
         if self.state_feedback:
             if q is None or q_anchor is None or signed_adj is None:
@@ -249,7 +269,8 @@ class GraphODEDynamicsHead(nn.Module):
             out = out + control_term
         if return_terms:
             return out, {'diffusion': diffusion, 'residual': residual,
-                         'control': control_term, 'q_feedback': feedback, 'kappa': kappa}
+                         'control': control_term, 'q_feedback': feedback, 'kappa': kappa,
+                         'individual': individual, 'pathology': pathology}
         return out
 
     def field_terms(self, z: torch.Tensor, adj: torch.Tensor,
@@ -259,11 +280,14 @@ class GraphODEDynamicsHead(nn.Module):
                     memory: Optional[torch.Tensor] = None,
                     q: Optional[torch.Tensor] = None,
                     q_anchor: Optional[torch.Tensor] = None,
-                    signed_adj: Optional[torch.Tensor] = None) -> dict:
+                    signed_adj: Optional[torch.Tensor] = None,
+                    personal_parameters: Optional[dict] = None,
+                    pathology_parameters: Optional[dict] = None) -> dict:
         """诊断接口：返回向量场各分量（diffusion/residual/control/kappa）。"""
         _, terms = self._field(z, adj, cond, profile, control, memory=memory,
                                q=q, q_anchor=q_anchor, signed_adj=signed_adj,
-                               return_terms=True)
+                               return_terms=True, personal_parameters=personal_parameters,
+                               pathology_parameters=pathology_parameters)
         return terms
 
     def _rate(self, z: torch.Tensor, q: Optional[torch.Tensor] = None,
@@ -284,7 +308,9 @@ class GraphODEDynamicsHead(nn.Module):
                            control: Optional[torch.Tensor] = None,
                            memory: Optional[torch.Tensor] = None,
                            q_anchor: Optional[torch.Tensor] = None,
-                           signed_adj: Optional[torch.Tensor] = None):
+                           signed_adj: Optional[torch.Tensor] = None,
+                           personal_parameters: Optional[dict] = None,
+                           pathology_parameters: Optional[dict] = None):
         """在**一个**预测区间内以固定 Heun RK2 同步推进 latent Z 与归一化 BOLD q。
 
         Args:
@@ -318,13 +344,16 @@ class GraphODEDynamicsHead(nn.Module):
             hq = h[:, None]                                    # q 步长 [B,1]
             for _ in range(self.ode_steps):
                 k1 = self._field(z32, adj32, c32, p32, u32, memory=m32,
-                                 q=q32, q_anchor=anchor32, signed_adj=signed32)
+                                 q=q32, q_anchor=anchor32, signed_adj=signed32,
+                                 personal_parameters=personal_parameters,
+                                 pathology_parameters=pathology_parameters)
                 v1 = self._rate(z32, q32, anchor32)
                 z_stage = z32 + hz * k1
                 q_stage = q32 + hq * v1
                 k2 = self._field(z_stage, adj32, c32, p32, u32,
                                  memory=m32, q=q_stage, q_anchor=anchor32,
-                                 signed_adj=signed32)
+                                 signed_adj=signed32, personal_parameters=personal_parameters,
+                                 pathology_parameters=pathology_parameters)
                 v2 = self._rate(z_stage, q_stage, anchor32)
                 z32 = z32 + 0.5 * hz * (k1 + k2)
                 q32 = q32 + 0.5 * hq * (v1 + v2)
@@ -341,7 +370,9 @@ class GraphODEDynamicsHead(nn.Module):
                 horizon: int = 8,
                 memory: Optional[torch.Tensor] = None,
                 q_anchor: Optional[torch.Tensor] = None,
-                signed_adj: Optional[torch.Tensor] = None):
+                signed_adj: Optional[torch.Tensor] = None,
+                personal_parameters: Optional[dict] = None,
+                pathology_parameters: Optional[dict] = None):
         """从初始状态连续推进 ``horizon`` 个预测区间。
 
         Args:
@@ -389,7 +420,9 @@ class GraphODEDynamicsHead(nn.Module):
             z, q = self.integrate_interval(z, q, adj, dt, cond=cond,
                                            profile=profile, control=u,
                                            memory=memory, q_anchor=q_anchor,
-                                           signed_adj=signed_adj)
+                                           signed_adj=signed_adj,
+                                           personal_parameters=personal_parameters,
+                                           pathology_parameters=pathology_parameters)
             z_traj.append(z)
             q_traj.append(q)
         z_final = z

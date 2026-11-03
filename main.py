@@ -6,6 +6,7 @@
 本文件保留 main 训练循环与 CLI 定义。
 """
 import argparse
+import json
 import math
 import os
 import shutil
@@ -37,6 +38,8 @@ from train.losses import (ForecastFidelityLoss, complete_sequence_mask,
                           correlation_matrix, fc_mse_per_sample, fc_pattern_pcc,
                           frequency_l1_per_sample, masked_l1_per_sample,
                           spatial_pcc)
+from train.individualized import (DYNAMICS_MODEL_OPTIONS, auxiliary_dynamics_loss,
+                                  build_hc_reference)
 from train.optim import (ModelEMA, build_optimizer, build_scheduler,
                          check_pretrain_config_compat, count_trainable_params,
                          load_backbone_only, load_backbone_weights,
@@ -475,8 +478,8 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
                  pathology_epoch=None):
     """H1–8 验证：单步、短程轨迹、FC 与频域指标。
 
-    Checkpoint 判据为 ``metric_selection_h1_N_mae_plus_fc_mse``：
-    H1–N 被试级 MAE 与 FC MSE 等权相加；两项先被试内平均、再跨被试等权。
+    H1–N MAE 和 FC MSE 先被试内平均、再跨被试等权。
+    checkpoint_metric 决定按 MAE 或 MAE + FC MSE 选模。
     FC/频域只统计具备完整 H1–8 真值的锚点。
     """
     model.eval()
@@ -631,6 +634,25 @@ def main(args):
     # checkpoint config.args 快照保留 model_arch 键：evaluate 重建与
     # pretrain 签名校验依赖它（TFM 已是唯一主干，CLI 不再暴露该开关）
     args.model_arch = 'tfm'
+    for name in ('lambda_delta', 'lambda_subject', 'lambda_personal_reg', 'lambda_disease',
+                 'lambda_clinical', 'lambda_path_reg', 'lambda_hc_reference'):
+        if getattr(args, name) < 0:
+            raise ValueError(f'{name} 必须非负')
+    if args.stable_representation and args.stable_window_length < 1:
+        raise ValueError('SDRL 窗长必须为正')
+    if args.stable_warmup_epochs < 0 or args.stable_ramp_epochs < 0:
+        raise ValueError('SDRL warmup/ramp epochs 必须非负')
+    if args.pathology_train_readout and args.pathology_readout_lr_scale <= 0:
+        raise ValueError('病理阶段读出学习率倍率必须为正')
+    if args.pathology_dynamics:
+        if args.mode != 'finetune' or args.condition_group != 'hc3' or args.condition_arm != 'demo':
+            raise ValueError('PDD 阶段使用 finetune + hc3/demo，症状量表不作为输入')
+        if not args.personal_dynamics:
+            raise ValueError('PDD 阶段需要阶段 I 的 IDG 健康基础模型')
+    if args.stable_representation and args.stable_window_length != args.calibration_length:
+        raise ValueError('SDRL 窗长必须与固定前缀校准长度一致')
+    if args.lambda_clinical > 0 and (not args.pathology_dynamics or args.clinical_target_field != 'HAMD'):
+        raise ValueError('临床辅助损失需要 PDD 与 --clinical_target_field HAMD')
     resume_metadata = None
     resume_progress_data = None
     if args.resume_training_state:
@@ -754,6 +776,9 @@ def main(args):
               f'来源字段={src_names} → 继承共享字段={share}；'
               f'其余字段将在 MDD-train 上拟合（不会覆盖继承值）')
 
+    if args.pathology_dynamics and cond_base_stats is not None:
+        condition_stats_mode = 'inherit'
+
     dl = NeuroTwinDataLoader(
         data_root=args.data_root, mode=args.mode, batch_size=args.batch_size,
         condition_group=condition_group,
@@ -800,6 +825,8 @@ def main(args):
         num_rois=args.num_rois,
         graph_source=args.graph_source,
         calibration_length=args.calibration_length,
+        stable_window_length=args.stable_window_length if args.stable_representation else 0,
+        clinical_target_field=args.clinical_target_field,
         control_manifest=(args.control_manifest or None),
     )
     train_data, val_data = dl.get_train(), dl.get_val()
@@ -867,13 +894,19 @@ def main(args):
         state_feedback=args.state_feedback,
         spatial_profile=args.spatial_profile,
         condition_initial_state=args.condition_initial_state,
+        **{key: getattr(args, key) for key in DYNAMICS_MODEL_OPTIONS},
     ).to(device)
     migration_report = (resume_progress_data.get('study', {}).get('pretrained_migration')
                         if resume_progress_data is not None else None)
     if args.mode == 'pretrain' and getattr(args, 'init_weight', ''):
         from analysis.checkpoint import load_checkpoint_compat
-        model, compat = load_checkpoint_compat(
-            model, args.init_weight, device, strict=True)
+        if args.personal_dynamics:
+            compat = migrate_pretrained_checkpoint(
+                model, args.init_weight, device,
+                new_module_prefixes=('one_step_head.personal_dynamics.',))
+        else:
+            model, compat = load_checkpoint_compat(
+                model, args.init_weight, device, strict=True)
         print(f'[pretrain] 热启动权重已加载: {args.init_weight} | compat={compat}')
 
     if args.mode == 'finetune':
@@ -931,7 +964,9 @@ def main(args):
                 layout_expect=(model.conditioner.layout()['layout_hash']
                                if (getattr(model, 'conditioner', None) and same_group_arm)
                                else None),
-                layout_saved=saved_layout if same_group_arm else None)
+                layout_saved=saved_layout if same_group_arm else None,
+                new_module_prefixes=(('one_step_head.pathology_dynamics.',)
+                                     if args.pathology_dynamics else ()))
         elif resume_metadata is None:
             # 任务口径闸门：不同任务的目标/输入 shape 语义不同，
             # 不允许静默按 shape 过滤加载（形状对不上时会静默跳过大量键）
@@ -940,14 +975,20 @@ def main(args):
             load_backbone_weights(model, args.pretrained_weight, device,
                                   arch_policy=args.pretrained_arch_policy,
                                   skip_pattern=getattr(args, 'pretrained_skip_pattern', ''))
-        set_finetune_trainability(model, backbone_unfrozen=False)
+        if args.pathology_dynamics and resume_metadata is None:
+            saved_state = torch.load(args.pretrained_weight, map_location='cpu', weights_only=False)
+            if not any(k.startswith('one_step_head.personal_dynamics.') for k in saved_state['state_dict']):
+                raise ValueError('PDD 必须从已训练 IDG 的阶段 I 权重初始化')
+        set_finetune_trainability(model, backbone_unfrozen=False,
+                                 pathology_train_readout=args.pathology_train_readout)
         condition_trainables = []
         if getattr(model.one_step_head, 'film', None) is not None:
             condition_trainables.append('One-Step FiLM')
         if getattr(model.cpm_head, 'film', None) is not None:
             condition_trainables.append('CPM FiLM')
-        print(f'已进入分阶段微调: 前期仅训练条件适配器'
-              f'（{ "+ ".join(condition_trainables) }），后期逐步解冻主干。')
+        if not args.pathology_dynamics:
+            print(f'已进入分阶段微调: 前期仅训练条件适配器'
+                  f'（{ "+ ".join(condition_trainables) }），后期逐步解冻主干。')
 
 
     print(f"Total Model Parameters: {sum(p.numel() for p in model.parameters())}")
@@ -982,10 +1023,11 @@ def main(args):
         lambda_rec=args.lambda_rec, lambda_fc=args.lambda_fc,
         lambda_freq=args.lambda_freq,
         weighting=getattr(args, 'loss_weighting', 'uncertainty'),
+        fc_objective=args.fc_objective,
     ).to(device)
     print(f"[TFM] 损失: H1–{horizon} 重建 L1={args.lambda_rec} | "
           f"FC MSE={args.lambda_fc} | 频域 L1={args.lambda_freq} | "
-          f"weighting={criterion.weighting}")
+          f"weighting={criterion.weighting} | FC objective={criterion.fc_objective}")
     if criterion.weighting == 'uncertainty':
         n_log_s = len(list(criterion.log_s.parameters()))
         print(f"[TFM] 损失权重: 同方差不确定性加权（Kendall CVPR 2018，"
@@ -1001,6 +1043,14 @@ def main(args):
           f" | OS FiLM: {'on' if getattr(model.one_step_head, 'film', None) is not None else 'off'}"
           f" | 训练路径跳过 CPM/方差辅助头（with_aux=False）")
 
+    hc_reference = None
+    hc_train_data = None
+    if args.pathology_dynamics:
+        hc_reference = build_hc_reference(args, dl.get_condition_stats())
+        hc_train_data = hc_reference.get_train()
+        print(f'[PDD] 训练病理增量，读出更新={args.pathology_train_readout}；'
+              f'每个 MDD batch 配对一个 HC train batch，'
+              f'HC train 被试数={len(hc_reference.train_subjects)}')
     backbone_unfrozen = (args.mode == 'pretrain')
     optimizer = build_optimizer(model, criterion, args)
     scheduler = build_scheduler(optimizer, args)
@@ -1017,7 +1067,7 @@ def main(args):
         backbone_unfrozen = saved_unfrozen
     _report_conditioning(
         model, optimizer, args, dl,
-        allow_frozen_conditioning=False)
+        allow_frozen_conditioning=args.pathology_dynamics)
     scaler    = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     ema       = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     if args.compile and device.type == 'cuda' and hasattr(torch, 'compile'):
@@ -1030,12 +1080,14 @@ def main(args):
         print("[next_timepoint] torch.compile(dynamic=True) 已启用（变长 K 符号化，"
               "首个 epoch 含一次性编译耗时属预期）。")
 
-    # 主 checkpoint 判据：验证集 H1–8 被试级 MAE + FC MSE（两者越低越好）。
-    # 只按 MAE 选模会在 FC/频域持续改善时停在第 1 个 epoch，丢掉网络保真度增益。
+    # 预测任务可按 MAE 选模，避免尺度不变的 Pearson FC 掩盖低振幅退化。
     dyn_metric_horizon = horizon
     dyn_metric_key = dynamics_metric_key(dyn_metric_horizon)
-    ckpt_metric_key = selection_metric_key(dyn_metric_horizon)
-    ckpt_metric_name = f'{dynamics_metric_name(dyn_metric_horizon)} + FC MSE'
+    ckpt_metric_key = (dyn_metric_key if args.checkpoint_metric == 'mae'
+                       else selection_metric_key(dyn_metric_horizon))
+    ckpt_metric_name = dynamics_metric_name(dyn_metric_horizon)
+    if args.checkpoint_metric != 'mae':
+        ckpt_metric_name += ' + FC MSE'
     selector = CheckpointSelector(ckpt_metric_key, ckpt_metric_name,
                                   patience=args.patience)
     print(f"[next_timepoint] checkpoint 选择判据: {ckpt_metric_name}"
@@ -1169,6 +1221,7 @@ def main(args):
     epoch_limit = start_epoch if early_stopped else args.train_epochs
     for epoch in range(start_epoch, epoch_limit):
         if (args.mode == 'finetune'
+                and not args.pathology_dynamics
                 and not backbone_unfrozen
                 and epoch >= args.freeze_backbone_epochs):
             set_finetune_trainability(model, backbone_unfrozen=True)
@@ -1183,6 +1236,14 @@ def main(args):
                   f"（沿用现有 optimizer 状态与 scheduler 进度；早停计数已重置）")
 
         model.train()
+        if args.pathology_dynamics:
+            # 冻结的健康编码器保持 eval，避免 dropout 改变健康参照。
+            inner = getattr(model, '_orig_mod', model)
+            inner.eval()
+            inner.one_step_head.pathology_dynamics.train()
+            hc_reference.loader_generator.manual_seed(args.seed + epoch)
+            hc_train_data.batch_sampler.set_epoch(epoch)
+            hc_iterator = iter(hc_train_data)
         # 轨迹任务：每 epoch 重新打乱分桶 sampler（同 batch 内 L 一致的约束保持不变）
         batch_sampler = getattr(train_data, 'batch_sampler', None)
         if hasattr(batch_sampler, 'set_epoch'):
@@ -1218,7 +1279,31 @@ def main(args):
                 total_loss, loss_stats = criterion(
                     aux_info['dynamics_pred'][:, :, :horizon],
                     by_roll[:, :, :horizon], bm_roll[:, :horizon])
-
+                auxiliary, auxiliary_stats = auxiliary_dynamics_loss(
+                    model, aux_info, batch, by_roll[:, :, :horizon],
+                    bm_roll[:, :horizon], args,
+                    disease_label=1.0 if args.pathology_dynamics else None, epoch=epoch)
+                total_loss = total_loss + auxiliary
+                loss_stats.update(auxiliary_stats)
+                if hc_train_data is not None:
+                    try:
+                        hc_batch = next(hc_iterator)
+                    except StopIteration:
+                        hc_iterator = iter(hc_train_data)
+                        hc_batch = next(hc_iterator)
+                    hx, _, _, _, hs, _ = next_point_batch(hc_batch, device)
+                    hc_cal, hc_ctl = dynamics_extras(hc_batch, device)
+                    _, hc_aux = model(hx, hs, condition=condition_batch(hc_batch, device),
+                                      calibration_bold=hc_cal, controls=hc_ctl,
+                                      dynamics_horizon=horizon, with_aux=False)
+                    hc_target = hc_batch['future'].to(device)
+                    hc_mask = hc_batch['future_mask'].to(device)
+                    hc_loss, _ = criterion(hc_aux['dynamics_pred'], hc_target, hc_mask)
+                    hc_extra, hc_stats = auxiliary_dynamics_loss(
+                        model, hc_aux, hc_batch, hc_target, hc_mask, args,
+                        disease_label=0.0, epoch=epoch)
+                    total_loss = 0.5 * (total_loss + hc_loss + hc_extra)
+                    loss_stats.update({f'hc_{key}': value for key, value in hc_stats.items()})
 
             scaler.scale(total_loss).backward()
 
@@ -1278,11 +1363,13 @@ def main(args):
             f"persistence H1–{horizon}={_val(f'metric_persistence_h1_{horizon}')}")
         selection_score, selection_mae, selection_fc = selection_metric(
             val_metrics, horizon)
+        if args.checkpoint_metric == 'mae':
+            selection_score = selection_mae
         val_metrics[ckpt_metric_key] = selection_score
         is_best, cur_metric = selector.step(val_metrics)
         tqdm.write(
             f"[Select] {ckpt_metric_name}={cur_metric:.4f} "
-            f"(MAE={selection_mae:.4f} + FC MSE={selection_fc:.4f}) | "
+            f"(MAE={selection_mae:.4f}, FC MSE={selection_fc:.4f}) | "
             f"model vs persistence ΔMAE="
             f"{val_metrics.get(f'metric_persistence_h1_{horizon}', float('nan')) - selection_mae:+.4f}")
         if criterion.weighting == 'uncertainty':
@@ -1367,6 +1454,9 @@ def main(args):
                          ('metric_freq_l1', 'Val/Freq_L1')):
             if key in val_metrics:
                 tb_scalars.append((tag, val_metrics[key]))
+        for key, value in train_metrics.items():
+            if key not in ('metric_total', 'loss_rec', 'loss_fc', 'loss_freq'):
+                tb_scalars.append((f'Train/{key}', value))
         for tag, val in tb_scalars:
             writer.add_scalar(tag, val, epoch)
         for name, lr in group_lrs.items():
@@ -1718,6 +1808,35 @@ def parse_args():
                         '空=无控制（controls=None，不伪造刺激标签）。')
 
 
+    p.add_argument('--dynamics_experiment', choices=['B0', 'B1', 'B2', 'B3'], default=None,
+                   help='读取 configs/individualized_dynamics.json 的固定实验配方；CLI 可覆盖')
+    for name, default in (
+            ('personal_dynamics', False), ('regional_diffusion', True),
+            ('regional_decay', False), ('personalized_graph', True),
+            ('stable_representation', False), ('pathology_dynamics', False)):
+        p.add_argument('--' + name, type=str2bool, default=default)
+    for name, default in (
+            ('personal_generator_hidden_dim', 128), ('personal_rank', 8),
+            ('personal_graph_rank', 8), ('stable_window_length', 32),
+            ('pathology_dim', 16), ('pathology_rank', 4)):
+        p.add_argument('--' + name, type=int, default=default)
+    for name, default in (
+            ('personal_residual_scale', 0.05), ('pathology_residual_scale', 0.05),
+            ('contrastive_temperature', 0.1), ('lambda_delta', 0.0),
+            ('lambda_subject', 0.0), ('lambda_personal_reg', 0.0),
+            ('lambda_disease', 0.0), ('lambda_clinical', 0.0),
+            ('lambda_path_reg', 0.0), ('lambda_hc_reference', 1.0)):
+        p.add_argument('--' + name, type=float, default=default)
+    p.add_argument('--clinical_target_field', choices=['', 'HAMD'], default='')
+    p.add_argument('--hc_reference_split', default='', help='原 HC 划分；空值沿用原版本化 manifest')
+    p.add_argument('--fc_objective', choices=['pearson', 'covariance'], default='pearson')
+    p.add_argument('--checkpoint_metric', choices=['mae_fc', 'mae'], default='mae_fc')
+    p.add_argument('--dynamics_readout_init_std', type=float, default=0.0)
+    p.add_argument('--stable_warmup_epochs', type=int, default=0)
+    p.add_argument('--stable_ramp_epochs', type=int, default=0)
+    p.add_argument('--pathology_train_readout', type=str2bool, default=False)
+    p.add_argument('--pathology_readout_lr_scale', type=float, default=0.2)
+
     from model import load_model_config
     config = load_model_config()
     declared = {action.dest for action in p._actions}
@@ -1730,10 +1849,19 @@ def parse_args():
     conditioning = config['data_and_split']['conditioning']
     defaults.update({key: value for key, value in conditioning.items()
                      if key in declared})
+    preview, _ = p.parse_known_args()
+    if preview.dynamics_experiment:
+        with open(FILE.parent / 'configs' / 'individualized_dynamics.json', encoding='utf-8') as f:
+            experiment = json.load(f)[preview.dynamics_experiment]
+        unknown = set(experiment) - declared
+        if unknown:
+            raise ValueError(f'实验配置存在未声明字段: {sorted(unknown)}')
+        defaults.update(experiment)
     p.set_defaults(**defaults, name=None)
     args = p.parse_args()
     if args.name is None:
-        args.name = f'neurotwin_{args.mode}'
+        args.name = (f'neurotwin_{args.dynamics_experiment}_{args.mode}'
+                     if args.dynamics_experiment else f'neurotwin_{args.mode}')
     if args.condition_arm is None:
         args.condition_arm = conditioning[args.mode]['condition_arm']
     if args.mode == 'finetune' and not args.pretrained_weight:

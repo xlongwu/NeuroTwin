@@ -247,6 +247,8 @@ class NeuroTwinNextPointDataset(Dataset):
         graph_source: str = 'legacy_mask',
         calibration_length: int = 0,          # 0 = 关闭（legacy）；raw 分支必须 >=1
         control_manifest: Optional[str] = None,
+        stable_window_length: int = 0,
+        clinical_target_field: str = '',
     ):
         self.data_root = Path(data_root)
         self.mode = mode
@@ -278,6 +280,12 @@ class NeuroTwinNextPointDataset(Dataset):
         self.num_rois = int(num_rois)
         if self.num_rois < 1:
             raise ValueError(f"num_rois 必须 >= 1，收到 {self.num_rois}")
+        self.stable_window_length = int(stable_window_length)
+        self.clinical_target_field = str(clinical_target_field)
+        if self.stable_window_length and self.stable_window_length != int(calibration_length):
+            raise ValueError('SDRL window_length 必须与主 Profile 校准长度一致')
+        if self.clinical_target_field not in ('', 'HAMD'):
+            raise ValueError('当前临床辅助目标仅支持 HAMD')
         self.calibration_length = int(calibration_length)
         if self.bold_source == 'raw' and self.calibration_length < 1:
             raise ValueError(
@@ -356,6 +364,22 @@ class NeuroTwinNextPointDataset(Dataset):
         self._mat_cache: Dict[str, np.ndarray] = {}
         self._source_logged = False
         self._build_index()
+        self.clinical_targets = None
+        self.clinical_target_mask = None
+        self.stratification_table = None
+        if self.mode == 'finetune' and self.condition_group == 'hc3':
+            # PDD 不把量表作为输入，仍保留原 HAMD 分层与可选辅助监督。
+            self.stratification_table = load_condition_table(
+                self.data_root, self.condition_file or CONDITION_FILE_BY_MODE['finetune'], 'mdd8')
+        if self.clinical_target_field and self.mode == 'finetune':
+            table = self.stratification_table or self.condition_table
+            if table is None or table.group != 'mdd8':
+                table = load_condition_table(self.data_root, self.condition_file or
+                                             CONDITION_FILE_BY_MODE['finetune'], 'mdd8')
+            values, mask = table.align(self.subject_ids)
+            index = [spec.name for spec in table.specs].index(self.clinical_target_field)
+            self.clinical_targets = np.nan_to_num(values[:, index], nan=0.0)
+            self.clinical_target_mask = mask[:, index].astype(np.float32)
 
     def attach_condition_stats(self, stats) -> None:
         """附加 train-only 统计量并**一次性**编码整个队列（z / 类别索引）。
@@ -696,6 +720,9 @@ class NeuroTwinNextPointDataset(Dataset):
         if self.condition_enabled:
             table = self.condition_table
             names = [s.name for s in table.specs]
+            if key not in names and self.stratification_table is not None:
+                table = self.stratification_table
+                names = [s.name for s in table.specs]
             if key not in names:
                 raise ValueError(
                     f'分层键 {key} 不在条件 schema {names} 中；分层键必须显式登记。')
@@ -1052,6 +1079,18 @@ class NeuroTwinNextPointDataset(Dataset):
             cal = series[:, :self.calibration_length]                  # [F, L]
             out['calibration_bold'] = torch.from_numpy(np.ascontiguousarray(
                 np.asarray(cal[:, None, :], dtype=np.float32)))        # [F,1,L]
+        if self.stable_window_length:
+            length = self.stable_window_length
+            valid = t + 1 >= 2 * length
+            # 不足两窗时只提供占位张量；训练端按 valid 筛掉，绝不读取未来。
+            second = series[:, length:2 * length] if valid else np.zeros((series.shape[0], length))
+            out['stable_bold_b'] = torch.from_numpy(np.asarray(second[:, None, :], dtype=np.float32).copy())
+            out['stable_pair_valid'] = torch.tensor(valid, dtype=torch.bool)
+        if self.clinical_target_field:
+            value = self.clinical_targets[subj_pos] if self.clinical_targets is not None else 0.0
+            mask = self.clinical_target_mask[subj_pos] if self.clinical_target_mask is not None else 0.0
+            out['clinical_target'] = torch.tensor(float(value))
+            out['clinical_target_mask'] = torch.tensor(float(mask))
         if self.controls_by_subject is not None:
             u = self.controls_by_subject.get(subj_id, None)
             h = int(future_steps)
@@ -1403,6 +1442,8 @@ class NeuroTwinDataLoader:
         graph_source: str = 'legacy_mask',
         calibration_length: int = 0,
         control_manifest: Optional[str] = None,
+        stable_window_length: int = 0,
+        clinical_target_field: str = '',
     ):
         task_mode = str(task_mode)
         if task_mode != 'next_timepoint':
@@ -1451,6 +1492,8 @@ class NeuroTwinDataLoader:
         self.eval_anchor_min_future_steps = int(eval_anchor_min_future_steps)
         self.num_rois = int(num_rois)
         self.graph_source = str(graph_source)
+        self.stable_window_length = int(stable_window_length)
+        self.clinical_target_field = str(clinical_target_field)
         self.calibration_length = int(calibration_length)
         self.control_manifest = str(control_manifest) if control_manifest else None
         self.seed = seed
@@ -1488,6 +1531,8 @@ class NeuroTwinDataLoader:
             num_rois=self.num_rois,
             graph_source=self.graph_source,
             calibration_length=self.calibration_length,
+            stable_window_length=self.stable_window_length,
+            clinical_target_field=self.clinical_target_field,
             control_manifest=self.control_manifest,
         )
 

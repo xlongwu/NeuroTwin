@@ -445,7 +445,8 @@ def classify_checkpoint_keys(model_state, ckpt_state, conditioning_prefixes):
 def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
                                   arch_policy='require_match',
                                   zero_expanded_keys=(), layout_expect=None,
-                                  layout_saved=None, horizon_policy='require_match'):
+                                  layout_saved=None, horizon_policy='require_match',
+                                  new_module_prefixes=()):
     r"""显式迁移器：旧 checkpoint → 新结构，逐键归类并汇报（方案 §8）。
 
     与「``strict=False`` + shape 过滤」不同，本函数把每个键归入
@@ -459,6 +460,8 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
     - ``skipped``：checkpoint 有、模型没有的键（旧模块被移除）；
     - ``missing``：模型有、checkpoint 没有、且**不属于**条件模块的键 → 结构漂移，
       报错。
+
+    ``new_module_prefixes``：本次显式新增的 IDG/PDD 模块键前缀；其他主干缺失仍报错。
 
     ``layout_expect`` / ``layout_saved``：条件向量的 ``layout_hash``。**字段顺序
     参与哈希**，因此「同宽度但字段顺序变化」也会被拒绝（验收 K）。
@@ -498,7 +501,7 @@ def migrate_pretrained_checkpoint(model, pretrained_path, device='cpu',
                     'arch_version': arch_version}
         print('警告: ' + msg + '（arch_policy=warn：继续迁移）')
 
-    prefixes = set(conditioning_module_prefixes(model))
+    prefixes = set(conditioning_module_prefixes(model)) | set(new_module_prefixes)
     cond_prefixes = tuple(sorted(prefixes))
     model_state = model.state_dict()
     horizon_expanded = []
@@ -592,10 +595,19 @@ def unfreeze_while_preserving_state(model, optimizer, args):
     return added_numel, [g.get('name') for g in optimizer.param_groups]
 
 
-def set_finetune_trainability(model: NeuroTwinTFM, backbone_unfrozen: bool = False):
+def set_finetune_trainability(model: NeuroTwinTFM, backbone_unfrozen: bool = False,
+                             pathology_train_readout: bool = False):
     """微调分阶段训练：默认训练条件模块（病理 FiLM 等），backbone_unfrozen 后解冻主干。"""
     for p in model.parameters():
         p.requires_grad = False
+    pathology = getattr(model.one_step_head, 'pathology_dynamics', None)
+    if pathology is not None:
+        for p in pathology.parameters():
+            p.requires_grad = True
+        if pathology_train_readout:
+            for p in model.one_step_head.decode_rate.parameters():
+                p.requires_grad = True
+        return
     # 条件模块在冻结阶段即参与训练：它们是“让病理条件真正生效”的唯一路径
     for module in _iter_conditioning_modules(model):
         for p in module.parameters():
@@ -632,6 +644,18 @@ def get_param_groups(model: NeuroTwinTFM, args):
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if args.mode == 'pretrain':
         return [{'params': [p for _, p in named], 'lr': args.lr_peak, 'name': 'all'}]
+
+    inner = getattr(model, '_orig_mod', model)
+    if getattr(inner.one_step_head, 'pathology_dynamics', None) is not None:
+        readout_ids = {id(p) for p in inner.one_step_head.decode_rate.parameters()}
+        groups = [{'params': [p for _, p in named if id(p) not in readout_ids],
+                 'lr': args.lr_peak * getattr(args, 'adapter_lr_scale', 1.0), 'name': 'pathology'}]
+        readout = [p for _, p in named if id(p) in readout_ids]
+        if readout:
+            groups.append({'params': readout,
+                           'lr': args.lr_peak * getattr(args, 'pathology_readout_lr_scale', 0.2),
+                           'name': 'pathology_readout'})
+        return groups
 
     adapter_ids = set()
     for module in _iter_conditioning_modules(model):

@@ -92,3 +92,25 @@ def test_invalid_batch_skips_fc_and_freq_terms():
     assert stats['loss_fc'].item() == pytest.approx(0.0)
     assert stats['loss_freq'].item() == pytest.approx(0.0)
     assert total.item() == pytest.approx(stats['loss_rec'].item(), rel=1e-6)
+
+
+def test_covariance_objective_penalizes_amplitude_collapse_and_respects_mask():
+    from train.losses import normalized_covariance_mse
+    _, target, mask = _batch()
+    pred = (target * 0.1).requires_grad_()
+    assert fc_mse(pred, target, mask) < 1e-5
+    loss = normalized_covariance_mse(pred, target, mask)
+    assert loss > 0.01
+    assert normalized_covariance_mse(target, target, mask) == 0
+    loss.backward()
+    assert torch.isfinite(pred.grad).all()
+    assert (pred.grad * target).sum() < 0  # 梯度下降增大预测振幅。
+    mask[1:] = 0
+    torch.testing.assert_close(normalized_covariance_mse(pred, target, mask),
+                               normalized_covariance_mse(pred[:1], target[:1]))
+    mask.zero_()
+    assert normalized_covariance_mse(pred, target, mask) == 0
+    crit = ForecastFidelityLoss(weighting='fixed', fc_objective='covariance')
+    _, stats = crit(pred, target)
+    torch.testing.assert_close(stats['loss_fc'],
+                               normalized_covariance_mse(pred, target).detach())

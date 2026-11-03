@@ -275,6 +275,20 @@ class NeuroTwinTFM(nn.Module):
         state_feedback: bool = False,
         spatial_profile: bool = False,
         condition_initial_state: bool = False,
+        personal_dynamics: bool = False,
+        personal_generator_hidden_dim: int = 128,
+        personal_rank: int = 8,
+        personal_residual_scale: float = 0.05,
+        regional_diffusion: bool = True,
+        regional_decay: bool = False,
+        personalized_graph: bool = True,
+        personal_graph_rank: int = 8,
+        stable_representation: bool = False,
+        pathology_dynamics: bool = False,
+        pathology_dim: int = 16,
+        pathology_rank: int = 4,
+        pathology_residual_scale: float = 0.05,
+        dynamics_readout_init_std: float = 0.0,
     ):
         super().__init__()
         if patch_len < 1 or context_max < patch_len:
@@ -411,7 +425,8 @@ class NeuroTwinTFM(nn.Module):
             profile_dim=self.profile_dim or None,
             ode_steps=self.ode_steps,
             history_memory=dynamics_history_memory,
-            state_feedback=self.state_feedback)
+            state_feedback=self.state_feedback,
+            readout_init_std=dynamics_readout_init_std)
         self.cpm_head = CPMHorizonHead(
             dim=dim, horizon=cpm_horizon, num_heads=num_heads,
             num_layers=cpm_layers, dropout=dropout,
@@ -428,6 +443,20 @@ class NeuroTwinTFM(nn.Module):
         self.initial_condition_film = None
         if condition_initial_state and head_cond_dim:
             self.initial_condition_film = ConditionFiLM(head_cond_dim, dim)
+
+        if (personal_dynamics or stable_representation) and not self.personalized:
+            raise ValueError('IDG/SDRL 需要 personalized=True')
+        self.stable_representation = bool(stable_representation)
+        from models.individual_dynamics import IndividualDynamicsGenerator, PathologyDynamics
+        with isolated_global_rng():
+            if personal_dynamics:
+                self.one_step_head.personal_dynamics = IndividualDynamicsGenerator(
+                    features, dim, self.profile_dim, personal_generator_hidden_dim,
+                    personal_rank, personal_graph_rank, personal_residual_scale,
+                    regional_diffusion, regional_decay, personalized_graph)
+            if pathology_dynamics:
+                self.one_step_head.pathology_dynamics = PathologyDynamics(
+                    dim, pathology_dim, pathology_rank, pathology_residual_scale)
 
     # ------------------------------------------------------------------
     # 内部构件
@@ -451,7 +480,8 @@ class NeuroTwinTFM(nn.Module):
             condition['cond_z'], condition['cond_code'], condition['cond_mask'],
             subject_index=condition.get('subject_index'), epoch=condition_epoch)
 
-    def _encode(self, x_grid: torch.Tensor, sc_matrix: torch.Tensor):
+    def _encode(self, x_grid: torch.Tensor, sc_matrix: torch.Tensor,
+                personal_parameters: Optional[dict] = None):
         """[B,F,K]（已归一化）→ (context tokens [B,F,P,D], sc_info)。
 
         A_eff 由 SoftAnatomicalPrior 从归一化 context 与 SC 导出，backbone
@@ -460,7 +490,8 @@ class NeuroTwinTFM(nn.Module):
 
         """
         x4 = x_grid.unsqueeze(2)                               # [B,F,1,K]
-        sc_info = self.sc_prior(x4, sc_matrix)
+        sc_info = self.sc_prior(x4, sc_matrix, personal_delta=(
+            personal_parameters['graph_delta'] if personal_parameters is not None else None))
         tokens = self.patch_embed(x_grid)
         for block in self.blocks:
             tokens = block(tokens, sc_info['A_eff'])
@@ -525,7 +556,8 @@ class NeuroTwinTFM(nn.Module):
                 dynamics_horizon: Optional[int] = None,
                 calibration_bold: Optional[torch.Tensor] = None,
                 profile: Optional[torch.Tensor] = None,
-                with_aux: bool = True):
+                with_aux: bool = True,
+                pathology_active: bool = True):
         """单次前向：Graph-ODE H1..H 轨迹 + 可选 CPM/方差辅助输出。
 
         Args:
@@ -534,6 +566,7 @@ class NeuroTwinTFM(nn.Module):
             pathology_score: 保留的位置参数，仅接受 None；条件使用 condition。
             future_control: 仅接受 None；控制输入使用 controls。
             pathology_epoch: 当前训练 epoch（0 基）；保留的兼容参数。
+            pathology_active: False 时仅运行健康基础，用于病理增量对照。
             with_aux: True 时同时计算 CPM 全 horizon 与方差头（旧接口）；
                 False 时跳过这两条辅助通路，只保留主 ODE 轨迹，训练路径使用。
         Returns:
@@ -555,9 +588,13 @@ class NeuroTwinTFM(nn.Module):
             x_grid = x_norm4[:, :, 0, :]
         cond = self._prepare_condition(pathology_score, condition, condition_epoch)
 
+        if self.one_step_head.personal_dynamics is not None:
+            profile = self._resolve_profile(profile, calibration_bold)
+        personal_parameters = self.generate_personal_parameters(profile)
         signed_fc = self._history_fc_signed(x_grid) if self.state_feedback else None
         graph_input = signed_fc.abs() if signed_fc is not None else self._graph_input(x_grid, sc_matrix)
-        tokens, sc_info = self._encode(x_grid, graph_input)
+        tokens, sc_info = self._encode(x_grid, graph_input, personal_parameters)
+        pathology_parameters = self.encode_pathology(tokens) if pathology_active else None
         # One-Step / 图 ODE 头：最后 causal token 为初始 latent 状态
         z_t = self._initial_latent(tokens, cond)                # [B,F,D]
         x_last_norm = x_grid[:, :, -1]                         # [B,F] = x_t（归一化）
@@ -567,16 +604,8 @@ class NeuroTwinTFM(nn.Module):
             raise ValueError(
                 'future_control 已移除；控制输入请传 '
                 'controls [B,H,F]，两者不自动转置混用。')
-        if self.personalized:
-            if profile is None and calibration_bold is not None:
-                # 基线另走一次共享编码器；训练时保持梯度，不缓存 detached tokens
-                profile = self.calibrate_profile(calibration_bold)
-            elif profile is None:
-                raise ValueError(
-                    'personalized=True 的 forward 需要 profile 或 '
-                    'calibration_bold 之一（不偷偷从包含未来的全序列计算）。')
-        else:
-            profile = None
+        if self.one_step_head.personal_dynamics is None:
+            profile = self._resolve_profile(profile, calibration_bold)
         # dynamics_horizon 是可选覆盖，缺省复用 CPM H（不新增 horizon CLI）
         dyn_h = (int(dynamics_horizon)
                  if dynamics_horizon is not None else self.cpm_horizon)
@@ -585,7 +614,8 @@ class NeuroTwinTFM(nn.Module):
         z_final, q_traj_norm, z_traj = self.one_step_head(
             z_t, x_last_norm, sc_info['A_eff'], cond=cond, profile=profile,
             controls=controls, time_deltas=time_deltas, horizon=dyn_h,
-            memory=memory, q_anchor=q_anchor, signed_adj=signed_adj)
+            memory=memory, q_anchor=q_anchor, signed_adj=signed_adj,
+            personal_parameters=personal_parameters, pathology_parameters=pathology_parameters)
         del z_final   # forward 只消费 q 轨迹；latent 末状态经 state API 使用
         # 主输出 = 动态轨迹第一帧（反归一化后 [B,F,1,1]），不再额外加 x_last
         one_pred_norm = q_traj_norm[:, :, 0:1].unsqueeze(-1)
@@ -597,6 +627,10 @@ class NeuroTwinTFM(nn.Module):
         if profile is not None:
             dyn_aux['personal_profile'] = profile              # [B,profile_dim]
 
+        if personal_parameters is not None:
+            dyn_aux['personal_parameters'] = personal_parameters
+        if pathology_parameters is not None:
+            dyn_aux['pathology_parameters'] = pathology_parameters
         aux_info = {'sc_prior': sc_info}
         if cond is not None:
             aux_info['pathology_cond'] = cond
@@ -758,7 +792,8 @@ class NeuroTwinTFM(nn.Module):
         return out.squeeze(-1).squeeze(-1)
 
     def _encode_history_internal(self, history: torch.Tensor, sc_matrix,
-                                 cond: Optional[torch.Tensor] = None):
+                                 cond: Optional[torch.Tensor] = None,
+                                 personal_parameters: Optional[dict] = None):
         """数据尺度 history [B,K,F] → (tokens, x_grid_norm, norm_stats, sc_info)。
 
         图输入按 graph_source 路由（history_fc 从当前可见历史计算 FC）；
@@ -773,7 +808,7 @@ class NeuroTwinTFM(nn.Module):
             x_grid = x[:, :, 0, :]
         signed_fc = self._history_fc_signed(x_grid) if self.state_feedback else None
         graph_input = signed_fc.abs() if signed_fc is not None else self._graph_input(x_grid, sc_matrix)
-        tokens, sc_info = self._encode(x_grid, graph_input)
+        tokens, sc_info = self._encode(x_grid, graph_input, personal_parameters)
         if signed_fc is not None:
             sc_info['signed_fc'] = signed_fc
         return tokens, x_grid, norm_stats, sc_info
@@ -793,6 +828,28 @@ class NeuroTwinTFM(nn.Module):
         if not self.dynamics_history_memory:
             return None
         return _pool_history_tokens(tokens)
+
+    def _resolve_profile(self, profile: Optional[torch.Tensor],
+                         calibration_bold: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if self.personalized:
+            if profile is None and calibration_bold is not None:
+                # 基线另走一次共享编码器；训练时保持梯度，不缓存 detached tokens
+                profile = self.calibrate_profile(calibration_bold)
+            elif profile is None:
+                raise ValueError(
+                    'personalized=True 的 forward 需要 profile 或 '
+                    'calibration_bold 之一（不偷偷从包含未来的全序列计算）。')
+        else:
+            profile = None
+        return profile
+
+    def generate_personal_parameters(self, profile: Optional[torch.Tensor]) -> Optional[dict]:
+        generator = self.one_step_head.personal_dynamics
+        return generator(profile) if generator is not None else None
+
+    def encode_pathology(self, bold_tokens: torch.Tensor) -> Optional[dict]:
+        encoder = self.one_step_head.pathology_dynamics
+        return encoder(bold_tokens) if encoder is not None else None
 
     def calibrate_profile(self, calibration_bold: torch.Tensor) -> torch.Tensor:
         """基线 ``[B,F,1,L]`` → p ``[B,profile_dim]``（共享编码器一次，方案 §5/§6.3）。
@@ -843,12 +900,15 @@ class NeuroTwinTFM(nn.Module):
                 profile = self.calibrate_profile(calibration_bold)
         else:
             profile = None
+        personal_parameters = self.generate_personal_parameters(profile)
         tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
-            history, sc_matrix, cond)
+            history, sc_matrix, cond, personal_parameters)
         q_anchor, signed_adj = self._feedback_context(x_grid, sc_info.get('signed_fc'))
         state = {'z': self._initial_latent(tokens, cond), 'q': x_grid[:, :, -1],
                  'adj': self._symmetrize_adj(sc_info['A_eff']),
                  'cond': cond, 'profile': profile,
+                 'personal_parameters': personal_parameters,
+                 'pathology_parameters': self.encode_pathology(tokens),
                  'memory': self._history_memory(tokens),
                  'q_anchor': q_anchor, 'signed_adj': signed_adj,
                  'norm_stats': norm_stats, 'history': history}
@@ -874,7 +934,9 @@ class NeuroTwinTFM(nn.Module):
             state['z'], state['q'], state['adj'], dt,
             cond=state['cond'], profile=state['profile'], control=control,
             memory=state.get('memory'), q_anchor=state.get('q_anchor'),
-            signed_adj=state.get('signed_adj'))
+            signed_adj=state.get('signed_adj'),
+            personal_parameters=state.get('personal_parameters'),
+            pathology_parameters=state.get('pathology_parameters'))
         x_new = self._denorm_q(q_new, state['norm_stats'])     # [B,F] 数据尺度
         history_new = torch.cat(
             [state['history'][:, 1:, :], x_new.unsqueeze(1)], dim=1)
@@ -905,10 +967,11 @@ class NeuroTwinTFM(nn.Module):
         history_new[:, -1, :] = observation
         sc_matrix = state.get('sc_matrix')
         tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
-            history_new, sc_matrix, state['cond'])
+            history_new, sc_matrix, state['cond'], state.get('personal_parameters'))
         new_state = dict(state)
         q_anchor, signed_adj = self._feedback_context(x_grid, sc_info.get('signed_fc'))
         new_state.update({'z': self._initial_latent(tokens, state['cond']), 'q': x_grid[:, :, -1],
+                          'pathology_parameters': self.encode_pathology(tokens),
                           'adj': self._symmetrize_adj(sc_info['A_eff']),
                           'memory': self._history_memory(tokens),
                           'q_anchor': q_anchor, 'signed_adj': signed_adj,

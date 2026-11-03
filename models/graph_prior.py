@@ -155,7 +155,8 @@ class SoftAnatomicalPrior(nn.Module):
     # 前向
     # ------------------------------------------------------------------
     def forward(self, h: torch.Tensor, sc_matrix: torch.Tensor,
-                adj_norm: torch.Tensor = None) -> dict:
+                adj_norm: torch.Tensor = None,
+                personal_delta: torch.Tensor = None) -> dict:
         """由输入特征 h [B, F, W, S] 生成软邻接矩阵。
 
         Args:
@@ -186,6 +187,9 @@ class SoftAnatomicalPrior(nn.Module):
             da = 0.5 * (da + da.transpose(-1, -2))
             # ΔA 可正可负，裁剪保证非负（Sinkhorn 要求非负）
             a = (a + F.softplus(self.delta_scale) * da).clamp_min(0.0)
+
+        if personal_delta is not None:
+            a = (a + personal_delta.to(a.dtype)).clamp_min(0.0)
 
         eye = torch.eye(n, device=a.device, dtype=a.dtype).unsqueeze(0)
         a = symmetric_sinkhorn(a + self.self_loop_eps * eye,

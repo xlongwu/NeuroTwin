@@ -287,12 +287,29 @@ def fc_pattern_pcc(pred: torch.Tensor, target: torch.Tensor,
         return (a * b).sum(dim=1) / denom
 
 
+def normalized_covariance_mse(pred: torch.Tensor, target: torch.Tensor,
+                              mask: torch.Tensor = None) -> torch.Tensor:
+    """连接与振幅共同监督；两侧使用相同的真实信号方差归一化。"""
+    valid = (torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+             if mask is None else complete_sequence_mask(mask, pred.shape[-1]))
+    if not bool(valid.any()):
+        return pred.sum() * 0
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        p, t = pred[valid].float(), target[valid].float()
+        p, t = p - p.mean(-1, keepdim=True), t - t.mean(-1, keepdim=True)
+        scale = t.square().mean((1, 2), keepdim=True).detach().clamp_min(1e-4)
+        pc = torch.bmm(p, p.transpose(1, 2)) / p.shape[-1]
+        tc = torch.bmm(t, t.transpose(1, 2)) / t.shape[-1]
+        return ((pc - tc) / scale).square().mean()
+
+
 class ForecastFidelityLoss(nn.Module):
     """H1–H future loss: reconstruction + FC + frequency, uncertainty-weighted.
 
     ``pred``/``target`` are ``[B, F, H]`` trajectories in BOLD units. The three
     terms follow the documented reconstruction (L1), functional-connectivity
-    (MSE between Pearson FC matrices) and frequency (L1 between rFFT magnitudes)
+    (Pearson FC MSE, or target-normalized covariance MSE including variance)
+    and frequency (L1 between rFFT magnitudes)
     objectives. With ``weighting='uncertainty'`` each enabled task gets a
     learnable log-variance ``s_i`` and contributes ``exp(-s_i)·L_i + s_i``
     (Kendall et al., CVPR 2018); initial ``s_i = -log(lambda_i)`` keeps the
@@ -303,7 +320,8 @@ class ForecastFidelityLoss(nn.Module):
     TASKS = ('rec', 'fc', 'freq')
 
     def __init__(self, lambda_rec: float = 1.0, lambda_fc: float = 1.0,
-                 lambda_freq: float = 1.0, weighting: str = 'uncertainty'):
+                 lambda_freq: float = 1.0, weighting: str = 'uncertainty',
+                 fc_objective: str = 'pearson'):
         super().__init__()
         for name, value in (('rec', lambda_rec), ('fc', lambda_fc),
                             ('freq', lambda_freq)):
@@ -314,6 +332,9 @@ class ForecastFidelityLoss(nn.Module):
             raise ValueError(
                 f"weighting must be 'fixed' or 'uncertainty', got {weighting!r}")
         self.weighting = str(weighting)
+        if fc_objective not in ('pearson', 'covariance'):
+            raise ValueError(f'Unknown fc_objective: {fc_objective}')
+        self.fc_objective = fc_objective
         self.log_s = nn.ParameterDict()
         if weighting == 'uncertainty':
             for name in self.TASKS:
@@ -361,7 +382,8 @@ class ForecastFidelityLoss(nn.Module):
 
         raw = {
             'rec': masked_l1(pred, target, mask),
-            'fc': fc_mse(pred, target, mask),
+            'fc': (normalized_covariance_mse(pred, target, mask)
+                   if self.fc_objective == 'covariance' else fc_mse(pred, target, mask)),
             'freq': frequency_l1(pred, target, mask),
         }
         valid = {

@@ -4,7 +4,7 @@
 > **制定日期**：2026-11-02  
 > **项目**：[NeuroTwin](https://github.com/xlongwu/NeuroTwin)  
 > **方案类型**：模型结构设计与训练策略优化  
-> **状态**：待实施（设计方案，不代表已有实验结果）  
+> **状态**：IDG、SDRL、PDD 代码及训练/评估入口已实施；真实数据训练与研究对照待执行（不代表已有实验结果）
 > **基线**：截至 2026-10-28 的 H1–8 研究主线；以当前 `main` 分支、实际 checkpoint 内嵌配置及数据划分为准。
 
 ---
@@ -400,7 +400,8 @@ $$
 ### 6.2 阶段 I：HC 个体化动力学预训练
 
 **训练数据**：沿用已有 HC train 被试划分；每个训练样本使用合法的历史与预测锚点，增加同被试历史窗口配对。  
-**初始化**：从当前 HC 模型权重加载已有模块；新增 IDG/SDRL 分支零输出或保守初始化。  
+**初始化**：按 2026-11-02 最新训练要求，从随机初始化完整训练修改后的模型，不加载修改前 HC 权重；新增 IDG/SDRL 分支保持保守初始化。
+
 **训练范围**：共享主干、Profile、IDG、Graph-ODE 均可端到端优化；可以使用短暂的新增模块 warm-up，但无需分成多轮人工验收。
 
 保留现有主预测目标：
@@ -629,6 +630,55 @@ training:
 
 每完成一个实际模块，即同步完成相应代码、配置与训练入口，再用真实模型实验检验，不采用大量独立“验证阶段”代替实施。
 
+### 9.4 已实施入口（2026-11-02）
+
+原正式基线 `configs/neurotwin.json` 不变。新增 `configs/individualized_dynamics.json` 提供 B0–B3 配方，`main.py --dynamics_experiment` 读取配方后仍允许命令行覆盖；新开关及参数写入 checkpoint 的 `config.args`，评估侧可严格重建。
+
+| 实验 | 可执行实现 | 入口 |
+|---|---|---|
+| B0 | 原 Profile/FiLM 健康基线，不开启新增模块 | `bash scripts/train_individualized.sh B0` |
+| B1 | IDG 区域扩散修正、低秩动力学与个体图；时间差分及参数正则 | `bash scripts/train_individualized.sh B1` |
+| B2 | B1 + 合法双窗口一致性与主体对比 | `bash scripts/train_individualized.sh B2` |
+| B3 | 从本次 B2 健康权重加载，训练 PDD 和小学习率读出；每个 MDD batch 配对一个 HC train batch | `bash scripts/train_individualized.sh B3 --pretrained_weight "$HC_PERSONALIZED"` |
+
+当前 B1/B2 从随机初始化开始，B3 的 `HC_PERSONALIZED` 必须指向本次 B2 生成的 checkpoint。B1–B3 最大训练轮数为 150，按 H1–8 被试级 MAE 选模，连续 12 轮不改善则早停。训练使用固定权重：重建 1、目标方差归一化协方差误差 0.1、频域 1、首步在内的时间差分 0.1。协方差包含对角方差，两侧使用同一个真实信号尺度，避免纯相关目标奖励振幅收缩；报告仍保留原 Pearson FC 指标。速率读出权重采用标准差 0.01 的小幅非零初始化，使预测梯度首步即可进入编码器。EMA 衰减改为 0.99。
+
+完整两阶段命令（输出目录必须尚不存在）：
+
+```bash
+bash scripts/train_individualized_full.sh checkpoints/个体化从零完整训练
+```
+
+该脚本快照当前代码，固定原 HC/MDD 划分，先训练 B2，再将本次最佳 B2 权重传入 B3；保存每轮训练状态、两阶段日志与运行状态。支持 `DATA_ROOT`、`DEVICE`、`PYTHON` 和 `CUDA_VISIBLE_DEVICES` 环境变量。单阶段入口仍支持原 CLI 参数覆盖。
+
+SDRL 的主 Profile 始终来自最早 32 TR，第二窗固定为 TR 33–64；锚点没有完整观察两窗时跳过辅助损失。对比按被试去重，重复样本不互作负样本。当前沿用原长度分桶与随机混合批次，没有新增站点/人口学匹配采样器；混杂控制仍须由后续研究对照完成。前 5 轮不加入 SDRL，随后 10 轮线性渐入；一致性和主体对比的最终权重各为 `lambda_subject=0.005`。
+
+PDD 默认使用 `hc3/demo`，仅把人口学字段作为预测条件；病理编码器只接收 BOLD tokens。HAMD 保留作原划分的分层元数据，不进入预测条件。冻结健康编码器、条件模块、Profile、IDG 和共享动力学，整个 B3 训练期间不自动解冻；另允许 BOLD 速率读出以病理分支学习率的 0.2 倍更新。HC 参考来自原 HC train 划分，默认使用原 manifest，可通过 `--hc_reference_split` 指定同一份既有划分。HC 病理算子零参照权重为 `lambda_hc_reference=1.0`，MDD 与 HC batch 的总损失等权平均。
+
+默认关闭临床回归；确有有效 HAMD 目标时，显式增加：
+
+```bash
+bash scripts/train_individualized.sh B3 \
+  --pretrained_weight "$HC_PERSONALIZED" \
+  --clinical_target_field HAMD --lambda_clinical 0.05
+```
+
+HAMD 目标仅从 merged 表读取，缺失值按独立 mask 排除，不用于 BOLD 表征输入。病理分支输出为辅助疾病 logit、可选临床读出及低秩增量，均不能直接作为疾病因果解释。
+
+训练后的个体化诊断入口：
+
+```bash
+python -m analysis.individualized_dynamics \
+  --checkpoint "$HC_PERSONALIZED" --data-root data \
+  --split test --out-dir results/个体化动力学新实验/表格
+```
+
+该入口导出中文命名的三份 CSV 和 JSON 汇总：原 Profile/跨被试交换/零 Profile 的 H1–8 MAE、扫描内 Profile/参数稳定性、检索命中率及个体/病理参数。对 B3 可分别指定 `--cohort hc` 和 `--cohort mdd`，同时比较关闭病理分支的健康基础预测。供体在同队列同划分内按被试排序循环选择；各锚点先在被试内平均，再跨被试汇总。零 Profile 是输入消融，不等同于移除整个 IDG；共享动力学对照使用独立 B0。
+
+模型代码位于 `models/individual_dynamics.py`、`models/tfm.py`、`models/tfm_dynamics.py` 和 `models/graph_prior.py`；采样位于 `utils/dataloader.py`；辅助目标和 HC 参照位于 `train/individualized.py`。新增模块使用零系数、非零低秩基初始化，保留已有模块权重与梯度通路。
+
+**交付边界**：已实现代码集成与轻量合成数据检查；当前从零训练的进度以对应输出目录中的运行状态和日志为准，尚不能据此宣称新配方已提升效果。真实数据收益、站点控制后的疾病/临床关联、相对静态 FC 的增量及 PDF 图件，仍需在训练后用相同划分完成。第 7 节随机长程动力学仍作为后续独立扩展。
+
 ---
 
 ## 10. 预期研究贡献与可检验假设
@@ -699,4 +749,4 @@ HC 基础动力学 + MDD 病理候选残差
 - MINDy 相关研究：<https://pmc.ncbi.nlm.nih.gov/articles/PMC7875185/>
 - *Building digital twin brains at the limits of measurement*：<https://www.nature.com/articles/s44287-026-00320-8>
 
-> **说明**：本文件是下一版模型研发方案。所列新增模块、数值超参数与预期贡献均为设计建议，尚未在 NeuroTwin 上实施或验证；已有模型表现与历史结果必须以实际 checkpoint 和评估协议为准。
+> **说明**：本文件保留模型研发设计及科学假设。新增核心模块、配方和入口已按 §9.4 实施，数值超参数和预期贡献尚未经真实数据实验验证；已有模型表现与历史结果必须以实际 checkpoint 和评估协议为准。
