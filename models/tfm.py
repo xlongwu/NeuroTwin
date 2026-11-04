@@ -21,9 +21,10 @@ from models.tfm_backbone import (
     RMSNorm,
     TFMEncoderBlock,
     TemporalPatchEmbed,
+    SpectralMemoryEncoder,
     build_context_grid,
 )
-from models.tfm_dynamics import GraphODEDynamicsHead
+from models.tfm_dynamics import GraphODEDynamicsHead, SpectralOscillator
 from models.tfm_personal import ProfileEncoder
 
 
@@ -289,6 +290,12 @@ class NeuroTwinTFM(nn.Module):
         pathology_rank: int = 4,
         pathology_residual_scale: float = 0.05,
         dynamics_readout_init_std: float = 0.0,
+        spectral_memory: bool = False,
+        spectral_oscillator: bool = False,
+        spectral_tr: float = 2.0,
+        spectral_min_hz: float = 0.01,
+        spectral_max_hz: float = 0.10,
+        spectral_latent_drive: bool = False,
     ):
         super().__init__()
         if patch_len < 1 or context_max < patch_len:
@@ -458,6 +465,32 @@ class NeuroTwinTFM(nn.Module):
                 self.one_step_head.pathology_dynamics = PathologyDynamics(
                     dim, pathology_dim, pathology_rank, pathology_residual_scale)
 
+        if spectral_memory and not self.dynamics_history_memory:
+            raise ValueError('spectral_memory requires dynamics_history_memory=True')
+        if spectral_latent_drive and not spectral_oscillator:
+            raise ValueError('spectral_latent_drive requires spectral_oscillator=True')
+        self.spectral_encoder = None
+        self.spectral_memory_gate = None
+        self.spectral_memory_proj = None
+        # New modules leave shared initialization unchanged across E0/E1/E2.
+        with isolated_global_rng():
+            if spectral_memory or spectral_oscillator:
+                self.spectral_encoder = SpectralMemoryEncoder(
+                    context_max, dim, spectral_tr, spectral_min_hz, spectral_max_hz)
+                if not spectral_oscillator:
+                    self.spectral_encoder.state_gain.requires_grad_(False)
+                if not spectral_memory:
+                    self.spectral_encoder.proj.requires_grad_(False)
+                    self.spectral_encoder.mode_logits.requires_grad_(False)
+            if spectral_memory:
+                self.spectral_memory_gate = nn.Linear(2 * dim, dim)
+                self.spectral_memory_proj = nn.Linear(dim, dim, bias=False)
+                nn.init.normal_(self.spectral_memory_proj.weight, std=0.001)
+            if spectral_oscillator:
+                self.one_step_head.spectral_oscillator = SpectralOscillator(
+                    dim, self.spectral_encoder.omega, head_cond_dim,
+                    self.profile_dim, spectral_latent_drive)
+
     # ------------------------------------------------------------------
     # 内部构件
     # ------------------------------------------------------------------
@@ -609,13 +642,17 @@ class NeuroTwinTFM(nn.Module):
         # dynamics_horizon 是可选覆盖，缺省复用 CPM H（不新增 horizon CLI）
         dyn_h = (int(dynamics_horizon)
                  if dynamics_horizon is not None else self.cpm_horizon)
-        memory = self._history_memory(tokens)
+        memory, osc_u, osc_v = self._spectral_context(tokens, x_grid)
         q_anchor, signed_adj = self._feedback_context(x_grid, signed_fc)
+        if time_deltas is None:
+            time_deltas = torch.full((dyn_h,), self.dynamics_dt,
+                                     device=z_t.device, dtype=torch.float32)
         z_final, q_traj_norm, z_traj = self.one_step_head(
             z_t, x_last_norm, sc_info['A_eff'], cond=cond, profile=profile,
             controls=controls, time_deltas=time_deltas, horizon=dyn_h,
             memory=memory, q_anchor=q_anchor, signed_adj=signed_adj,
-            personal_parameters=personal_parameters, pathology_parameters=pathology_parameters)
+            personal_parameters=personal_parameters, pathology_parameters=pathology_parameters,
+            osc_u=osc_u, osc_v=osc_v)
         del z_final   # forward 只消费 q 轨迹；latent 末状态经 state API 使用
         # 主输出 = 动态轨迹第一帧（反归一化后 [B,F,1,1]），不再额外加 x_last
         one_pred_norm = q_traj_norm[:, :, 0:1].unsqueeze(-1)
@@ -843,6 +880,17 @@ class NeuroTwinTFM(nn.Module):
             profile = None
         return profile
 
+    def _spectral_context(self, tokens: torch.Tensor, x_grid: torch.Tensor):
+        memory = self._history_memory(tokens)
+        if self.spectral_encoder is None:
+            return memory, None, None
+        freq_memory, osc_u, osc_v = self.spectral_encoder(x_grid)
+        if self.spectral_memory_gate is not None:
+            with torch.autocast(device_type=x_grid.device.type, enabled=False):
+                gate = self.spectral_memory_gate(torch.cat((memory, freq_memory), -1)).sigmoid()
+                memory = memory + gate * self.spectral_memory_proj(freq_memory)
+        return memory, osc_u, osc_v
+
     def generate_personal_parameters(self, profile: Optional[torch.Tensor]) -> Optional[dict]:
         generator = self.one_step_head.personal_dynamics
         return generator(profile) if generator is not None else None
@@ -904,14 +952,17 @@ class NeuroTwinTFM(nn.Module):
         tokens, x_grid, norm_stats, sc_info = self._encode_history_internal(
             history, sc_matrix, cond, personal_parameters)
         q_anchor, signed_adj = self._feedback_context(x_grid, sc_info.get('signed_fc'))
+        memory, osc_u, osc_v = self._spectral_context(tokens, x_grid)
         state = {'z': self._initial_latent(tokens, cond), 'q': x_grid[:, :, -1],
                  'adj': self._symmetrize_adj(sc_info['A_eff']),
                  'cond': cond, 'profile': profile,
                  'personal_parameters': personal_parameters,
                  'pathology_parameters': self.encode_pathology(tokens),
-                 'memory': self._history_memory(tokens),
+                 'memory': memory,
                  'q_anchor': q_anchor, 'signed_adj': signed_adj,
                  'norm_stats': norm_stats, 'history': history}
+        if self.one_step_head.spectral_oscillator is not None:
+            state.update(osc_u=osc_u, osc_v=osc_v)
         return state
 
     def advance_state(self, state: dict, control: Optional[torch.Tensor] = None,
@@ -930,18 +981,26 @@ class NeuroTwinTFM(nn.Module):
         if dt is None:
             dt = torch.full((state['z'].shape[0],), float(self.dynamics_dt),
                             device=state['z'].device, dtype=torch.float32)
-        z_new, q_new = self.one_step_head.integrate_interval(
+        else:
+            dt = torch.as_tensor(dt, device=state['z'].device, dtype=torch.float32)
+            if dt.ndim == 0:
+                dt = dt.expand(state['z'].shape[0])
+        advanced = self.one_step_head.integrate_interval(
             state['z'], state['q'], state['adj'], dt,
             cond=state['cond'], profile=state['profile'], control=control,
             memory=state.get('memory'), q_anchor=state.get('q_anchor'),
             signed_adj=state.get('signed_adj'),
             personal_parameters=state.get('personal_parameters'),
-            pathology_parameters=state.get('pathology_parameters'))
+            pathology_parameters=state.get('pathology_parameters'),
+            osc_u=state.get('osc_u'), osc_v=state.get('osc_v'))
+        z_new, q_new = advanced[:2]
         x_new = self._denorm_q(q_new, state['norm_stats'])     # [B,F] 数据尺度
         history_new = torch.cat(
             [state['history'][:, 1:, :], x_new.unsqueeze(1)], dim=1)
         new_state = dict(state)
         new_state.update({'z': z_new, 'q': q_new, 'history': history_new})
+        if self.one_step_head.spectral_oscillator is not None:
+            new_state.update(osc_u=advanced[2], osc_v=advanced[3])
         return new_state
 
     def readout_state(self, state: dict) -> torch.Tensor:
@@ -970,12 +1029,15 @@ class NeuroTwinTFM(nn.Module):
             history_new, sc_matrix, state['cond'], state.get('personal_parameters'))
         new_state = dict(state)
         q_anchor, signed_adj = self._feedback_context(x_grid, sc_info.get('signed_fc'))
+        memory, osc_u, osc_v = self._spectral_context(tokens, x_grid)
         new_state.update({'z': self._initial_latent(tokens, state['cond']), 'q': x_grid[:, :, -1],
                           'pathology_parameters': self.encode_pathology(tokens),
                           'adj': self._symmetrize_adj(sc_info['A_eff']),
-                          'memory': self._history_memory(tokens),
+                          'memory': memory,
                           'q_anchor': q_anchor, 'signed_adj': signed_adj,
                           'norm_stats': norm_stats, 'history': history_new})
+        if self.one_step_head.spectral_oscillator is not None:
+            new_state.update(osc_u=osc_u, osc_v=osc_v)
         return new_state
 
     def simulate_intervention(self, history: torch.Tensor, controls: torch.Tensor,

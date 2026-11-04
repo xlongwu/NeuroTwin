@@ -1,6 +1,7 @@
 # coding=utf-8
 """学习率调度契约：每个参数组按自身峰值比例衰减，不能反向升高。"""
 import math
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -97,3 +98,37 @@ def test_scheduler_covers_groups_added_after_construction():
     for _ in range(10):
         _step(opt, sched)
     assert opt.param_groups[-1]['lr'] == pytest.approx(1e-5)
+
+
+def test_resume_allows_only_epoch_budget_increase(monkeypatch):
+    from main import _resume_argument_mismatches, parse_args
+    monkeypatch.setattr('sys.argv', ['main.py', '--mode', 'pretrain'])
+    saved = vars(parse_args()).copy()
+    saved['train_epochs'] = 30
+    current = {**saved, 'train_epochs': 150}
+    assert _resume_argument_mismatches(saved, current) == {}
+    assert _resume_argument_mismatches(saved, {**current, 'train_epochs': 29}) == {
+        'train_epochs': (30, 29)}
+    assert 'lr_peak' in _resume_argument_mismatches(
+        saved, {**current, 'lr_peak': saved['lr_peak'] * 2})
+
+
+def test_extended_budget_restores_optimizer_and_schedule_position():
+    opt = _optimizer()
+    sched = build_scheduler(opt, _args(train_epochs=30))
+    for _ in range(6):
+        for group in opt.param_groups:
+            for param in group['params']:
+                param.grad = torch.ones_like(param)
+        _step(opt, sched)
+    saved_opt, saved_sched = deepcopy(opt.state_dict()), deepcopy(sched.state_dict())
+    restored_opt = _optimizer()
+    restored = build_scheduler(restored_opt, _args(train_epochs=150))
+    restored_opt.load_state_dict(saved_opt)
+    restored.load_state_dict(saved_sched)
+    assert restored.last_epoch == 6
+    assert _lrs(restored_opt) == pytest.approx(_lrs(opt))
+    assert all(state['step'] == 6 for state in restored_opt.state.values())
+    _step(restored_opt, restored)
+    factor = .5 + .5 * .5 * (1 + math.cos(math.pi * (7 - 5) / (150 - 5)))
+    assert _lrs(restored_opt) == pytest.approx([2e-5 * factor, 1e-4 * factor])

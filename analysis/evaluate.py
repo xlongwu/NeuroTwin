@@ -1,8 +1,8 @@
 # coding=utf-8
 """统一评估入口：从 checkpoint 重建完整模型 → 评估 → 落盘指标。
 
-唯一任务口径 next_timepoint（连续 BOLD context → 下一 TR 全脑状态）；当前阶段
-只评估 H1–8 短程轨迹，free rollout 与 rollout 长度上的 FC/频谱默认关闭。
+唯一任务口径 next_timepoint（连续 BOLD context → 下一 TR 全脑状态）；
+预测范围及 free rollout、FC、频谱开关沿用 checkpoint 的训练配置。
 
 关键点（模型重建口径）：
   构造 NeuroTwinTFM 若只传部分参数，结构性变体（tfm_patch_len/cpm_horizon/
@@ -229,14 +229,17 @@ def evaluate_next_point(ckpt_path, out_dir, args, eval_splits=('test',), seed=20
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # None = 沿用 checkpoint 训练配置中的开关；当前阶段的 checkpoint 不记录
-    # rollout 开关，因此默认关闭长程自由 rollout 及其上的 FC/频谱分析。
+    # None = 沿用 checkpoint 配置；旧 H1–8 快照未记录开关时保持关闭。
     eval_rollout = getattr(args, 'eval_rollout', False) if eval_rollout is None else eval_rollout
     eval_fc = getattr(args, 'eval_fc', False) if eval_fc is None else eval_fc
     eval_spectral = (getattr(args, 'eval_spectral', False) if eval_spectral is None
                      else eval_spectral)
     spectral_tr = (getattr(args, 'eval_spectral_tr', 2.0) if spectral_tr is None
                    else spectral_tr)
+    # Loader construction must use the same effective switches as inference,
+    # including explicit --rollout/--no_rollout overrides of a saved recipe.
+    args = Namespace(**vars(args))
+    args.eval_rollout, args.eval_fc, args.eval_spectral = eval_rollout, eval_fc, eval_spectral
 
     condition_bundle = load_condition_bundle(ckpt_path)
     model = build_model_from_args(args, device, condition_bundle=condition_bundle)

@@ -65,6 +65,57 @@ class VarianceHead(nn.Module):
         return logvar.clamp(LOGVAR_MIN, LOGVAR_MAX)
 
 
+class SpectralOscillator(nn.Module):
+    """Damped rotations in radians/TR, with latent and personal/clinical drive."""
+
+    def __init__(self, dim: int, omega: torch.Tensor, cond_dim: int = 0,
+                 profile_dim: int = 0, latent_drive: bool = False):
+        super().__init__()
+        self.register_buffer('omega', omega.clone())
+        modes = omega.numel()
+        self.damping_raw = nn.Parameter(torch.full((modes,), float(np.log(np.expm1(0.01)))))
+        self.norm = nn.LayerNorm(dim)
+        self.cond_dim, self.profile_dim = cond_dim, profile_dim
+        width = dim + cond_dim + profile_dim
+        self.drive = nn.Linear(width, 2 * modes)
+        nn.init.normal_(self.drive.weight, std=0.001)
+        nn.init.zeros_(self.drive.bias)
+        self.gate = nn.Linear(width, 1)
+        self.readout = nn.Linear(modes, 1, bias=False)
+        nn.init.zeros_(self.readout.weight)
+        self.latent_proj = nn.Linear(2 * modes, dim, bias=False) if latent_drive else None
+        if self.latent_proj is not None:
+            nn.init.zeros_(self.latent_proj.weight)
+
+    def _features(self, z: torch.Tensor, cond: Optional[torch.Tensor],
+                  profile: Optional[torch.Tensor]) -> torch.Tensor:
+        parts = [self.norm(z)]
+        for width, value in ((self.cond_dim, cond), (self.profile_dim, profile)):
+            if width:
+                v = z.new_zeros((z.shape[0], width)) if value is None else value
+                parts.append(v.unsqueeze(1).expand(-1, z.shape[1], -1))
+        return torch.cat(parts, dim=-1)
+
+    def forcing(self, z: torch.Tensor, cond: Optional[torch.Tensor] = None,
+                profile: Optional[torch.Tensor] = None) -> tuple:
+        return (0.01 * self.drive(self._features(z, cond, profile)).tanh()).chunk(2, -1)
+
+    def rotate(self, u: torch.Tensor, v: torch.Tensor, dt: torch.Tensor) -> tuple:
+        angle = dt[:, None, None] * self.omega
+        decay = torch.exp(-dt[:, None, None] * F.softplus(self.damping_raw))
+        return (decay * (angle.cos() * u - angle.sin() * v),
+                decay * (angle.sin() * u + angle.cos() * v))
+
+    def rate(self, z: torch.Tensor, u: torch.Tensor,
+             cond: Optional[torch.Tensor] = None,
+             profile: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return (self.gate(self._features(z, cond, profile)).sigmoid()
+                * self.readout(u)).squeeze(-1)
+
+    def field(self, u: torch.Tensor, v: torch.Tensor):
+        return self.latent_proj(torch.cat((u, v), -1)) if self.latent_proj is not None else 0.0
+
+
 class GraphODEDynamicsHead(nn.Module):
     """受控条件图 ODE 头（方案 §6.1）：向量场 + 固定 Heun RK2。
 
@@ -105,6 +156,7 @@ class GraphODEDynamicsHead(nn.Module):
         self.state_feedback = bool(state_feedback)
         self.personal_dynamics = None
         self.pathology_dynamics = None
+        self.spectral_oscillator = None
 
         # ---- 神经残差：W1 Xavier / W2 std=0.01 / bias 零 ----
         self.norm_z = nn.LayerNorm(self.dim)
@@ -310,7 +362,9 @@ class GraphODEDynamicsHead(nn.Module):
                            q_anchor: Optional[torch.Tensor] = None,
                            signed_adj: Optional[torch.Tensor] = None,
                            personal_parameters: Optional[dict] = None,
-                           pathology_parameters: Optional[dict] = None):
+                           pathology_parameters: Optional[dict] = None,
+                           osc_u: Optional[torch.Tensor] = None,
+                           osc_v: Optional[torch.Tensor] = None):
         """在**一个**预测区间内以固定 Heun RK2 同步推进 latent Z 与归一化 BOLD q。
 
         Args:
@@ -319,6 +373,7 @@ class GraphODEDynamicsHead(nn.Module):
             memory: [B,D] 或 [B,F,D] 历史记忆（None 时关闭）
         Returns:
             (z_new [B,F,D], q_new [B,F]) float32，保留反向图（不 detach）。
+            启用振荡器时追加 osc_u_new、osc_v_new [B,F,M]。
 
         第二 stage 在预测 latent 上重新计算向量场，状态相关控制门随之重算；
         A/c/p/u 在区间内固定。积分关闭 autocast、以 float32 运算。
@@ -339,6 +394,11 @@ class GraphODEDynamicsHead(nn.Module):
             m32 = memory.float() if memory is not None else None
             anchor32 = q_anchor.float() if q_anchor is not None else None
             signed32 = signed_adj.float() if signed_adj is not None else None
+            oscillator = self.spectral_oscillator
+            if oscillator is not None:
+                if osc_u is None or osc_v is None:
+                    raise ValueError('spectral oscillator requires osc_u and osc_v initialized from history')
+                osc_u, osc_v = osc_u.float(), osc_v.float()
             h = (dt.float() / self.ode_steps)                  # [B]
             hz = h[:, None, None]                              # z 步长 [B,1,1]
             hq = h[:, None]                                    # q 步长 [B,1]
@@ -348,6 +408,15 @@ class GraphODEDynamicsHead(nn.Module):
                                  personal_parameters=personal_parameters,
                                  pathology_parameters=pathology_parameters)
                 v1 = self._rate(z32, q32, anchor32)
+                if oscillator is not None:
+                    k1 = k1 + oscillator.field(osc_u, osc_v)
+                    v1 = v1 + oscillator.rate(z32, osc_u, c32, p32)
+                    du1, dv1 = oscillator.forcing(z32, c32, p32)
+                    # Exponential Heun: exact homogeneous rotation and stage-aligned
+                    # trapezoidal forcing; q/z use the same start/end stages.
+                    eu, ev = oscillator.rotate(osc_u, osc_v, h)
+                    ed_u, ed_v = oscillator.rotate(du1, dv1, h)
+                    u_stage, v_stage = eu + hz * ed_u, ev + hz * ed_v
                 z_stage = z32 + hz * k1
                 q_stage = q32 + hq * v1
                 k2 = self._field(z_stage, adj32, c32, p32, u32,
@@ -355,8 +424,16 @@ class GraphODEDynamicsHead(nn.Module):
                                  signed_adj=signed32, personal_parameters=personal_parameters,
                                  pathology_parameters=pathology_parameters)
                 v2 = self._rate(z_stage, q_stage, anchor32)
+                if oscillator is not None:
+                    k2 = k2 + oscillator.field(u_stage, v_stage)
+                    v2 = v2 + oscillator.rate(z_stage, u_stage, c32, p32)
+                    du2, dv2 = oscillator.forcing(z_stage, c32, p32)
+                    osc_u = eu + 0.5 * hz * (ed_u + du2)
+                    osc_v = ev + 0.5 * hz * (ed_v + dv2)
                 z32 = z32 + 0.5 * hz * (k1 + k2)
                 q32 = q32 + 0.5 * hq * (v1 + v2)
+        if oscillator is not None:
+            return z32, q32, osc_u, osc_v
         return z32, q32
 
     # ------------------------------------------------------------------
@@ -372,7 +449,9 @@ class GraphODEDynamicsHead(nn.Module):
                 q_anchor: Optional[torch.Tensor] = None,
                 signed_adj: Optional[torch.Tensor] = None,
                 personal_parameters: Optional[dict] = None,
-                pathology_parameters: Optional[dict] = None):
+                pathology_parameters: Optional[dict] = None,
+                osc_u: Optional[torch.Tensor] = None,
+                osc_v: Optional[torch.Tensor] = None):
         """从初始状态连续推进 ``horizon`` 个预测区间。
 
         Args:
@@ -414,15 +493,19 @@ class GraphODEDynamicsHead(nn.Module):
             if time_deltas is None:
                 dt = ones
             elif time_deltas.ndim == 1:
-                dt = time_deltas.to(device=device, dtype=torch.float32).expand(b)
+                dt = time_deltas[hidx].to(device=device, dtype=torch.float32).expand(b)
             else:
                 dt = time_deltas[:, hidx].to(device=device, dtype=torch.float32)
-            z, q = self.integrate_interval(z, q, adj, dt, cond=cond,
+            advanced = self.integrate_interval(z, q, adj, dt, cond=cond,
                                            profile=profile, control=u,
                                            memory=memory, q_anchor=q_anchor,
                                            signed_adj=signed_adj,
                                            personal_parameters=personal_parameters,
-                                           pathology_parameters=pathology_parameters)
+                                           pathology_parameters=pathology_parameters,
+                                           osc_u=osc_u, osc_v=osc_v)
+            z, q = advanced[:2]
+            if self.spectral_oscillator is not None:
+                osc_u, osc_v = advanced[2:]
             z_traj.append(z)
             q_traj.append(q)
         z_final = z

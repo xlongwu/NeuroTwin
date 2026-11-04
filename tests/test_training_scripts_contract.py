@@ -49,7 +49,7 @@ def _prepare(tmp_path):
     return data, checkpoints
 
 
-def _run_script(tmp_path, script, capture):
+def _run_script(tmp_path, script, capture, model_config=None):
     data, checkpoints = _prepare(tmp_path)
     env = os.environ.copy()
     env.update(
@@ -59,11 +59,26 @@ def _run_script(tmp_path, script, capture):
         CHECKPOINT_DIR=str(checkpoints),
         TMPDIR=str(tmp_path / 'runtime'),
     )
+    if model_config is not None:
+        env['MODEL_CONFIG'] = str(model_config)
     proc = subprocess.run(
         ['bash', str(ROOT / 'scripts' / script)],
         cwd=ROOT, env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     return _parse_argv(capture)
+
+
+@pytest.mark.parametrize('suffix', ['baseline', 'memory', 'spectral', 'staged'])
+@pytest.mark.parametrize('stage', ['pretrain', 'finetune'])
+def test_h32_scripts_use_config_and_isolated_output(tmp_path, suffix, stage):
+    import json
+    config = ROOT / 'configs' / f'neurotwin_h32_{suffix}.json'
+    cfg = json.loads(config.read_text())
+    got = _run_script(tmp_path, f'{stage}.sh', tmp_path / 'args.txt', model_config=config)
+    assert got['model_config'] == str(config)
+    assert got['cpm_horizon'] == '32'
+    assert got['context_min'] == got['context_max'] == '64'
+    assert got['condition_arm'] == cfg['data_and_split']['conditioning'][stage]['condition_arm']
 
 
 def _parse_argv(path):

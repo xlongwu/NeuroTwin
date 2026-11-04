@@ -1,0 +1,11 @@
+{
+  "scope": "artificial phase sweep of a damped single sinusoid; isolated fixed-gate readout only",
+  "not_real_data_prediction": true,
+  "omega_radians_per_TR": 0.39269909262657166,
+  "damping_per_TR": 0.010000001639127731,
+  "optimal_U_coefficient_after_gate": -0.010000001639127731,
+  "U_only_derivative_MSE": 0.0771062895655632,
+  "U_V_derivative_MSE": 0.0,
+  "unexplained_derivative_energy_fraction": 0.999351978302002,
+  "boundary": "Full model has latent drive/gate/forcing inputs; this establishes a readout limitation, not its isolated causal contribution to E2 failure."
+}

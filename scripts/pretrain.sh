@@ -14,7 +14,6 @@ export TORCH_SHARING_STRATEGY="${TORCH_SHARING_STRATEGY:-file_system}"
 
 PYTHON_BIN="${PYTHON:-python}"
 data_root="${DATA_ROOT:-$ROOT/data}"
-checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
 RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-}"
 SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-False}"
@@ -28,6 +27,7 @@ name="neurotwin_pretrain"
 # 模型/损失/优化/条件共享值由 helper 导出；随机种子在 helper 内与
 # utils/condition_schema.py 的登记值逐项核对；阶段特有的 HC 条件臂也在 JSON。
 source "$ROOT/scripts/_model_defaults.sh"
+checkpoint_dir="${CHECKPOINT_DIR:-${config_checkpoint_dir:-$ROOT/checkpoints}}"
 if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
       || "$sampling_seed" == "$cond_dropout_seed" ]]; then
   echo "[错误] 随机来源未分离（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed），违反方案 §四" >&2
@@ -56,10 +56,7 @@ ema_decay="${EMA_DECAY:-$ema_decay}"
 batch_size="${BATCH_SIZE:-$batch_size}"
 patience="${PATIENCE:-$patience}"
 cpm_horizon="${CPM_HORIZON:-$cpm_horizon}"
-if [[ "$cpm_horizon" != "8" ]]; then
-  echo "[错误] 当前阶段只训练 H1–8，CPM_HORIZON 必须为 8（收到 $cpm_horizon）" >&2
-  exit 1
-fi
+
 
 # 数据加载并发（只影响吞吐，不影响训练结果）：默认关闭 pin_memory 以避免长时
 # 运行中 resource_sharer/pin-memory 线程因临时 socket 消失而中断训练。
@@ -72,6 +69,7 @@ pin_memory="${PIN_MEMORY:-False}"
   echo "[错误] 缺少 HC Raw 目录（$data_root/Raw/HC/ROISignals_<id>.mat，[T,F] 布局）"; exit 1; }
 
 ARGS=(
+  --model_config "$model_config_path"
   # ---- 基础与路径 ----
   --mode pretrain
   --seed "$seed"

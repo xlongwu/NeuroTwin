@@ -30,6 +30,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SpectralMemoryEncoder(nn.Module):
+    """History-only complex Fourier features on a fixed physical frequency grid.
+
+    Short contexts are zero-padded by rFFT to ``context_max``. Oscillator
+    coefficients are rotated to the last observed sample, rather than FFT t=0.
+    """
+
+    def __init__(self, context_max: int, dim: int, tr: float = 2.0,
+                 min_hz: float = 0.01, max_hz: float = 0.10):
+        super().__init__()
+        if not (math.isfinite(tr) and tr > 0
+                and 0 < min_hz <= max_hz <= 0.5 / tr):
+            raise ValueError('spectral band must satisfy 0 < min <= max <= Nyquist, TR > 0')
+        frequencies = torch.fft.rfftfreq(context_max, d=tr)
+        bins = ((frequencies >= min_hz) & (frequencies <= max_hz)).nonzero().flatten()
+        if bins.numel() == 0:
+            raise ValueError('spectral band contains no Fourier bins for context_max/TR')
+        self.context_max = int(context_max)
+        self.register_buffer('bins', bins)
+        self.register_buffer('omega', 2 * math.pi * frequencies[bins] * tr)
+        self.mode_logits = nn.Parameter(torch.zeros(len(bins)))
+        self.state_gain = nn.Parameter(torch.ones(len(bins)))
+        self.proj = nn.Sequential(nn.Linear(2 * len(bins), dim), nn.GELU())
+
+    def forward(self, history: torch.Tensor):
+        k = history.shape[-1]
+        if not 1 <= k <= self.context_max:
+            raise ValueError(f'spectral context length must be in [1,{self.context_max}], got {k}')
+        with torch.autocast(device_type=history.device.type, enabled=False):
+            coeff = torch.fft.rfft(history.float(), n=self.context_max, dim=-1,
+                                   norm='forward').index_select(-1, self.bins)
+            weights = self.mode_logits.softmax(-1) * self.bins.numel()
+            features = torch.stack((coeff.real, coeff.imag), dim=-1)
+            features = (features * weights[None, None, :, None]).flatten(-2)
+            memory = self.proj(features)
+            angle = self.omega * (k - 1)
+            real = coeff.real * angle.cos() - coeff.imag * angle.sin()
+            imag = coeff.real * angle.sin() + coeff.imag * angle.cos()
+            # Double the positive-frequency coefficients; Nyquist has no partner.
+            scale = torch.where(2 * self.bins == self.context_max, 1.0, 2.0)
+            return memory, real * scale * self.state_gain, imag * scale * self.state_gain
+
+
 class RMSNorm(nn.Module):
     """Root-Mean-Square 归一化（方案 §6.4 的 Block 使用 RMSNorm 而非 LayerNorm）。
 

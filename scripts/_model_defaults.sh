@@ -20,7 +20,8 @@ if [[ -z "${ROOT:-}" || -z "${PYTHON_BIN:-}" ]]; then
   return 1
 fi
 
-model_json="$ROOT/configs/neurotwin.json"
+model_config_path="${MODEL_CONFIG:-$ROOT/configs/neurotwin.json}"
+model_json="$model_config_path"
 [ -f "$model_json" ] || {
   echo "[错误] 找不到模型配置：$model_json" >&2
   return 1
@@ -50,6 +51,7 @@ if seeds != registry:
         f'json={seeds} registry={registry}')
 
 values = {
+    'config_checkpoint_dir': train.get('checkpoint_dir', ''),
     'seed': train['seed'],
     'sampling_seed': train['sampling_seed'],
     'cond_dropout_seed': train['cond_dropout_seed'],

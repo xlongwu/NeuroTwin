@@ -151,6 +151,17 @@ def check_pretrain_config_compat(pretrained_path, expected_dims: dict,
     if expected['model_arch'] == 'tfm':
         expected['patch_len'] = int(expected_dims['patch_len'])
         expected['cpm_horizon'] = int(expected_dims['cpm_horizon'])
+        # Same-shaped Fourier buffers can encode different physical frequencies;
+        # shape checks alone cannot establish HC→MDD spectral compatibility.
+        spectral_defaults = dict(spectral_memory=False, spectral_oscillator=False,
+                                 spectral_tr=2.0, spectral_min_hz=0.01,
+                                 spectral_max_hz=0.10, spectral_latent_drive=False)
+        if any(saved_args.get(k, False) or expected_dims.get(k, False)
+               for k in ('spectral_memory', 'spectral_oscillator')):
+            for key, default in spectral_defaults.items():
+                if key in expected_dims:
+                    saved[key] = saved_args.get(key, default)
+                    expected[key] = expected_dims[key]
     mismatch = {k: (saved.get(k), expected[k]) for k in expected
                 if saved.get(k) != expected[k]}
     if horizon_policy == 'repeat_last' and 'cpm_horizon' in mismatch:
@@ -624,6 +635,9 @@ def set_finetune_trainability(model: NeuroTwinTFM, backbone_unfrozen: bool = Fal
         # 条件 FiLM 等适配器已由上方条件模块循环解冻，不在此重复。
         if getattr(model, 'profile_encoder', None) is not None:
             backbone_modules.append(model.profile_encoder)
+        for name in ('spectral_encoder', 'spectral_memory_gate', 'spectral_memory_proj'):
+            if getattr(model, name, None) is not None:
+                backbone_modules.append(getattr(model, name))
         for module in backbone_modules:
             for p in module.parameters():
                 p.requires_grad = True

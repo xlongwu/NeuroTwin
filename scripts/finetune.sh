@@ -14,21 +14,21 @@ export TORCH_SHARING_STRATEGY="${TORCH_SHARING_STRATEGY:-file_system}"
 
 PYTHON_BIN="${PYTHON:-python}"
 data_root="${DATA_ROOT:-$ROOT/data}"
-checkpoint_dir="${CHECKPOINT_DIR:-$ROOT/checkpoints}"
 DEVICE="${DEVICE:-}"
 HC_WEIGHT="${HC_WEIGHT:-}"
 RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-}"
 SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-False}"
 name="neurotwin_finetune"
-if [[ -z "$HC_WEIGHT" && -z "$RESUME_TRAINING_STATE" ]]; then
-  HC_WEIGHT="$checkpoint_dir/neurotwin_pretrain/base_best.pt"
-fi
-pretrained_weight="$HC_WEIGHT"
 
 # ---- 模型配方（configs/neurotwin.json）----
 # 模型/损失/优化/条件共享值由 helper 导出；随机种子在 helper 内与
 # utils/condition_schema.py 的登记值逐项核对；阶段特有的 MDD 条件臂也在 JSON。
 source "$ROOT/scripts/_model_defaults.sh"
+checkpoint_dir="${CHECKPOINT_DIR:-${config_checkpoint_dir:-$ROOT/checkpoints}}"
+if [[ -z "$HC_WEIGHT" && -z "$RESUME_TRAINING_STATE" ]]; then
+  HC_WEIGHT="$checkpoint_dir/neurotwin_pretrain/base_best.pt"
+fi
+pretrained_weight="$HC_WEIGHT"
 if [[ "$seed" == "$sampling_seed" || "$seed" == "$cond_dropout_seed" \
       || "$sampling_seed" == "$cond_dropout_seed" ]]; then
   echo "[错误] 随机来源未分离（seed=$seed sampling=$sampling_seed dropout=$cond_dropout_seed）" >&2
@@ -62,10 +62,7 @@ pin_memory="${PIN_MEMORY:-False}"
 freeze_backbone_epochs="${FREEZE_BACKBONE_EPOCHS:-$freeze_backbone_epochs}"
 cpm_horizon="${CPM_HORIZON:-$cpm_horizon}"
 batch_size="${BATCH_SIZE:-$batch_size}"
-if [[ "$cpm_horizon" != "8" ]]; then
-  echo "[错误] 当前阶段只训练 H1–8，CPM_HORIZON 必须为 8（收到 $cpm_horizon）" >&2
-  exit 1
-fi
+
 
 # ---- 预检查 ----
 # graph_ode 路线用 raw + history_fc：只要求 Raw 目录与临床表，不要求 Mask，
@@ -81,6 +78,7 @@ if [[ -z "$RESUME_TRAINING_STATE" ]]; then
 fi
 
 ARGS=(
+  --model_config "$model_config_path"
   # ---- 基础与路径 ----
   --mode finetune
   --seed "$seed"

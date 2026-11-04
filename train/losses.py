@@ -1,6 +1,7 @@
 # coding=utf-8
 """TFM 双目标损失与 SC 软先验图正则。"""
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -321,7 +322,8 @@ class ForecastFidelityLoss(nn.Module):
 
     def __init__(self, lambda_rec: float = 1.0, lambda_fc: float = 1.0,
                  lambda_freq: float = 1.0, weighting: str = 'uncertainty',
-                 fc_objective: str = 'pearson'):
+                 fc_objective: str = 'pearson',
+                 rec_stage_weights: Optional[list[float]] = None):
         super().__init__()
         for name, value in (('rec', lambda_rec), ('fc', lambda_fc),
                             ('freq', lambda_freq)):
@@ -335,6 +337,12 @@ class ForecastFidelityLoss(nn.Module):
         if fc_objective not in ('pearson', 'covariance'):
             raise ValueError(f'Unknown fc_objective: {fc_objective}')
         self.fc_objective = fc_objective
+        self.rec_stage_weights = tuple(rec_stage_weights or ())
+        if self.rec_stage_weights and (
+                len(self.rec_stage_weights) != 3
+                or any(not math.isfinite(w) or w < 0 for w in self.rec_stage_weights)
+                or not math.isclose(sum(self.rec_stage_weights), 1.0)):
+            raise ValueError('rec_stage_weights must contain three nonnegative weights summing to 1')
         self.log_s = nn.ParameterDict()
         if weighting == 'uncertainty':
             for name in self.TASKS:
@@ -386,6 +394,20 @@ class ForecastFidelityLoss(nn.Module):
                    if self.fc_objective == 'covariance' else fc_mse(pred, target, mask)),
             'freq': frequency_l1(pred, target, mask),
         }
+        if self.rec_stage_weights:
+            if pred.shape[-1] != 32:
+                raise ValueError('staged reconstruction requires exactly H32')
+            stage_losses, active_weights = [], []
+            for (start, end), weight in zip(((0, 8), (8, 16), (16, 32)), self.rec_stage_weights):
+                stage_mask = mask[:, start:end] if mask is not None else None
+                valid_samples = (pred.new_ones(pred.shape[0]) if stage_mask is None
+                                 else (stage_mask > 0).any(-1).to(pred.dtype))
+                per_sample = masked_l1_per_sample(
+                    pred[:, :, start:end], target[:, :, start:end], stage_mask)
+                stage_losses.append(weight * (per_sample * valid_samples).sum()
+                                    / valid_samples.sum().clamp_min(1))
+                active_weights.append(weight * valid_samples.any().to(pred.dtype))
+            raw['rec'] = sum(stage_losses) / sum(active_weights).clamp_min(1e-8)
         valid = {
             'rec': rec_valid.any().to(pred.dtype),
             'fc': complete_valid.any().to(pred.dtype),

@@ -49,6 +49,7 @@ from train.optim import (ModelEMA, build_optimizer, build_scheduler,
 from train.training_state import (TrainingState, load_training_state,
                                   read_training_state_metadata,
                                   restore_rng_state, save_training_state)
+from train.forecast_metrics import STAGE_LABELS, h32_stage_metrics
 
 
 FILE = Path(__file__).resolve()
@@ -476,11 +477,11 @@ def _format_loss_weight(name, info):
 @torch.no_grad()
 def evaluate_tfm(model, data_loader, criterion, device, args,
                  pathology_epoch=None):
-    """H1–8 验证：单步、短程轨迹、FC 与频域指标。
+    """配置 horizon 验证：单步、自主轨迹、FC 与频域指标。
 
     H1–N MAE 和 FC MSE 先被试内平均、再跨被试等权。
     checkpoint_metric 决定按 MAE 或 MAE + FC MSE 选模。
-    FC/频域只统计具备完整 H1–8 真值的锚点。
+    FC/频域只统计具备完整 H1–N 真值的锚点。
     """
     model.eval()
     horizon = int(getattr(args, 'cpm_horizon', DYNAMICS_CKPT_HORIZON) or
@@ -527,6 +528,8 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
         pers_mae = masked_l1_per_sample(x_t, target, mask)
 
         complete = complete_sequence_mask(mask, horizon)
+        stage_metrics = (h32_stage_metrics(
+            dyn_pred, target, mask, bx[:, :, 0, -1]) if horizon == 32 else {})
         has_complete = bool(complete.any())
         fc_mse_v = fc_pcc_v = freq_v = None
         if has_complete:
@@ -552,6 +555,11 @@ def evaluate_tfm(model, data_loader, criterion, device, args,
             add_subject('mae_next', sid, mae_next[i].item())
             add_subject('rmse_next', sid, rmse_next[i].item())
             add_subject('pcc_next', sid, pcc_next[i].item())
+            for metric, values in stage_metrics.items():
+                for stage_idx, label in enumerate(STAGE_LABELS):
+                    if metric == 'mae' and label == 'H1_32':
+                        continue  # Already recorded by h_mae below.
+                    add_subject(f'{metric}_{label.lower()}', sid, values[i, stage_idx].item())
             if complete[i]:
                 add_subject(f'mae_h1_{horizon}', sid, h_mae[i].item())
                 add_subject(f'persistence_h1_{horizon}', sid, pers_mae[i].item())
@@ -613,17 +621,29 @@ def check_seed_separation(args):
 
 
 def _resume_argument_mismatches(saved_args: dict, current_args: dict) -> dict:
-    """Compare effective training arguments, ignoring path/entry-point-only values."""
+    """Compare training arguments; allow increasing the epoch budget on resume."""
     # Training states saved before the optional optimization arms have the same
     # baseline semantics as these disabled defaults.
     saved_args = {
         'state_feedback': False, 'spatial_profile': False,
-        'condition_initial_state': False, **saved_args,
+        'condition_initial_state': False,
+        'spectral_memory': False, 'spectral_oscillator': False,
+        'spectral_tr': 2.0, 'spectral_min_hz': 0.01, 'spectral_max_hz': 0.10,
+        'spectral_latent_drive': False, 'rec_stage_weights': None,
+        'eval_rollout': False, 'eval_fc': False, 'eval_spectral': False,
+        'eval_spectral_tr': 2.0, 'eval_rollout_horizons': '1,2,4,8,16',
+        'eval_rollout_steps': 0, 'eval_rollout_tasks_per_subject': 0,
+        'fc_min_length': 32, **saved_args,
     }
     ignored = {
         'checkpoint_dir', 'name', 'pretrained_weight', 'condition_inherit_stats',
         'resume_training_state', 'save_training_state', 'eval_after_train',
+        'model_config',
     }
+    old_budget = saved_args.get('train_epochs')
+    new_budget = current_args.get('train_epochs')
+    if old_budget is not None and new_budget is not None and int(new_budget) >= int(old_budget):
+        ignored.add('train_epochs')
     keys = (set(saved_args) | set(current_args)) - ignored
     return {key: (saved_args.get(key, '<missing>'), current_args.get(key, '<missing>'))
             for key in sorted(keys)
@@ -709,11 +729,12 @@ def main(args):
     # 任务维度解析：next_timepoint（in_window=1, pred_window=1, seq_len=context_max）。
     # 模型/数据/损失共用同一口径。
     dims = resolve_task_dims(args)
+    dims.update({key: getattr(args, key) for key in (
+        'spectral_memory', 'spectral_oscillator', 'spectral_tr',
+        'spectral_min_hz', 'spectral_max_hz', 'spectral_latent_drive')})
     horizon = int(dims['cpm_horizon'])
-    if horizon != DYNAMICS_CKPT_HORIZON:
-        raise ValueError(
-            f'当前阶段只训练与评估 H1–{DYNAMICS_CKPT_HORIZON}，'
-            f'cpm_horizon 必须为 {DYNAMICS_CKPT_HORIZON}，收到 {horizon}')
+    if horizon < 1:
+        raise ValueError(f'cpm_horizon 必须 >= 1，收到 {horizon}')
     forecast_offsets = resolve_forecast_offsets(args)
 
     print('=' * 50)
@@ -894,6 +915,12 @@ def main(args):
         state_feedback=args.state_feedback,
         spatial_profile=args.spatial_profile,
         condition_initial_state=args.condition_initial_state,
+        spectral_memory=args.spectral_memory,
+        spectral_oscillator=args.spectral_oscillator,
+        spectral_tr=args.spectral_tr,
+        spectral_min_hz=args.spectral_min_hz,
+        spectral_max_hz=args.spectral_max_hz,
+        spectral_latent_drive=args.spectral_latent_drive,
         **{key: getattr(args, key) for key in DYNAMICS_MODEL_OPTIONS},
     ).to(device)
     migration_report = (resume_progress_data.get('study', {}).get('pretrained_migration')
@@ -1003,7 +1030,7 @@ def main(args):
           f"| rank={args.sc_prior_rank} | delta_a={args.sc_delta_a} "
           f"| sinkhorn_iters={args.sc_sinkhorn_iters}")
 
-    # 当前阶段的训练目标只有三项：H1–8 重建、FC、频域。
+    # 基础训练目标：配置 horizon 的重建、FC、频域。
     if resume_metadata is not None:
         saved_args = resume_progress_data['study']['args']
         mismatches = _resume_argument_mismatches(saved_args, vars(args))
@@ -1013,7 +1040,7 @@ def main(args):
                 for key, (old, new) in mismatches.items())
             raise ValueError(
                 '续训配置与保存状态不一致；模型、数据或训练配方必须保持原值，'
-                'train_epochs 也不能在续训时改变：\n' + details)
+                'train_epochs 仅允许增加上限：\n' + details)
         if resume_progress_data.get('epoch', 0) < 1:
             raise ValueError('训练状态没有任何已完成 epoch，无法按 epoch 边界续训')
         if resume_progress_data.get('study', {}).get('mode') != args.mode:
@@ -1024,6 +1051,7 @@ def main(args):
         lambda_freq=args.lambda_freq,
         weighting=getattr(args, 'loss_weighting', 'uncertainty'),
         fc_objective=args.fc_objective,
+        rec_stage_weights=args.rec_stage_weights,
     ).to(device)
     print(f"[TFM] 损失: H1–{horizon} 重建 L1={args.lambda_rec} | "
           f"FC MSE={args.lambda_fc} | 频域 L1={args.lambda_freq} | "
@@ -1154,6 +1182,11 @@ def main(args):
         print(f'[resume] 恢复 {save_dir}：完成 epoch={start_epoch}/'
               f'{args.train_epochs}，global_step={global_step}，'
               f'best={selector.best:.6g}，patience counter={selector.counter}')
+        previous_budget = int(saved_study['args']['train_epochs'])
+        if args.train_epochs > previous_budget:
+            print(f'[resume] 训练上限 {previous_budget}→{args.train_epochs}；'
+                  '保留已完成训练、optimizer/EMA/当前学习率与调度步数，'
+                  '后续余弦调度按新上限推进。')
         if args.num_workers > 0 and args.persistent_workers:
             print('[resume] 提示：persistent_workers 的 worker-local NumPy/Python '
                   '增强随机流不能由主进程 checkpoint；恢复后的样本随机序列不逐位连续，'
@@ -1267,7 +1300,7 @@ def main(args):
 
             if by_roll is None or bm_roll is None:
                 raise KeyError(
-                    '训练 batch 缺少 future/future_mask：H1–8 重建、FC 与频域'
+                    '训练 batch 缺少 future/future_mask：自主轨迹重建、FC 与频域'
                     '监督都需要未来轨迹')
             with torch.amp.autocast('cuda', enabled=amp_enabled):
                 outputs, aux_info = model(
@@ -1361,6 +1394,12 @@ def main(args):
             f"FC grpPCC={_val('metric_fc_group_pcc')} | "
             f"Freq L1={_val('metric_freq_l1')} | "
             f"persistence H1–{horizon}={_val(f'metric_persistence_h1_{horizon}')}")
+        if horizon == 32:
+            tqdm.write('[Val stages] ' + ' | '.join(
+                f'{label} MAE={_val(f"metric_mae_{label.lower()}")} '
+                f'PCC(t)={_val(f"metric_temporal_pcc_{label.lower()}")} '
+                f'std ratio={_val(f"metric_std_ratio_{label.lower()}")}'
+                for label in STAGE_LABELS[1:4]))
         selection_score, selection_mae, selection_fc = selection_metric(
             val_metrics, horizon)
         if args.checkpoint_metric == 'mae':
@@ -1387,8 +1426,9 @@ def main(args):
             meta = {'args': vars(args), 'epoch': int(epoch),
                     'epoch_1based': int(epoch + 1),
                     'val_metric': float(cur_metric),
-                    'val_mae_h1_8': float(selection_mae),
+                    f'val_mae_h1_{horizon}': float(selection_mae),
                     'val_fc_mse': float(selection_fc),
+                    'val_metrics': dict(val_metrics),
                     'ckpt_metric_key': selector.metric_key,
                     'ckpt_metric_name': selector.metric_name,
                     'backbone_unfrozen': bool(backbone_unfrozen)}
@@ -1457,6 +1497,10 @@ def main(args):
         for key, value in train_metrics.items():
             if key not in ('metric_total', 'loss_rec', 'loss_fc', 'loss_freq'):
                 tb_scalars.append((f'Train/{key}', value))
+        if horizon == 32:
+            tb_scalars.extend((f'Val/LongHorizon/{key[7:]}', value)
+                              for key, value in val_metrics.items()
+                              if any(key.endswith(label.lower()) for label in STAGE_LABELS))
         for tag, val in tb_scalars:
             writer.add_scalar(tag, val, epoch)
         for name, lr in group_lrs.items():
@@ -1488,10 +1532,9 @@ def main(args):
         eval_dir = os.path.join(save_dir, 'eval')
         try:
             summary = _eval_variant(best_path, eval_dir, eval_splits=('test',),
-                                    seed=args.seed, eval_rollout=False,
-                                    eval_fc=False)
+                                    seed=args.seed)
             print(f"[post-train eval] test_PCC={summary.get('test_pcc')} "
-                  f"test_MAE={summary.get('test_mae')}（仅单步；H1–8/FC 见训练日志）")
+                  f"test_MAE={summary.get('test_mae')}（单步；自主轨迹详见评估报告）")
             print(f"[post-train eval] 详细指标见: {eval_dir}/指标_测试集.json")
         except Exception as e:
             print(f"[post-train eval] 自动评估失败（训练产物不受影响）: {type(e).__name__}: {e}\n"
@@ -1695,8 +1738,7 @@ def parse_args():
     p.add_argument('--tfm_one_step_hidden_dim', type=int, default=256,
                    help='TFM One-Step 状态转移头的 MLP 隐层宽度。')
     p.add_argument('--cpm_horizon', type=int, default=8,
-                   help='Graph-ODE 预测步数 H；当前阶段固定为 8（H1–8），'
-                        '传入其他值会直接报错。')
+                   help='Graph-ODE 预测步数 H；正式配置为 8，长程实验配置为 32。')
     p.add_argument('--cpm_layers', type=int, default=2,
                    help='CPM ROI×Horizon 查询解码器的交叉注意力层数。')
     p.add_argument('--cpm_intervention', type=str2bool, default=False,
@@ -1704,11 +1746,11 @@ def parse_args():
                         '接口（方案 §12.4/§13）。V1 默认关闭：无真实干预数据，'
                         '仅保留接口，不作为治疗预测任务训练（方案 §13.1）。')
     p.add_argument('--lambda_rec', type=float, default=1.0,
-                   help='H1–8 重建 L1 的 warm-start 权重。')
+                   help='自主预测重建 L1 的 warm-start 权重。')
     p.add_argument('--lambda_fc', type=float, default=1.0,
-                   help='H1–8 FC 相关矩阵 MSE 的 warm-start 权重。')
+                   help='自主预测 FC 相关矩阵 MSE 的 warm-start 权重。')
     p.add_argument('--lambda_freq', type=float, default=1.0,
-                   help='H1–8 rFFT 幅度 L1 的 warm-start 权重。')
+                   help='自主预测 rFFT 幅度 L1 的 warm-start 权重。')
     p.add_argument('--loss_weighting', default='uncertainty',
                    choices=['uncertainty', 'fixed'],
                    help='三项损失的聚合方式：uncertainty=同方差不确定性自动加权'
@@ -1837,8 +1879,28 @@ def parse_args():
     p.add_argument('--pathology_train_readout', type=str2bool, default=False)
     p.add_argument('--pathology_readout_lr_scale', type=float, default=0.2)
 
-    from model import load_model_config
-    config = load_model_config()
+    p.add_argument('--model_config', default=str(FILE.parent / 'configs' / 'neurotwin.json'),
+                   help='训练配方 JSON；默认保留正式 H1–8 配置')
+    p.add_argument('--spectral_memory', type=str2bool, default=False)
+    p.add_argument('--spectral_oscillator', type=str2bool, default=False)
+    p.add_argument('--spectral_tr', type=float, default=2.0)
+    p.add_argument('--spectral_min_hz', type=float, default=0.01)
+    p.add_argument('--spectral_max_hz', type=float, default=0.10)
+    p.add_argument('--spectral_latent_drive', type=str2bool, default=False)
+    p.add_argument('--rec_stage_weights', type=float, nargs=3, default=None,
+                   help='可选 H1–8/H9–16/H17–32 重建权重，和为 1；仅 H32')
+    p.add_argument('--eval_rollout', type=str2bool, default=False)
+    p.add_argument('--eval_fc', type=str2bool, default=False)
+    p.add_argument('--eval_spectral', type=str2bool, default=False)
+    p.add_argument('--eval_spectral_tr', type=float, default=2.0)
+    p.add_argument('--eval_rollout_horizons', default='1,2,4,8,16')
+    p.add_argument('--eval_rollout_steps', type=int, default=0)
+    p.add_argument('--eval_rollout_tasks_per_subject', type=int, default=0)
+    p.add_argument('--fc_min_length', type=int, default=32)
+
+    preview, _ = p.parse_known_args()
+    with open(preview.model_config, encoding='utf-8') as f:
+        config = json.load(f)
     declared = {action.dest for action in p._actions}
     defaults = {
         key: value
@@ -1865,7 +1927,8 @@ def parse_args():
     if args.condition_arm is None:
         args.condition_arm = conditioning[args.mode]['condition_arm']
     if args.mode == 'finetune' and not args.pretrained_weight:
-        args.pretrained_weight = DEFAULT_PRETRAINED_WEIGHT
+        args.pretrained_weight = config.get('weights', {}).get('pretrain', {}).get(
+            'path', DEFAULT_PRETRAINED_WEIGHT)
     if args.mode == 'finetune' and not args.condition_inherit_stats:
         args.condition_inherit_stats = args.pretrained_weight
     return args

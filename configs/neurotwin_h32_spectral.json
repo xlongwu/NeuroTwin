@@ -1,0 +1,128 @@
+{
+  "_meta": {
+    "name": "neurotwin_h32_spectral",
+    "description": "E2：固定 K64 历史锚点，H32 自主推进；频域记忆=True，振荡状态=True，分阶段重建=False",
+    "status": "implemented_unvalidated_experiment"
+  },
+  "architecture": {
+    "model_arch": "tfm",
+    "task_mode": "next_timepoint",
+    "num_rois": 116,
+    "context_min": 64,
+    "context_max": 64,
+    "forecast_offsets": "1",
+    "calibration_length": 32,
+    "tfm_dim": 256,
+    "tfm_layers": 4,
+    "tfm_heads": 4,
+    "tfm_ff_ratio": 4,
+    "tfm_patch_len": 8,
+    "tfm_one_step_hidden_dim": 256,
+    "tfm_patho_mode": "film",
+    "cpm_horizon": 32,
+    "cpm_layers": 2,
+    "cpm_intervention": false,
+    "norm": true,
+    "dropout": 0.1,
+    "sc_prior_mode": "soft_prior",
+    "sc_lambda_mode": "global",
+    "sc_lambda_init": 0.7,
+    "sc_prior_rank": 12,
+    "sc_delta_a": true,
+    "sc_delta_rank": null,
+    "sc_sinkhorn_iters": 64,
+    "dynamics_mode": "graph_ode",
+    "ode_steps": 2,
+    "dynamics_dt": 1.0,
+    "graph_source": "history_fc",
+    "personalized": true,
+    "profile_dim": 32,
+    "dynamics_history_memory": true,
+    "spectral_memory": true,
+    "spectral_oscillator": true,
+    "spectral_tr": 2.0,
+    "spectral_min_hz": 0.01,
+    "spectral_max_hz": 0.1,
+    "spectral_latent_drive": false
+  },
+  "loss": {
+    "name": "h32_e2_reconstruction_fc_frequency",
+    "lambda_rec": 1.0,
+    "lambda_fc": 1.0,
+    "lambda_freq": 1.0,
+    "loss_weighting": "uncertainty",
+    "rec_stage_weights": null
+  },
+  "data_and_split": {
+    "data_root": "data/",
+    "bold_source": "raw",
+    "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
+    "val_ratio": 0.1,
+    "test_ratio": 0.1,
+    "split": "被试级 8:1:1，优先 split_file > 版本化 manifest（subject_split_<mode>.json）> 现场按模型 seed 生成；当前 manifest 记录 seed=2024",
+    "conditioning": {
+      "pretrain": {
+        "condition_arm": "demo",
+        "condition_group": "hc3"
+      },
+      "finetune": {
+        "condition_arm": "cat",
+        "condition_group": "mdd8"
+      },
+      "cond_inject": "heads",
+      "cond_dim": 32,
+      "cond_d_demo": 16,
+      "cond_d_new": 16,
+      "cond_h_delta": 64,
+      "cond_delta_style": "mlp",
+      "cond_dropout_p": 0.0
+    }
+  },
+  "training": {
+    "seed": 2024,
+    "sampling_seed": 20261009,
+    "cond_dropout_seed": 20261008,
+    "split_seed": 2024,
+    "batch_size": 128,
+    "train_epochs": 150,
+    "lr_init": 2e-05,
+    "lr_peak": 5e-05,
+    "lr_final": 1e-05,
+    "warmup_epochs": 3,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "patience": 12,
+    "freeze_backbone_epochs": 10,
+    "backbone_lr_scale": 0.2,
+    "use_ema": true,
+    "ema_decay": 0.999,
+    "amp": true,
+    "entrypoints": [
+      "bash scripts/pretrain.sh",
+      "bash scripts/finetune.sh"
+    ],
+    "checkpoint_dir": "checkpoints/h32_spectral/E2",
+    "random_context": false,
+    "eval_context_length": 64,
+    "eval_anchors_per_subject": 8,
+    "eval_rollout": true,
+    "eval_fc": true,
+    "eval_spectral": true,
+    "eval_spectral_tr": 2.0,
+    "eval_rollout_horizons": "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32",
+    "eval_rollout_steps": 32,
+    "eval_rollout_tasks_per_subject": 8,
+    "fc_min_length": 32
+  },
+  "evaluation_protocol": {
+    "primary": "val 选模 = H1–32 被试级 MAE + H32 FC MSE；报告 H1–8、H9–16、H17–32 及逐 horizon 指标",
+    "final_eval": "python -m analysis.evaluate --ckpt checkpoints/h32_spectral/E2/neurotwin_finetune/finetuned_best.pt --out_dir results/长程预测/E2 --splits test",
+    "metrics_reference": "main.evaluate_tfm / analysis.next_point_eval.evaluate_split"
+  },
+  "weights": {
+    "pretrain": {
+      "path": "checkpoints/h32_spectral/E2/neurotwin_pretrain/base_best.pt",
+      "note": "需要使用本实验相同配置重新预训练；非已生成权重"
+    }
+  }
+}
