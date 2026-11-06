@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd
 
 ROOT=Path(__file__).resolve().parents[1]
-OUT=ROOT/'results/H1-8分析_20261028'
-CACHE=OUT/'03_可解释性/扰动缓存'
+OUT=ROOT/'results/方案B/H1-8分析'
+from analysis.h18_probes import OUT as CACHE
 COLORS={'hc':'#df5252','mdd':'#643c33'}
 
 

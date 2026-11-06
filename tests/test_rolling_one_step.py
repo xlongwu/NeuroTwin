@@ -106,4 +106,5 @@ def test_subject_scalar_summary_blocks_and_fractions():
     m2 = guardrail_metrics(np.zeros_like(x2), x2, x2)
     s2 = subject_scalar_summary(m2)
     assert np.isfinite(s2['mae_model']) and np.isfinite(s2['mae_persistence'])
+    assert np.isnan(s2['improvement_subject'])  # persistence误差为零时，相对改善无定义
     assert s2['delta_corr_valid_fraction'] < 1.0

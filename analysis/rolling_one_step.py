@@ -3,7 +3,7 @@
 
 协议（v2 研究计划 §3，与 checkpoint 正式口径对齐）：
 
-- 模型：HC 参照 ``checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt``
+- 模型：HC 参照 ``checkpoints/方案B/neurotwin_pretrain/base_best.pt``
   （从 ``config.args`` 快照 strict 重建，条件统计量 inherit，不重拟合）；
 - 数据：``NeuroTwinNextPointDataset`` raw 分支（``bold_source=raw``、
   ``calibration_length=32``、``graph_source=history_fc``，均取自快照）；
@@ -11,8 +11,7 @@
   ``data/subject_split_finetune.json``，条件仍为 hc3 三字段（MDD merged 表
   含同名列 Sex/Age/education），统计量继承 HC 快照；
 - 锚点：K=64（``--context_length``），每被试枚举全部合法锚点
-  t ∈ [max(K-1, calib-1), T-2]，每锚点只取 ODE 头 ``dynamics_pred`` 的 lag-1 帧
-  （``dynamics_horizon=1``，不做 32 步积分）；
+  t ∈ [max(K-1, calib-1), T-2]，每锚点只取 CPM 的 H1 输出；
 - persistence 基线内建于同一次遍历（``x_last`` 即 persistence 预测），零额外前向。
 
 逐被试缓存（断点可续跑）：``<out_dir>/<group>/<subj>.npz``（err_abs / pred /
@@ -35,7 +34,7 @@ delta_corr / dir_acc / improvement 记 NaN 并计入无效池，不填理想值�
 
     # 5 被试冒烟（HC val）
     python -m analysis.rolling_one_step \
-      --ckpt checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt \
+      --ckpt checkpoints/方案B/neurotwin_pretrain/base_best.pt \
       --group hc --split val --limit 5 --device cuda:0
     # 全量：hc train/val/test 与 mdd train/val/test 依次执行
 """
@@ -147,8 +146,9 @@ def subject_scalar_summary(metrics: Dict[str, np.ndarray]) -> Dict[str, float]:
             vals = np.asarray(metrics[key], dtype=np.float64)
             ok = np.isfinite(vals)
             out[key] = float(vals[ok].mean()) if ok.any() else float('nan')
-        out['improvement_subject'] = float(
-            1.0 - metrics['mae_model'].mean() / metrics['mae_persistence'].mean())
+        persistence_mae = float(metrics['mae_persistence'].mean())
+        out['improvement_subject'] = (float(1.0 - metrics['mae_model'].mean() / persistence_mae)
+                                      if persistence_mae > 0 else float('nan'))
         out['delta_corr_valid_fraction'] = float(
             np.isfinite(metrics['delta_corr']).mean())
         out['dir_acc_valid_fraction'] = float(
@@ -230,9 +230,8 @@ def forward_subjects(model, view, subjects: Sequence[str], device,
     """逐被试前向并落盘 npz 缓存（已存在且 manifest 兼容的被试跳过）。
 
     返回本次写入/复用的 npz 路径列表。每被试锚点按视图顺序成批前向；
-    ODE lag-1 = ``aux['dynamics_pred'][:, :, 0]``。
+    使用 CPM 直接预测的首步。
     """
-    from main import dynamics_extras
     model.eval()
     group_dir = out_dir / GROUP_SUBDIR[group]
     group_dir.mkdir(parents=True, exist_ok=True)
@@ -242,7 +241,6 @@ def forward_subjects(model, view, subjects: Sequence[str], device,
                     num_workers=int(num_workers))
     for batch in dl:
         x = batch['x'].to(device, non_blocking=True)              # [B,F,1,K]
-        sc = batch['sc'].to(device, non_blocking=True)
         cond = None
         if 'cond_z' in batch:
             cond = {'cond_z': batch['cond_z'].to(device, non_blocking=True),
@@ -251,16 +249,10 @@ def forward_subjects(model, view, subjects: Sequence[str], device,
             if 'subject_index' in batch:
                 cond['subject_index'] = batch['subject_index'].to(device,
                                                                   non_blocking=True)
-        cal, ctl = dynamics_extras(batch, device)
-        pred, aux = model(x, sc, None, condition=cond, controls=None,
-                          calibration_bold=cal, dynamics_horizon=1)
-        dyn = aux.get('dynamics_pred', None) if isinstance(aux, dict) else None
+        dyn, _ = model(x, condition=cond)
         if not torch.is_tensor(dyn) or dyn.shape[:2] != x.shape[:2] or dyn.shape[2] < 1:
-            raise ValueError(
-                f"checkpoint 前向未返回可用 dynamics_pred（形状 "
-                f"{tuple(dyn.shape) if torch.is_tensor(dyn) else type(dyn)}）；"
-                'rolling_one_step 依赖 graph_ode 路线的 ODE 头 lag-1 输出。')
-        lag1 = dyn[:, :, 0].float().cpu().numpy()                  # [B,F]
+            raise ValueError('CPM 前向未返回 [B,F,H] 预测')
+        lag1 = dyn[:, :, 0].float().cpu().numpy()
         true = batch['y'][:, :, 0].float().numpy()                 # [B,F]（offset=1）
         x_last = batch['x_last'].float().numpy()                   # [B,F]
         err_abs = np.abs(lag1 - true)
@@ -413,10 +405,7 @@ def summarize_group(out_dir: Path, group: str, split: str,
 # ══════════════════════════════════════════════════════════════════════════
 
 def main(argv: Optional[List[str]] = None) -> None:
-    from analysis.checkpoint import load_checkpoint_compat
-    from analysis.evaluate import (build_model_from_args,
-                                              load_condition_bundle,
-                                              load_train_args)
+    from model import load_model_checkpoint
     from utils.common import set_seed
 
     ap = argparse.ArgumentParser(description=__doc__,
@@ -430,7 +419,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument('--num_workers', type=int, default=0)
     ap.add_argument('--device', default='',
                     help='如 cuda:0；留空自动选择 GPU/CPU')
-    ap.add_argument('--out_dir', type=Path, default=Path('results/rolling_eval'))
+    ap.add_argument('--out_dir', type=Path, default=Path('results/方案B/滚动单步'))
     ap.add_argument('--data_root', type=Path, default=None,
                     help='覆盖 checkpoint 快照中的 data_root（迁移机器时使用）')
     ap.add_argument('--limit', type=int, default=0,
@@ -444,21 +433,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     device = torch.device(ns.device) if ns.device else torch.device(
         'cuda:0' if torch.cuda.is_available() else 'cpu')
-    args = load_train_args(ns.ckpt)
-    bundle = load_condition_bundle(ns.ckpt)
+    model, args, bundle = load_model_checkpoint(ns.ckpt, device)
     data_root = Path(ns.data_root) if ns.data_root else Path(args.data_root)
     set_seed(int(args.seed))
-
-    model = build_model_from_args(args, device, condition_bundle=bundle)
-    model, compat = load_checkpoint_compat(model, ns.ckpt, device, strict=True)
-    if compat.get('missing') or compat.get('unexpected'):
-        raise RuntimeError(f'权重加载不完整：{compat}')
-    if getattr(model, 'conditioner', None) is not None:
-        saved_hash = (bundle or {}).get('meta', {}).get('layout_hash')
-        now_hash = model.conditioner.layout()['layout_hash']
-        if saved_hash and saved_hash != now_hash:
-            raise RuntimeError(
-                f'条件布局不一致：checkpoint={saved_hash}，重建后={now_hash}。')
 
     if ns.group == 'mdd':
         cond_group = str(((bundle or {}).get('config') or {}).get('group', '') or '')
@@ -473,7 +450,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         from main import condition_loader_kwargs
         loader_kwargs = condition_loader_kwargs(args, bundle)
 
-    from utils.dataloader import NeuroTwinDataLoader  # noqa: F401（类型提示用）
     loader = _build_loader_with_condition(args, ns.group, data_root,
                                           ns.context_length, ns.batch_size,
                                           ns.num_workers, loader_kwargs)
@@ -496,8 +472,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                            else '不抽稀')),
         'dtype': 'float32', 'deadzone': float(ns.deadzone),
         'min_points': int(ns.min_points),
-        'condition_group': 'hc3',
-        'lag_output': "aux['dynamics_pred'][:, :, 0]（ODE 头 lag-1）",
+        'condition_group': bundle['config']['group'],
+        'lag_output': 'prediction[:, :, 0]（CPM H1）',
     }
     written = forward_subjects(model, view, todo, device, ns.batch_size,
                                ns.num_workers, ns.out_dir, ns.group, manifest)
@@ -520,7 +496,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 def _build_loader_with_condition(args, group, data_root, context_length,
                                  batch_size, num_workers, condition_kwargs):
     """build_loader 的包装：注入组特定的条件 kwargs（hc=快照推导，mdd=hc3 inherit）。"""
-    from main import parse_pathology_fields
     from utils.common import parse_int_list, resolve_forecast_offsets
     from utils.dataloader import NeuroTwinDataLoader
 
@@ -541,9 +516,6 @@ def _build_loader_with_condition(args, group, data_root, context_length,
 
     return NeuroTwinDataLoader(
         data_root=str(data_root), mode=mode, batch_size=batch_size,
-        pathology_input_dim=int(getattr(args, 'pathology_input_dim', 1)),
-        pathology_fields=parse_pathology_fields(getattr(args, 'pathology_fields', None)),
-        pathology_missing=str(getattr(args, 'pathology_missing', 'drop')),
         clinical_file=str(getattr(args, 'clinical_file',
                                   'Rest-meta-MDD-V1V2-Merged-MDD.xlsx')),
         total_windows=int(getattr(args, 'total_windows', 9)),

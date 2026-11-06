@@ -1,16 +1,5 @@
 # -*- coding: utf-8 -*-
-"""按脑网络分组渲染 AAL116 显著脑区玻璃脑图（next_timepoint 口径）。
-
-输入为 analysis/evaluate.py --feature_importance 落盘的
-``feature_importance_<split>.json``：优先取 ``significant_roi_indices``（ROI 置换重要性
-经 BH-FDR 校正后的显著 ROI，1 基 AAL 索引），无显著 ROI 时回落到重要性 Top N，并按
-``data/AAL116.xlsx`` 的「对应网络」列把脑区分组，逐网络绘制一张玻璃脑图（每个脑区
-独立配色，Nature 风格）。
-
-用法:
-    python analysis/visualize_sig_region.py \
-        --input_json results/eval/<run>/feature_importance_test.json
-"""
+"""按网络展示方案 B 的 ROI 历史置换重要性 Top N；只作描述性展示。"""
 import argparse
 import json
 import os
@@ -51,46 +40,30 @@ DISPLAY_MODE = "lyrz"
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="显著脑区玻璃脑图（按脑网络分组）")
+    p = argparse.ArgumentParser(description="ROI重要性玻璃脑图（按脑网络分组）")
     p.add_argument("--input_json", required=True,
                    help="evaluate.py --feature_importance 输出的 "
-                        "feature_importance_<split>.json")
+                        "指标_<split>.json")
     p.add_argument("--aal_file", default=DEFAULT_AAL_FILE,
                    help="AAL116 脑区图谱 xlsx（提供脑区名称与「对应网络」列）")
     p.add_argument("--output_dir", default=None,
                    help="图片输出目录，默认 <input_json 所在目录>/brain_regions")
     p.add_argument("--top_n", type=int, default=12,
-                   help="无 FDR 显著 ROI 时回落到重要性 Top N（默认 12）")
+                   help="按完整 H32 ΔMAE 选取 Top N（默认 12）")
     p.add_argument("--max_regions_per_figure", type=int, default=8,
                    help="单张网络图的脑区数上限（超出按重要性截断并打印提示）")
-    p.add_argument("--fdr_alpha", type=float, default=None,
-                   help="显著判定阈值；默认取 json 中的 fdr_alpha")
     return p.parse_args()
 
 
-def load_significant_regions(args):
-    """读取重要性 JSON → (显著 1 基 ROI 索引列表, 判据说明字符串)。"""
-    with open(args.input_json, "r", encoding="utf-8") as f:
+def load_regions(args):
+    """读取正式评价 JSON 中的描述性重要性，不作显著性判断。"""
+    with open(args.input_json, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    alpha = (float(args.fdr_alpha) if args.fdr_alpha is not None
-             else float(data.get("fdr_alpha", 0.05)))
-    qvals = data.get("roi_pvalues_fdr")
-    sig = data.get("significant_roi_indices")
-
-    if sig:
-        return sorted(int(r) for r in sig), f"FDR q<{alpha:g} 显著"
-
-    importance = np.asarray(data["roi_importance"], dtype=float)
-    if qvals is not None:
-        # 产物中 q 值存在但与索引不一致时以 q 值为准，避免静默使用过期字段
-        q = np.asarray(qvals, dtype=float)
-        idx = np.flatnonzero(q < alpha) + 1
-        if idx.size:
-            return sorted(int(r) for r in idx), f"FDR q<{alpha:g} 显著（按 q 值重算）"
+    importance = np.asarray(data['roi_importance']['mae_increase'], dtype=float)
     if importance.size == 0:
-        raise ValueError(f"{args.input_json} 中 roi_importance 为空，无法确定显著脑区。")
-    top = np.argsort(importance)[::-1][: max(1, int(args.top_n))]
-    return sorted(int(r) + 1 for r in top), f"无 FDR 显著 ROI，回落重要性 Top {len(top)}"
+        raise ValueError('ROI重要性为空')
+    top = np.argsort(importance)[::-1][:max(1, int(args.top_n))]
+    return sorted(int(i) + 1 for i in top), f'完整H32置换ΔMAE Top {len(top)}（描述性）'
 
 
 def load_network_labels(aal_file, n_rois):
@@ -111,7 +84,7 @@ def load_network_labels(aal_file, n_rois):
 
 def group_by_network(region_indexes, importance, networks,
                      max_regions_per_figure):
-    """显著 ROI → OrderedDict{网络: [ROI 索引...]}，组内按重要性降序、组间按峰值降序。"""
+    """ROI → OrderedDict{网络: [ROI 索引...]}，组内按重要性降序、组间按峰值降序。"""
     groups = {}
     for idx in region_indexes:
         net = networks[idx - 1]
@@ -119,7 +92,7 @@ def group_by_network(region_indexes, importance, networks,
     for net in groups:
         groups[net] = sorted(groups[net], key=lambda i: -float(importance[i - 1]))
         if len(groups[net]) > max_regions_per_figure:
-            print(f"  [提示] {net} 有 {len(groups[net])} 个显著脑区，"
+            print(f"  [提示] {net} 有 {len(groups[net])} 个脑区，"
                   f"仅绘制重要性最高的 {max_regions_per_figure} 个")
             groups[net] = groups[net][:max_regions_per_figure]
     ordered = sorted(groups.items(),
@@ -235,7 +208,7 @@ def plot_network(net_name, region_indexes, output_dir, region_colors,
 
     if SAVE_FIG:
         os.makedirs(output_dir, exist_ok=True)
-        fname = os.path.join(output_dir, f"glass_brain_{net_name}.png")
+        fname = os.path.join(output_dir, f"脑区重要性_{net_name}.pdf")
         display.savefig(fname, dpi=300, bbox_inches="tight")
         print(f"  已保存: {fname}")
 
@@ -243,12 +216,12 @@ def plot_network(net_name, region_indexes, output_dir, region_colors,
 def main():
     args = parse_args()
     output_dir = args.output_dir or os.path.join(
-        os.path.dirname(os.path.abspath(args.input_json)), "brain_regions")
+        os.path.dirname(os.path.abspath(args.input_json)), "脑区重要性图")
 
     with open(args.input_json, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    importance = np.asarray(payload["roi_importance"], dtype=float)
-    region_indexes, criterion = load_significant_regions(args)
+    importance = np.asarray(payload["roi_importance"]["mae_increase"], dtype=float)
+    region_indexes, criterion = load_regions(args)
     aal_names, networks = load_network_labels(args.aal_file, importance.size)
 
     print("=" * 60)
@@ -258,7 +231,7 @@ def main():
 
     groups = group_by_network(region_indexes, importance, networks,
                               int(args.max_regions_per_figure))
-    print(f"网络分组: " + ", ".join(f"{k}({len(v)})" for k, v in groups.items()))
+    print("网络分组: " + ", ".join(f"{k}({len(v)})" for k, v in groups.items()))
 
     atlas_img, regions = load_aal_atlas()
     atlas_nii = image.load_img(atlas_img)

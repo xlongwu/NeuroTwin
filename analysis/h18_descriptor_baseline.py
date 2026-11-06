@@ -6,9 +6,10 @@ import pandas as pd
 from analysis.pathology_tests import collect_descriptors, site_blocked_paired_permutation, site_blocked_unpaired_permutation, bh_fdr
 from analysis.h18_group_tests import bootstrap
 from utils.site_subset import parse_site
+from model import load_model_config
 
 ROOT=Path(__file__).resolve().parents[1]
-OUT=ROOT/'results/H1-8分析_20261028/02_病理分析'
+OUT=ROOT/'results/方案B/H1-8分析/02_病理分析'
 
 
 def main():
@@ -18,7 +19,7 @@ def main():
     split=json.loads((ROOT/'data/subject_split_pretrain.json').read_text())
     hc=sorted({p['hc'] for p in pairs}|set(split['val'])|set(split['test']))
     mdd=sorted({p['mdd'] for p in pairs})
-    scores,meta=collect_descriptors(ROOT/'data',ROOT/'checkpoints/neurotwin_pretrain/base_best.pt',hc,mdd)
+    scores,meta=collect_descriptors(ROOT/'data',ROOT/load_model_config()['weights']['pretrain']['path'],hc,mdd)
     all_ids=hc+mdd
     np.savez_compressed(OUT/'描述量基线_固定首锚点_逐被试.npz',subjects=np.array(all_ids),
                         scores=np.stack([scores[s] for s in all_ids]))

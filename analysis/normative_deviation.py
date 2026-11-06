@@ -10,12 +10,12 @@
   改善 ≥ ``--min-improvement``（默认 1%）**且**被试级配对置换检验
   p < ``--alpha``（默认 0.01，符号翻转 10,000 次，seed=2024）。
   不通过 → 输出 ``passed=false`` 并提示停止偏离分析（v2 计划 §7 触发器 T1，
-  唯一预登记的方向重议点）。产物 ``results/normative_reference/gate_report.json``。
+  唯一预登记的方向重议点）。产物 ``results/方案B/健康参照/gate_report.json``。
 - ``fit``（B3 第一阶段）：HC **train** 被试的 s 对人口学设计矩阵做 α=1 岭回归
   （复用 ``analysis/twin_reference.py`` 的设计布局：intercept + Age z + Age z² +
   education z + Sex one-hot + 缺失 mask），得 ``μ_roi(x)``、残差 ``σ_roi`` 与
   逐 ROI 残差绝对值的 conformal 分位数（α=0.1 → 0.9 分位）。
-  产物 ``results/normative_reference/fit.npz``（W / sigma / conformal_q / meta）。
+  产物 ``results/方案B/健康参照/fit.npz``（W / sigma / conformal_q / meta）。
 - ``score``（B3 第二阶段）：对 HC val（规范集）、HC test（负控）与 MDD 全队列
   计算 ``z_i,roi = (s_i − μ_roi(x_i)) / σ_roi``；输出逐被试 z 表
   （``per_subject_z_<group>_<split>.csv``，宽表 116 列）、z 矩阵 npz 与
@@ -25,12 +25,12 @@
 用法::
 
     python -m analysis.normative_deviation gate \
-      --rolling-dir results/rolling_eval --split val
+      --rolling-dir results/方案B/滚动单步 --split val
     python -m analysis.normative_deviation fit \
-      --rolling-dir results/rolling_eval
+      --rolling-dir results/方案B/滚动单步
     python -m analysis.normative_deviation score \
-      --rolling-dir results/rolling_eval \
-      --out-dir results/pathology_analysis/run1/z_maps
+      --rolling-dir results/方案B/滚动单步 \
+      --out-dir results/方案B/病理分析/run1/z_maps
 """
 import argparse
 import csv
@@ -402,22 +402,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument('--n-perm', type=int, default=10000)
     g.add_argument('--seed', type=int, default=2024)
     g.add_argument('--out', type=Path,
-                   default=Path('results/normative_reference/gate_report.json'))
+                   default=Path('results/方案B/健康参照/gate_report.json'))
     g.set_defaults(func=_cmd_gate)
 
     f = sub.add_parser('fit', parents=[common],
                        help='B3 第一阶段：HC train 参照拟合')
     f.add_argument('--conformal-alpha', type=float, default=DEFAULT_CONFORMAL_ALPHA)
     f.add_argument('--out', type=Path,
-                   default=Path('results/normative_reference/fit.npz'))
+                   default=Path('results/方案B/健康参照/fit.npz'))
     f.set_defaults(func=_cmd_fit)
 
     sc = sub.add_parser('score', parents=[common],
                         help='B3 第二阶段：z 偏离打分（HC train crossfit + HC val/test + MDD 全队列）')
     sc.add_argument('--reference', type=Path,
-                    default=Path('results/normative_reference/fit.npz'))
+                    default=Path('results/方案B/健康参照/fit.npz'))
     sc.add_argument('--out-dir', type=Path,
-                    default=Path('results/pathology_analysis/run1/z_maps'))
+                    default=Path('results/方案B/病理分析/run1/z_maps'))
     sc.add_argument('--crossfit', type=int, default=10,
                     help='HC train cross-fitted z 的折数（默认 10；0 = 跳过 hc train）')
     sc.set_defaults(func=_cmd_score)

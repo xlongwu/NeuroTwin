@@ -9,8 +9,9 @@ import numpy as np
 import torch
 
 from analysis.h18_data import calibrate_raw
-from analysis.individual_pilot import digest
+from utils.condition_schema import file_sha256 as digest
 from inference_twin import TwinSession, load_raw_series
+from model import load_model_config
 
 ROOT = Path(__file__).resolve().parents[1]
 NETWORKS = ('SMN', 'DAN', 'LN', 'DMN', 'SN', 'FN', 'VN')
@@ -70,7 +71,7 @@ def outgoing_response(response: np.ndarray, labels: np.ndarray) -> np.ndarray:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--group', choices=GROUP_FILES, required=True)
-    p.add_argument('--checkpoint', type=Path, default=ROOT/'checkpoints/neurotwin_pretrain/base_best.pt')
+    p.add_argument('--checkpoint', type=Path, default=ROOT/load_model_config()['weights']['pretrain']['path'])
     p.add_argument('--device', default='cpu')
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--out-dir', type=Path, required=True)
@@ -88,7 +89,7 @@ def main():
                     source_sha256=digest(Path(__file__)), seed=2024, repeats=1,
                     anchors='first and last legal H1; histories disjoint',
                     permutation='same per-ROI blockwise permutation for all subjects and windows; last TR fixed',
-                    arms=['combined', 'fixed_graph'], profile='own first 32 TR, held fixed',
+                    arms=['combined', 'fixed_graph'], calibration='first 32 TR fixed scale',
                     primary='seven source-network mean absolute output responses, ROI self excluded',
                     graph_contrast='absolute combined minus fixed-graph predictions; not causal mediation',
                     device=a.device, batch_size=a.batch_size, torch=torch.__version__)
@@ -100,8 +101,8 @@ def main():
     manifest.write_text(json.dumps(protocol, ensure_ascii=False, indent=2)+'\n')
     session = TwinSession(str(a.checkpoint), device=a.device, condition_file=cond_file)
     # The HC checkpoint determines hc3 encoding and its training statistics for BOTH groups.
-    if session.bundle['config']['group'] != 'hc3' or session.model.state_feedback:
-        raise ValueError('Requires HC hc3 checkpoint with state_feedback disabled')
+    if session.bundle['config']['group'] != 'hc3':
+        raise ValueError('Requires HC hc3 CPM checkpoint')
     model = session.model
     indices = permutation_indices()
     begin = time.perf_counter()
@@ -113,26 +114,23 @@ def main():
             raw_path = ROOT/f'data/Raw/{a.group.upper()}/ROISignals_{sid}.mat'
             series = calibrate_raw(load_raw_series(raw_path, 116), session.calibration_length)
             anchors = nonoverlap_anchors(len(series))
-            cal = torch.from_numpy(series[:32].T.copy())[None, :, None, :].to(a.device)
-            profile = model.calibrate_profile(cal)
             condition = session.condition_for(sid)
 
             def forward(x):
-                n = len(x)
-                return model(x, sc_matrix=None, profile=profile.expand(n, -1),
-                             condition={k: v.expand(n, *v.shape[1:]) for k, v in condition.items()},
-                             dynamics_horizon=1, with_aux=False)[1]
+                n=len(x)
+                pred,aux=model(x,condition={k:v.expand(n,*v.shape[1:]) for k,v in condition.items()})
+                return {**aux,'prediction':pred}
 
             baseline, combined, fixed, history_fc, pert_fc, graph_changes = [], [], [], [], [], []
             sham_max, graph_sham_max = 0., 0.
             for cutoff in anchors:
                 x = torch.from_numpy(series[cutoff-63:cutoff+1].T.copy())[None, :, None, :].to(a.device)
                 base = forward(x)
-                original = base['dynamics_pred'][0, :, 0]
+                original = base['prediction'][0, :, 0]
                 graph = base['sc_prior']
                 with fixed_effective_graph(model, graph):
                     sham = forward(x)
-                sham_max = max(sham_max, float((sham['dynamics_pred'][0, :, 0]-original).abs().max()))
+                sham_max = max(sham_max, float((sham['prediction'][0, :, 0]-original).abs().max()))
                 baseline.append(original.cpu().numpy())
                 original_fc = model._history_fc_signed(x[:, :, 0, :])[0]
                 history_fc.append(original_fc.cpu().numpy())
@@ -143,13 +141,13 @@ def main():
                     for row, roi in enumerate(rois):
                         changed[row, roi, 0] = x[0, roi, 0, indices[roi]]
                     normal = forward(changed)
-                    cp.append(normal['dynamics_pred'][:, :, 0].cpu().numpy())
+                    cp.append(normal['prediction'][:, :, 0].cpu().numpy())
                     frozen = {k: v.expand(len(rois), *v.shape[1:]) if torch.is_tensor(v) and v.ndim >= 3
                               else v for k, v in graph.items()}
                     with fixed_effective_graph(model, frozen):
                         control = forward(changed)
                     graph_sham_max = max(graph_sham_max, float((control['sc_prior']['A_eff']-frozen['A_eff']).abs().max()))
-                    fp.append(control['dynamics_pred'][:, :, 0].cpu().numpy())
+                    fp.append(control['prediction'][:, :, 0].cpu().numpy())
                     # FC baseline: only changed source-row correlations to other ROIs.
                     corr = model._history_fc_signed(changed[:, :, 0, :])
                     fc.append(corr[torch.arange(len(rois), device=a.device), torch.as_tensor(rois, device=a.device)].cpu().numpy())

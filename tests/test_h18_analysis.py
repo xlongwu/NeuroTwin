@@ -2,7 +2,7 @@ import numpy as np
 
 from analysis.h18_data import calibrate_raw
 from analysis.h18_group_tests import bootstrap, dispersion
-from analysis.h18_short_sequence import edges, similarity
+from analysis.h18_data import edges, similarity
 
 
 def test_raw_calibration_matches_float32_evaluation_path():

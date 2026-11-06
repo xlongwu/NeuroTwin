@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from analysis.individual_pilot import digest
+from utils.condition_schema import file_sha256 as digest
 from analysis.pathology_tests import bh_fdr
 from analysis.shared_mechanism import GROUP_FILES, NETWORKS, ROOT, network_responses, outgoing_response
 from utils.dataloader import load_condition_table
@@ -92,7 +92,7 @@ def load_cohort(cache: Path) -> tuple:
             raise ValueError(f'{group}: condition table changed')
         if group == 'mdd':
             shared_keys = ('version', 'checkpoint_sha256', 'source_sha256', 'seed', 'repeats', 'anchors',
-                           'permutation', 'arms', 'profile', 'primary', 'graph_contrast', 'condition_group', 'torch')
+                           'permutation', 'arms', 'calibration', 'primary', 'graph_contrast', 'condition_group', 'torch')
             if any(manifest[k] != manifests['hc'][k] for k in shared_keys):
                 raise ValueError('Cohorts do not share one model and analysis protocol')
         manifests[group] = manifest
@@ -203,7 +203,7 @@ def main():
                    max_sham=float(subjects.sham_max.max()), n_perm=10000, seed=2024,
                    checkpoint_sha256=manifests['hc']['checkpoint_sha256'],
                    inference_source_sha256=manifests['hc']['source_sha256'], summary_source_sha256=digest(Path(__file__)),
-                   limitations=['explored test set; exploratory only', 'same scan and shared profile; no retest validation',
+                   limitations=['explored test set; exploratory only', 'same scan and shared encoder; no retest validation',
                                 'site residual exchangeability assumed; HC3 is individual-level, not site-cluster interval',
                                 'single common permutation seed and one permutation per ROI',
                                 'graph contrast is conditional sensitivity, not neural causality or additive mediation',

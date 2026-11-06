@@ -6,7 +6,7 @@ import pandas as pd
 from analysis.normative_deviation import load_roi_mae, load_demo_matrix, fit_normative, score_normative
 
 ROOT=Path(__file__).resolve().parents[1]
-OUT=ROOT/'results/H1-8分析_20261028/02_病理分析'
+OUT=ROOT/'results/方案B/H1-8分析/02_病理分析'
 
 
 def main():

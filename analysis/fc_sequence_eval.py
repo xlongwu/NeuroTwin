@@ -98,7 +98,7 @@ def evaluate_cache(cache_dir: Path, split_file: Path, split: str) -> tuple:
         'split_file': str(split_file),
         'split_file_sha256': hashlib.sha256(split_file.read_bytes()).hexdigest(),
         'protocol': {
-            'prediction': 'ODE lag-1, true observed history refreshed at every anchor',
+            'prediction': 'CPM H1, true observed history refreshed at every anchor',
             'context_length': manifest['context_length'],
             'calibration_length': manifest['calibration_length'],
             'bold_source': manifest['bold_source'],

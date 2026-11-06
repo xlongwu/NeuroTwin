@@ -1,15 +1,12 @@
 {
   "_meta": {
     "name": "neurotwin",
-    "description": "固定结构：历史编码、功能图先验、个体 profile 与 Graph-ODE。当前阶段只训练/评估 H1–8，目标为重建、FC 与频域三项。",
     "status": "current",
-    "notes": "预训练与微调分别使用 hc3/demo 和 mdd8/cat；保留训练随机种子、损失权重及优化参数。H9–32 与 CPM/方差辅助监督暂不启用；选模判据为 H1–8 被试级 MAE + FC MSE，FC 在 8 步未来序列上估计。"
+    "description": "唯一正式方案 B：历史功能图引导 TFM 编码 + 字段条件 CPM，固定 K64 直接预测 H32；以已验证权重为准。"
   },
   "architecture": {
-    "model_arch": "tfm",
-    "task_mode": "next_timepoint",
     "num_rois": 116,
-    "context_min": 16,
+    "context_min": 64,
     "context_max": 64,
     "forecast_offsets": "1",
     "calibration_length": 32,
@@ -18,11 +15,8 @@
     "tfm_heads": 4,
     "tfm_ff_ratio": 4,
     "tfm_patch_len": 8,
-    "tfm_one_step_hidden_dim": 256,
-    "tfm_patho_mode": "film",
-    "cpm_horizon": 8,
+    "cpm_horizon": 32,
     "cpm_layers": 2,
-    "cpm_intervention": false,
     "norm": true,
     "dropout": 0.1,
     "sc_prior_mode": "soft_prior",
@@ -31,21 +25,16 @@
     "sc_prior_rank": 12,
     "sc_delta_a": true,
     "sc_delta_rank": null,
-    "sc_sinkhorn_iters": 64,
-    "dynamics_mode": "graph_ode",
-    "ode_steps": 2,
-    "dynamics_dt": 1.0,
-    "graph_source": "history_fc",
-    "personalized": true,
-    "profile_dim": 32,
-    "dynamics_history_memory": true
+    "sc_sinkhorn_iters": 64
   },
   "loss": {
-    "name": "h1_8_reconstruction_fc_frequency",
     "lambda_rec": 1.0,
-    "lambda_fc": 1.0,
-    "lambda_freq": 1.0,
-    "loss_weighting": "uncertainty"
+    "lambda_fc": 0.05,
+    "lambda_freq": 0.05,
+    "lambda_delta": 0.5,
+    "lambda_corr": 0.1,
+    "lambda_local_corr": 0.05,
+    "huber_delta": 1.0
   },
   "data_and_split": {
     "data_root": "data/",
@@ -53,7 +42,6 @@
     "clinical_file": "Rest-meta-MDD-V1V2-Merged-MDD.xlsx",
     "val_ratio": 0.1,
     "test_ratio": 0.1,
-    "split": "被试级 8:1:1，优先 split_file > 版本化 manifest（subject_split_<mode>.json）> 现场按模型 seed 生成；当前 manifest 记录 seed=2024",
     "conditioning": {
       "pretrain": {
         "condition_arm": "demo",
@@ -63,7 +51,6 @@
         "condition_arm": "cat",
         "condition_group": "mdd8"
       },
-      "cond_inject": "heads",
       "cond_dim": 32,
       "cond_d_demo": 16,
       "cond_d_new": 16,
@@ -76,9 +63,8 @@
     "seed": 2024,
     "sampling_seed": 20261009,
     "cond_dropout_seed": 20261008,
-    "split_seed": 2024,
-    "batch_size": 128,
-    "train_epochs": 30,
+    "batch_size": 64,
+    "train_epochs": 150,
     "lr_init": 2e-05,
     "lr_peak": 5e-05,
     "lr_final": 1e-05,
@@ -91,30 +77,54 @@
     "use_ema": true,
     "ema_decay": 0.999,
     "amp": true,
-    "entrypoints": [
-      "bash scripts/pretrain.sh",
-      "bash scripts/finetune.sh"
-    ]
+    "checkpoint_dir": "checkpoints/方案B/训练",
+    "random_context": false,
+    "eval_context_length": 64,
+    "eval_anchors_per_subject": 8,
+    "selection_corr_weight": 0.05,
+    "train_samples_per_subject": 8,
+    "compile": false,
+    "num_workers": 6,
+    "num_threads": 4,
+    "pin_memory": false,
+    "persistent_workers": true,
+    "prefetch_factor": 2,
+    "eval_batch_size": 256,
+    "subject_cache_size": 4096,
+    "cache_in_memory": false,
+    "random_cutoff": true,
+    "stratify_bins": 5,
+    "tf32": true
   },
   "evaluation_protocol": {
-    "primary": "val 选模 = H1–8 被试级 MAE + FC MSE（等权相加，越低越好）；test 报告单步 MAE、H1–8 MAE、FC PCC/MSE 与频域 L1",
-    "final_eval": "python -m analysis.evaluate --ckpt checkpoints/h1_8_v2/neurotwin_finetune/finetuned_best.pt --out_dir results/evaluation --splits test",
-    "metrics_reference": "main.evaluate_tfm"
+    "primary": "完整 H32 被试等权 MAE + 0.05*(1-Temporal PCC)，越低越好；保存完整和逐时距指标。",
+    "aggregation": "先按锚点计算，再被试内平均，最后跨被试等权。",
+    "results": {
+      "pretrain": "checkpoints/全时距双分支_20261104_231429/B/健康评估",
+      "finetune": "checkpoints/全时距双分支_20261104_231429/B/抑郁症评估"
+    }
   },
   "weights": {
+    "initializer": {
+      "path": "checkpoints/方案B/初始化/hc_h8_to_h32.pt",
+      "source": "checkpoints/baseline_1031/neurotwin_pretrain/base_best.pt",
+      "note": "原 HC H8 起点，仅复制有效 B 参数，horizon embedding 显式 repeat_last 扩展；不代表 H32 训练完成。",
+      "sha256": "efb6e4218191bc7028861aa23d9e1ee27514086830fe23bdccbaf1377add4ca6",
+      "source_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc"
+    },
     "pretrain": {
-      "role": "hc_pretrain",
-      "path": "checkpoints/h1_8_v2/neurotwin_pretrain/base_best.pt",
-      "sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc",
-      "note": "2026-10-28 三损失 H1–8 重训（30 epoch 完整跑完）；val 联合判据 0.7865 = MAE 0.5424 + FC MSE 0.2442。"
+      "path": "checkpoints/方案B/neurotwin_pretrain/base_best.pt",
+      "source": "checkpoints/全时距双分支_20261104_231429/B/neurotwin_pretrain/base_best.pt",
+      "epoch": 145,
+      "sha256": "e0187d32ccd7255189dd80f1626a9f6a2ca50ad43a95e8b05ae7e2cd13a42a37",
+      "source_sha256": "079aa4ea18293d83a81673a4dc046e7df80d23a395f0f20aede22b9999a384ab"
     },
     "finetune": {
-      "role": "mdd_finetune",
-      "path": "checkpoints/h1_8_v2/neurotwin_finetune/finetuned_best.pt",
-      "sha256": "f89f57026bb789b0fb8e131a8042e7f220b2e2e827521b988ff3398806ecf4ac",
-      "arch_version": 6,
-      "params_total": 6244019,
-      "note": "2026-10-28 从 h1_8_v2 HC 权重重训（30 epoch；epoch 19 为联合判据 best，val 0.7857 = MAE 0.5363 + FC MSE 0.2493）；主干冻结 10 轮，解冻后早停计数重置。"
+      "path": "checkpoints/方案B/neurotwin_finetune/finetuned_best.pt",
+      "source": "checkpoints/全时距双分支_20261104_231429/B/neurotwin_finetune/finetuned_best.pt",
+      "epoch": 94,
+      "sha256": "d0ba07105712f0a0ba5ae7eb43b3c3fa6f173e8ca9e05f2ac5d7e67f1d94ad43",
+      "source_sha256": "3a26016afe39e611f42ff200bf89db258989398dd088629cafb3be0f4c345b1b"
     }
   }
 }

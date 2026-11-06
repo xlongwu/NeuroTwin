@@ -281,16 +281,15 @@ def main():
         meta['splits_sha256'] = {g: hashlib.sha256((args.data_root / name).read_bytes()).hexdigest()
                                  for g, name in [('hc', 'subject_split_pretrain.json'), ('mdd', 'subject_split_finetune.json')]}
         np.savez_compressed(model_path, **model, metadata=json.dumps(meta))
-        model.update(meta)
-    else:
-        with np.load(model_path, allow_pickle=False) as data:
-            model = {k: data[k].copy() for k in data.files if k != 'metadata'}
-            model.update(json.loads(str(data['metadata'])))
-        if model['checkpoint_sha256'] != digest:
-            raise ValueError('病理模型与健康 checkpoint 不匹配')
-        for group, name in [('hc', 'subject_split_pretrain.json'), ('mdd', 'subject_split_finetune.json')]:
-            if hashlib.sha256((args.data_root / name).read_bytes()).hexdigest() != model['splits_sha256'][group]:
-                raise ValueError(f'{group} 数据划分与病理模型训练时不同')
+    # 拟合后也从落盘模型评分，保证首次验证与独立加载使用相同数组布局及标量类型。
+    with np.load(model_path, allow_pickle=False) as data:
+        model = {k: data[k].copy() for k in data.files if k != 'metadata'}
+        model.update(json.loads(str(data['metadata'])))
+    if model['checkpoint_sha256'] != digest:
+        raise ValueError('病理模型与健康 checkpoint 不匹配')
+    for group, name in [('hc', 'subject_split_pretrain.json'), ('mdd', 'subject_split_finetune.json')]:
+        if hashlib.sha256((args.data_root / name).read_bytes()).hexdigest() != model['splits_sha256'][group]:
+            raise ValueError(f'{group} 数据划分与病理模型训练时不同')
     groups = load_features(args.data_root, args.checkpoint, args.rolling_dir, args.split)
     if groups[0]['protocol'] != model['protocol']:
         raise ValueError('评价缓存协议与病理模型训练时不同')

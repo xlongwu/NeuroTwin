@@ -3,7 +3,7 @@
 
 输入（全部来自已完成的 v2 产物）：
 
-- z 矩阵：``results/pathology_analysis/run1/z_maps/z_matrix_<group>_<split>.npz``
+- z 矩阵：``results/方案B/病理分析/run1/z_maps/z_matrix_<group>_<split>.npz``
 - 匹配子集：``data/splits/site_matched_subset.json``（1504 对，36 站）
 - 人口学与临床：merged 表（hc3 / mdd8）
 - 描述量基线：在线拟合 ``analysis/twin_reference`` 参照（HC train）并对匹配
@@ -26,7 +26,7 @@
 
 用法::
 
-    python -m analysis.pathology_tests --run-dir results/pathology_analysis/run1
+    python -m analysis.pathology_tests --run-dir results/方案B/病理分析/run1
 """
 import argparse
 import csv
@@ -329,7 +329,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run-dir', type=Path,
-                    default=Path('results/pathology_analysis/run1'))
+                    default=Path('results/方案B/病理分析/run1'))
     ap.add_argument('--data-root', type=Path, default=Path('data'))
     ap.add_argument('--ckpt', type=Path,
                     default=Path('checkpoints/'
@@ -524,7 +524,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             'action': ('维持模型偏离信号为主线，MINDy 式参数组间分析不启动'
                        if model_increment else
                        '触发 T2：启动指定扩展动作——MINDy 式参数组间分析'
-                       '（冻结权重参数/个体 profile 的组间比较，不新增训练）'),
+                       '（方案 B 冻结权重下的预测及残差组间比较，不新增训练）'),
         }
 
     # ---- 5) 临床关联（网络级偏相关；HAMA 完整观测集） ----

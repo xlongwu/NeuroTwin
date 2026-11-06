@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 ROOT=Path(__file__).resolve().parents[1]
-OUT=ROOT/'results/H1-8分析_20261028'
+OUT=ROOT/'results/方案B/H1-8分析'
 CACHE=OUT/'03_可解释性/重要性缓存'
 NETWORKS=['VN','SMN','DAN','SN','FN','DMN','LN']
 

@@ -13,7 +13,7 @@
 用法::
 
     python -m analysis.visualize_v2_results \
-      --run-dir results/pathology_analysis/run1
+      --run-dir results/方案B/病理分析/run1
 """
 import argparse
 import json
@@ -42,7 +42,7 @@ def load_z(run_dir: Path, tag: str):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--run-dir', type=Path,
-                    default=Path('results/pathology_analysis/run1'))
+                    default=Path('results/方案B/病理分析/run1'))
     ap.add_argument('--subset', type=Path,
                     default=Path('data/splits/site_matched_subset.json'))
     ns = ap.parse_args()

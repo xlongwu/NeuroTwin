@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.information_readout import ALPHAS, kernel_scores, kernels, load_features, site_auc
-from analysis.individual_pilot import digest
+from utils.condition_schema import file_sha256 as digest
 from train.pathology_readout import site_folds, site_weights
 
 

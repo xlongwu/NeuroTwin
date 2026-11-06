@@ -31,7 +31,7 @@ def main():
         missing = [sid for sid in manifest['subjects'] if not (root / f'{sid}.npz').is_file()]
         if missing:
             raise RuntimeError(f'{group}: {len(missing)} subjects missing; refuse partial summary')
-        records, blocks, profiles, graph_records = [], [], [], []
+        records, blocks, representations, graph_records = [], [], [], []
         for sid in manifest['subjects']:
             with np.load(root / f'{sid}.npz') as z:
                 true, pred, altered, anchors = z['true'], z['prediction'], z['missing_prediction'], z['cutoff']
@@ -72,12 +72,12 @@ def main():
                                 'graph_similarity_mean': np.mean(similarities) if similarities else np.nan,
                                 'gap_min': min(gaps) if gaps else np.nan, 'gap_max': max(gaps) if gaps else np.nan})
                 blocks.append(per_graph)
-                profiles.append(z['profile'].copy())
+                representations.append(z['representation'].copy())
         groups[group] = {'records': pd.DataFrame(records), 'blocks': np.stack(blocks),
-                         'profiles': np.stack(profiles)}
+                         'representations': np.stack(representations)}
         groups[group]['records'].to_csv(args.out_dir / f'{group}_逐被试.csv', index=False)
         pd.DataFrame(graph_records).to_csv(args.out_dir / f'{group}_图边分布.csv', index=False)
-        pd.DataFrame(groups[group]['profiles'], index=manifest['subjects']).rename_axis('subject').to_csv(args.out_dir / f'{group}_profile.csv')
+        pd.DataFrame(groups[group]['representations'], index=manifest['subjects']).rename_axis('subject').to_csv(args.out_dir / f'{group}_个体表征.csv')
         rows = []
         for k, key in enumerate(('history_fc_abs', 'A_func', 'A_eff')):
             for i, left in enumerate(NETWORKS):
@@ -119,18 +119,18 @@ def main():
         fig.suptitle(f'Condition probe: full vs missing; {group.upper()} n={len(df)}')
         for ext in ('png', 'pdf'): fig.savefig(args.out_dir / f'{group}_condition.{ext}', dpi=300)
         plt.close(fig)
-        prof = data['profiles']
-        profile_mae_r = [np.corrcoef(prof[:,j], df['baseline_mae'])[0,1]
-                         if prof[:,j].std() > 1e-8 and df['baseline_mae'].std() > 0 else np.nan
-                         for j in range(prof.shape[1])]
-        pd.DataFrame({'dimension': np.arange(1, prof.shape[1]+1),
-                      'mean': prof.mean(axis=0), 'sd': prof.std(axis=0, ddof=1),
-                      'median': np.median(prof, axis=0), 'baseline_mae_pearson_r':profile_mae_r}).to_csv(args.out_dir / f'{group}_profile汇总.csv', index=False)
+        features = data['representations']
+        representation_mae_r = [np.corrcoef(features[:,j], df['baseline_mae'])[0,1]
+                         if features[:,j].std() > 1e-8 and df['baseline_mae'].std() > 0 else np.nan
+                         for j in range(features.shape[1])]
+        pd.DataFrame({'dimension': np.arange(1, features.shape[1]+1),
+                      'mean': features.mean(axis=0), 'sd': features.std(axis=0, ddof=1),
+                      'median': np.median(features, axis=0), 'baseline_mae_pearson_r':representation_mae_r}).to_csv(args.out_dir / f'{group}_表征汇总.csv', index=False)
         fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), constrained_layout=True)
-        x = np.arange(1, prof.shape[1]+1)
-        axes[0].errorbar(x, prof.mean(axis=0), yerr=prof.std(axis=0, ddof=1),
+        x = np.arange(1, features.shape[1]+1)
+        axes[0].errorbar(x, features.mean(axis=0), yerr=features.std(axis=0, ddof=1),
                          fmt='o', ms=2.8, lw=.8, color='#2b438d', ecolor='#87ceeb', capsize=1)
-        axes[0].set(xlabel='Profile dimension', ylabel='Mean ± between-subject SD', title='Fixed-prefix profile')
+        axes[0].set(xlabel='TFM dimension', ylabel='Mean ± between-subject SD', title='Historical TFM representation')
         vals = df['graph_similarity_mean'].dropna().to_numpy()
         if len(vals):
             axes[1].boxplot([vals], positions=[1], widths=.36, patch_artist=True,
@@ -139,8 +139,8 @@ def main():
             axes[1].scatter(1+rng.uniform(-.12,.12,len(vals)), vals, s=5, c='#2b438d', alpha=.45)
         axes[1].set(xticks=[1], xticklabels=[group.upper()], ylabel='Within-subject mean Pearson r',
                     title=f'Nonoverlapping effective-graph windows (n={len(vals)})')
-        fig.suptitle(f'{group.upper()}: profile and within-scan graph stability; n={len(df)}')
-        for ext in ('png', 'pdf'): fig.savefig(args.out_dir / f'{group}_profile_stability.{ext}', dpi=300)
+        fig.suptitle(f'{group.upper()}: representation and within-scan graph stability; n={len(df)}')
+        for ext in ('png', 'pdf'): fig.savefig(args.out_dir / f'{group}_表征稳定性.{ext}', dpi=300)
         plt.close(fig)
     (args.out_dir / ('_'.join(args.groups) + '_基线描述报告.md')).write_text('\n'.join(report) + '\n')
 

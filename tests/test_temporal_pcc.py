@@ -1,7 +1,7 @@
 """Focused Temporal PCC checks: mask, degenerate trajectories and E2 compatibility."""
 import pytest
 import torch
-from train.losses import temporal_pcc_loss, TFMDualLoss
+from train.losses import temporal_pcc_loss
 
 
 def test_temporal_pcc_affine_and_reversed():
@@ -38,28 +38,3 @@ def test_constant_target_excluded_constant_prediction_supervised():
     loss.backward()
     assert pred.grad[0,0].abs().sum()==0
     assert torch.isfinite(pred.grad).all() and pred.grad[0,1].abs().sum()>0
-
-
-def test_both_branches_and_disabled_e2():
-    torch.manual_seed(21)
-    one=torch.randn(2,3,1,1)
-    target=torch.randn(2,3,8)
-    cpm=torch.randn_like(target,requires_grad=True)
-    ode=torch.randn_like(target,requires_grad=True)
-    opts=dict(lambda_temporal_diff=.05,lambda_cross_head=.02,weighting='uncertainty')
-    old=TFMDualLoss(**opts)
-    disabled=TFMDualLoss(**opts,lambda_temporal_pcc=0)
-    active=TFMDualLoss(**opts,lambda_temporal_pcc=.05)
-    kwargs=dict(cpm_mask=torch.ones(2,8),dynamics_pred=ode,
-                dynamics_target=target,dynamics_mask=torch.zeros(2,8),context_last=one[...,0,0])
-    a,_=old(one,one,cpm,target,**kwargs);b,_=disabled(one,one,cpm,target,**kwargs)
-    assert torch.equal(a,b)
-    active_loss,stats=active(one,one,cpm,target,**kwargs)
-    torch.testing.assert_close(active_loss,b+.05*temporal_pcc_loss(cpm,target))
-    assert stats['loss_temporal_pcc_dyn']==0
-    kwargs['dynamics_mask']=torch.ones(2,8)
-    _,stats=active(one,one,cpm,target,**kwargs)
-    tp=temporal_pcc_loss(cpm,target)+temporal_pcc_loss(ode,target)
-    torch.testing.assert_close(stats['loss_temporal_pcc'],tp.detach())
-    tp.backward()
-    for p in (cpm,ode): assert torch.isfinite(p.grad).all() and p.grad.abs().sum()>0

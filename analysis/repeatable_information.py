@@ -8,12 +8,13 @@ import pandas as pd
 import torch
 
 from analysis.h18_data import calibrate_raw
-from analysis.individual_pilot import digest
+from utils.condition_schema import file_sha256 as digest
 from analysis.information_nuisance import demographic_features
 from analysis.information_readout import ALPHAS, adjusted_features, kernel_scores, kernels, site_auc
 from analysis.normative_deviation import load_demo_matrix
 from analysis.shared_mechanism import GROUP_FILES, ROOT, outgoing_response
 from inference_twin import TwinSession, load_raw_series
+from model import load_model_config
 from train.pathology_readout import site_folds, site_weights
 
 LAYERS=('input_fc','encoded_state','effective_graph','response7')
@@ -42,7 +43,7 @@ def extract_windows(meta: dict, mechanism_dir: Path, dest: Path, device: str, ch
     target=dest/'逐窗特征.npz'
     protocol=dict(checkpoint_sha256=digest(checkpoint),subjects=meta['subjects'].tolist(),layers=LAYERS,
                   source_sha256=digest(Path(__file__)),device=device,
-                  model_source_sha256={f:digest(ROOT/f) for f in ('models/tfm.py','models/tfm_dynamics.py','models/graph_prior.py')},
+                  model_source_sha256={f:digest(ROOT/f) for f in ('models/tfm.py','models/tfm_backbone.py','models/graph_prior.py')},
                   conditions={g:digest(ROOT/'data'/spec[1]) for g,spec in GROUP_FILES.items()})
     manifest=dest/'逐窗来源.json'
     if target.exists():
@@ -77,19 +78,10 @@ def extract_windows(meta: dict, mechanism_dir: Path, dest: Path, device: str, ch
                     raise ValueError('Overlapping history windows')
                 series=calibrate_raw(load_raw_series(raw_path,116),32)
                 x=torch.from_numpy(np.stack([series[t-63:t+1].T for t in cutoff]).copy())[:,:,None,:].to(device)
-                cal=torch.from_numpy(series[:32].T.copy())[None,:,None,:].to(device)
-                profile=model.calibrate_profile(cal);condition=session.condition_for(sid)
-                captured={}
-                def hook(_module,inputs):
-                    captured['state']=inputs[0].detach()
-                handle=model.one_step_head.register_forward_pre_hook(hook)
-                try:
-                    _,aux=model(x,sc_matrix=None,profile=profile.expand(2,-1),
-                                condition={k:v.expand(2,*v.shape[1:]) for k,v in condition.items()},
-                                dynamics_horizon=1,with_aux=False)
-                finally:
-                    handle.remove()
-                discrepancy=float(np.max(abs(aux['dynamics_pred'][:,:,0].cpu().numpy()-expected)))
+                condition=session.condition_for(sid)
+                prediction,aux=model(x,condition={k:v.expand(2,*v.shape[1:]) for k,v in condition.items()},return_tokens=True)
+                captured={'state':aux['history_tokens'][:,:,-1,:]}
+                discrepancy=float(np.max(abs(prediction[:,:,0].cpu().numpy()-expected)))
                 if discrepancy>1e-5:
                     raise ValueError(f'{sid}: baseline changed')
                 max_difference=max(max_difference,discrepancy)
@@ -163,7 +155,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mechanism-dir',type=Path,required=True)
     p.add_argument('--out-dir',type=Path,required=True)
-    p.add_argument('--checkpoint',type=Path,default=ROOT/'checkpoints/neurotwin_pretrain/base_best.pt')
+    p.add_argument('--checkpoint',type=Path,default=ROOT/load_model_config()['weights']['pretrain']['path'])
     p.add_argument('--device',default='cpu')
     a=p.parse_args();a.out_dir.mkdir(parents=True,exist_ok=True)
     meta=load_meta(a.mechanism_dir)
@@ -172,7 +164,7 @@ def main():
                   selection='source-window inner folds only; mixture zero includes baseline; locked model transfers to other window',
                   uncertainty='10000 paired site bootstrap of fixed OOF predictions; descriptive only, no CV refits or multiplicity correction',
                   limits=['same previously explored test cohort; not independent confirmation',
-                          'windows are disjoint but same scan, shared profile and calibration',
+                          'windows are disjoint but same scan and shared calibration scale',
                           'base HC model saw other subjects from these sites during pretraining',
                           'added reader increment is conditional predictive evidence, not neural causality'])
     manifest=a.out_dir/'分析协议.json'

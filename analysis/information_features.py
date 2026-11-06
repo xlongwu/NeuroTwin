@@ -7,16 +7,17 @@ import numpy as np
 import torch
 
 from analysis.h18_data import calibrate_raw
-from analysis.individual_pilot import digest
+from utils.condition_schema import file_sha256 as digest
 from analysis.shared_mechanism import GROUP_FILES, ROOT
 from analysis.twin_reference import describe_history
 from inference_twin import TwinSession, load_raw_series
+from model import load_model_config
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--group', choices=GROUP_FILES, required=True)
-    p.add_argument('--checkpoint', type=Path, default=ROOT/'checkpoints/neurotwin_pretrain/base_best.pt')
+    p.add_argument('--checkpoint', type=Path, default=ROOT/load_model_config()['weights']['pretrain']['path'])
     p.add_argument('--mechanism-dir', type=Path, required=True)
     p.add_argument('--out-dir', type=Path, required=True)
     p.add_argument('--device', default='cpu')
@@ -41,7 +42,7 @@ def main():
                     source_sha256=digest(Path(__file__)),
                     torch=torch.__version__, device=a.device,
                     windows='same first/last K64 as mechanism cache; per-window features averaged',
-                    model='eval; all parameters frozen; own fixed first-32TR profile; hc3 training statistics',
+                    model='eval; all parameters frozen; fixed first-32TR scale; hc3 training statistics',
                     label_use='no diagnosis or symptoms used in model feature extraction')
     manifest = dest/'数据清单.json'
     if manifest.exists() and json.loads(manifest.read_text()) != protocol:
@@ -61,28 +62,13 @@ def main():
             series = calibrate_raw(load_raw_series(raw_path, 116), 32)
             histories = np.stack([series[t-63:t+1].T for t in cutoffs])
             x = torch.from_numpy(histories.copy())[:, :, None, :].to(a.device)
-            cal = torch.from_numpy(series[:32].T.copy())[None, :, None, :].to(a.device)
-            profile = model.calibrate_profile(cal)
-            condition = session.condition_for(sid)
-            captured = {}
-
-            def input_hook(_module, inputs):
-                captured['normalized_history'] = inputs[0].detach()
-
-            def state_hook(_module, inputs, output):
-                captured['encoded_state'] = inputs[0].detach()
-                captured['advanced_state'] = output[0].detach()
-
-            handles = [model.patch_embed.register_forward_pre_hook(input_hook),
-                       model.one_step_head.register_forward_hook(state_hook)]
-            try:
-                _, aux = model(x, sc_matrix=None, profile=profile.expand(2,-1),
-                               condition={k:v.expand(2,*v.shape[1:]) for k,v in condition.items()},
-                               dynamics_horizon=1, with_aux=False)
-            finally:
-                for handle in handles:
-                    handle.remove()
-            prediction = aux['dynamics_pred'][:,:,0].cpu().numpy()
+            condition=session.condition_for(sid)
+            expanded={k:v.expand(len(x),*v.shape[1:]) for k,v in condition.items()}
+            prediction_all,aux=model(x,condition=expanded,return_tokens=True)
+            normalized=model.rev_norm(x,'norm')[0][:,:,0] if model.rev_norm else x[:,:,0]
+            captured={'normalized_history':normalized,
+                      'encoded_state':aux['history_tokens'][:,:,-1,:]}
+            prediction=prediction_all[:,:,0].cpu().numpy()
             discrepancy = float(np.max(abs(prediction-expected)))
             if discrepancy > 1e-5:
                 raise ValueError(f'{sid}: baseline changed by {discrepancy}')
@@ -91,7 +77,6 @@ def main():
                        'input_fc': fc[:,upper[0],upper[1]].mean(0),
                        'input_descriptors': describe_history(histories.transpose(0,2,1)).mean(0).reshape(-1),
                        **{k:v.cpu().numpy().mean(0).reshape(-1) for k,v in captured.items()},
-                       'profile':profile[0].cpu().numpy(),
                        'learned_graph':aux['sc_prior']['A_func'].cpu().numpy()[:,upper[0],upper[1]].mean(0),
                        'effective_graph':aux['sc_prior']['A_eff'].cpu().numpy()[:,upper[0],upper[1]].mean(0),
                        'prediction':prediction.mean(0),

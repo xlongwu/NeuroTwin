@@ -4,7 +4,6 @@ import numpy as np
 
 from analysis.next_point_eval import (aggregate_columns, amplitude_quantile_edges,
                                       per_task_amplitude_diagnostics,
-                                      per_task_dual_head_metrics,
                                       per_task_head_metrics)
 
 
@@ -53,44 +52,8 @@ def test_direction_accuracy_only_counts_valid_step_pairs():
     _close(out['direction_accuracy_step'][0], [1., np.nan, np.nan])
 
 
-def test_dual_head_gap_quality_and_both_fail():
-    anchor = np.zeros((1, 2))
-    target = np.zeros((1, 2, 2))
-    ode = np.zeros((1, 2, 2))                 # 完美
-    cpm = np.ones((1, 2, 2))                 # 与 ODE 相差 1
-    mask = np.ones((1, 2), bool)
-    out = per_task_dual_head_metrics(cpm, ode, target, mask, anchor)
-    _close(out['gap'], [[1., 1.]])
-    _close(out['cpm_mae'], [[1., 1.]])
-    _close(out['ode_mae'], [[0., 0.]])
-    # persistence = 0，ODE 不失败、CPM 失败 → both_fail=0
-    _close(out['both_fail_vs_persistence'], [[0., 0.]])
-    _close(out['cpm_win_rate'], [[0., 0.]])
-    # 误差向量为常数，相关系数无定义
-    assert np.isnan(out['head_error_corr']).all()
-
-    # 两头一起错：都预测 2，真值 0，persistence 0
-    both = np.full_like(target, 2.0)
-    bad = per_task_dual_head_metrics(both, both, target, mask, anchor)
-    _close(bad['gap'], [[0., 0.]])
-    _close(bad['both_fail_vs_persistence'], [[1., 1.]])
-    _close(bad['gap_norm'], [[0., 0.]])
 
 
-def test_dual_head_oracle_and_complementarity():
-    anchor = np.zeros((2, 1))
-    target = np.zeros((2, 1, 1))
-    # anchor0: CPM 完美、ODE 差；anchor1: 反过来
-    cpm = np.array([[[0.0]], [[2.0]]])
-    ode = np.array([[[2.0]], [[0.0]]])
-    out = per_task_dual_head_metrics(cpm, ode, target, np.ones((2, 1), bool), anchor)
-    _close(out['cpm_mae'], [[0.], [2.]])
-    _close(out['ode_mae'], [[2.], [0.]])
-    _close(out['oracle_mae'], [[0.], [0.]])
-    _close(out['oracle_gain_vs_cpm'], [[0.], [2.]])
-    _close(out['oracle_gain_vs_ode'], [[2.], [0.]])
-    # 两个 anchor 各由不同头胜出
-    _close(out['cpm_win_rate'], [[1.], [0.]])
 
 
 def test_amplitude_diagnostics_detect_uniform_scale_compression():

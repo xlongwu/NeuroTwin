@@ -10,8 +10,8 @@ import pandas as pd
 from utils.site_subset import parse_site
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / 'results/H1-8当前结果'
-OUT = ROOT / 'results/H1-8分析_20261028'
+SOURCE = ROOT / 'results/方案B'
+OUT = ROOT / 'results/方案B/H1-8分析'
 NETWORKS = ['VN', 'SMN', 'DAN', 'SN', 'FN', 'DMN', 'LN']
 
 

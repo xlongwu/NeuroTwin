@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 ROOT=Path(__file__).resolve().parents[1]
-OUT=ROOT/'results/H1-8分析_20261028'
+OUT=ROOT/'results/方案B/H1-8分析'
 
 
 def main():

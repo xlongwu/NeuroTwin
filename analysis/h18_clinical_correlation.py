@@ -9,7 +9,7 @@ from scipy import stats
 from utils.dataloader import load_condition_table
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'results/H1-8分析_20261028/02_病理分析'
+OUT = ROOT / 'results/方案B/H1-8分析/02_病理分析'
 
 
 def main():

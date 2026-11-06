@@ -12,7 +12,7 @@ import pandas as pd
 from scipy.linalg import eigh
 from sklearn.metrics import roc_auc_score
 
-from analysis.individual_pilot import digest
+from utils.condition_schema import file_sha256 as digest
 from analysis.normative_deviation import load_demo_matrix
 from analysis.shared_mechanism import GROUP_FILES, NETWORKS, ROOT
 from train.pathology_fingerprint import fit_reference, reference_features
@@ -20,7 +20,7 @@ from train.pathology_readout import site_folds, site_weights
 
 ALPHAS = (.01, .1, 1., 10.)
 LAYERS = ('input_history', 'input_fc', 'input_descriptors', 'normalized_history',
-          'encoded_state', 'advanced_state', 'profile', 'learned_graph', 'effective_graph',
+          'encoded_state', 'learned_graph', 'effective_graph',
           'prediction', 'prediction_error', 'response7', 'response49', 'response_full')
 
 
@@ -201,7 +201,7 @@ def main():
     pd.DataFrame(site_records).to_csv(a.out_dir/'逐站点读出.csv',index=False)
     contrasts=[]
     pairs=[('input_fc','effective_graph'),('input_fc','encoded_state'),('normalized_history','encoded_state'),
-           ('encoded_state','advanced_state'),('encoded_state','prediction'),('encoded_state','prediction_error'),
+           ('encoded_state','prediction'),('encoded_state','prediction_error'),
            ('response_full','response49'),('response49','response7')]
     for first,second in pairs:
         for reader in ('linear','rbf'):

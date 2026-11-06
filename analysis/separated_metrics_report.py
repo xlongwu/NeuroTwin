@@ -1,24 +1,14 @@
-"""分协议汇总评估：滚动单步 vs 固定锚点多步 H1–8。
+"""分协议汇总评估：滚动单步 vs 固定锚点多步 H1–32。
 
 两个协议回答不同问题，指标不合并：
 
 - rolling_one_step：每个 TR 用真实观测历史预测下一点，拼接成完整预测
   序列后计算 MAE/MSE/RMSE、时间 PCC 与整段 FC。它衡量“跟踪”能力，
   不是自主生成。
-- fixed_anchor_multi_step：单个 K64 锚点一次前向输出 H1–8，未来真值不
-  反馈；逐 horizon 报告 MAE/RMSE/空间 PCC/方向准确率，FC 在 8 步未来
+- fixed_anchor_multi_step：单个 K64 锚点一次前向输出 H1–32，未来真值不
+  反馈；逐 horizon 报告 MAE/RMSE/空间 PCC/方向准确率，FC 在 32 步未来
   序列上计算。H1 单独列为 single_step。
 
-示例::
-
-    python -m analysis.separated_metrics_report \
-        --hc-eval "results/H1-8当前结果/健康对照/指标_测试集.json" \
-        --mdd-eval "results/H1-8当前结果/抑郁症/指标_测试集.json" \
-        --hc-rolling-dir "results/H1-8当前结果/滚动单步_健康对照/hc" \
-        --hc-fc "results/H1-8当前结果/功能连接_健康对照/功能连接汇总_测试集.json" \
-        --mdd-rolling-dir "results/H1-8当前结果/滚动单步_抑郁症_微调/mdd" \
-        --mdd-fc "results/H1-8当前结果/功能连接_抑郁症_微调/功能连接汇总_测试集.json" \
-        --out "results/H1-8当前结果/单步与多步协议汇总.json"
 """
 import argparse
 import json
@@ -27,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-HORIZONS = tuple(f'H{k}' for k in range(1, 9))
+HORIZONS = tuple(f'H{k}' for k in range(1, 33))
 
 
 def _load(path):
@@ -48,63 +38,16 @@ def _mean(values):
 
 
 def single_step(eval_report):
-    """固定锚点协议的 H1：下一步点值误差与空间 pattern 相关。"""
-    h1 = eval_report['head_metrics']['ODE']['H1']
-    return {
-        'definition': '单个 K64 锚点预测 t+1；空间 PCC 为同一步跨 116 ROI 的 Pearson 相关',
-        'n_subjects': int(h1['n_subjects']), 'n_tasks': int(h1['n_tasks']),
-        'mae': float(h1['MAE']), 'mse': float(h1['RMSE'] ** 2),
-        'rmse': float(h1['RMSE']), 'pcc_spatial': float(h1['PCC_spatial']),
-        'r2': float(h1['R2']),
-        'direction_accuracy': float(h1['direction_accuracy_step']),
-        'variance_ratio': float(h1['variance_ratio']),
-    }
+    """同一个 CPM H32 前向的 H1 截面；跨 ROI 空间相关。"""
+    return {metric: values['H1']['mean']
+            for metric, values in eval_report['horizon_metrics'].items() if 'H1' in values}
 
 
 def multi_step(eval_report):
-    """固定锚点协议的 H1–8：逐 horizon 与总体指标 + 8 步 FC。"""
-    head = eval_report['head_metrics']['ODE']
-    per_horizon = {}
-    for h in HORIZONS:
-        if h not in head:
-            continue
-        blk = head[h]
-        per_horizon[h] = {
-            'mae': float(blk['MAE']), 'mse': float(blk['RMSE'] ** 2),
-            'rmse': float(blk['RMSE']),
-            'pcc_spatial': float(blk['PCC_spatial']),
-            'direction_accuracy': float(blk['direction_accuracy_step']),
-        }
-    overall = head['overall']
-    arms = [v for k, v in per_horizon.items() if k != 'H1']
-    fc = eval_report['fc_h1_8']
-    return {
-        'definition': ('单个 K64 锚点一次前向输出 H1–8，未来真值不反馈；'
-                       '空间 PCC 为每个时点跨 116 ROI 的 Pearson 相关，'
-                       'FC 在预测/真实 8 步序列上计算（单 TR 无 FC）'),
-        'per_horizon': per_horizon,
-        'aggregate_H1_8': {
-            'mae': float(overall['MAE']), 'mse': float(overall['RMSE'] ** 2),
-            'rmse': float(overall['RMSE']),
-            'pcc_spatial': float(overall['PCC_spatial']),
-            'r2': float(overall['R2']),
-            'direction_accuracy': float(overall['direction_accuracy_step']),
-            'variance_ratio': float(overall['variance_ratio']),
-        },
-        'aggregate_H2_8_equal_horizon_mean': {
-            'mae': _mean([v['mae'] for v in arms]),
-            'pcc_spatial': _mean([v['pcc_spatial'] for v in arms]),
-            'direction_accuracy': _mean([v['direction_accuracy'] for v in arms]),
-            'note': 'H2–H8 逐 horizon 指标的等权平均，仅用于与 H1 单步对照',
-        },
-        'fc_H1_8': {
-            'fc_mse': float(fc['fc_mse']['mean']),
-            'fc_edge_pcc': float(fc['fc_pcc']['mean']),
-            'fc_group_pcc': float(fc['fc_group_pcc']),
-            'freq_l1': float(fc['freq_l1']['mean']),
-            'n_subjects': int(fc['fc_mse']['n_subjects']),
-        },
-    }
+    """固定 K64 锚点的完整 H32 与各阶段，按被试等权。"""
+    return dict(definition='CPM 一次前向输出 H1–32，未来真值不反馈',
+                per_horizon=eval_report['horizon_metrics'],
+                stages=eval_report['trajectory_metrics'])
 
 
 def _rolling_cache_stats(cache_dir):
@@ -179,9 +122,9 @@ def main():
     hc_eval, mdd_eval = _load(ns.hc_eval), _load(ns.mdd_eval)
     report = {
         '_meta': {
-            'purpose': '把滚动单步（项目主协议）与固定锚点 H1–8（多步能力）分开报告',
+            'purpose': '把滚动单步（追踪协议）与固定锚点 H1–32（多步能力）分开报告',
             'single_step_note': ('单步是固定锚点协议的 H1，也是滚动协议的逐点预测；'
-                                 '单 TR 无法定义 FC，FC 只出现在 8 步窗口或完整序列协议中'),
+                                 '单 TR 无法定义 FC，FC 只出现在 32 步窗口或完整序列协议中'),
         },
         'protocols': {
             'rolling_one_step': {
@@ -192,9 +135,9 @@ def main():
             },
             'fixed_anchor_multi_step': {
                 'HC': {'single_step_H1': single_step(hc_eval),
-                       'multi_step_H1_8': multi_step(hc_eval)},
+                       'multi_step_H1_32': multi_step(hc_eval)},
                 'MDD': {'single_step_H1': single_step(mdd_eval),
-                        'multi_step_H1_8': multi_step(mdd_eval)},
+                        'multi_step_H1_32': multi_step(mdd_eval)},
             },
         },
     }

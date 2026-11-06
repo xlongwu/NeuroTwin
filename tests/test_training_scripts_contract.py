@@ -1,169 +1,32 @@
-# coding=utf-8
-"""训练脚本 ↔ 基线 JSON / checkpoint 快照的参数契约测试。
-
-通过一个只捕获 `main.py` argv 的假 Python 入口运行两份训练脚本，不启动训练。
-"""
+"""训练脚本只传递阶段和运行路径，算法参数由唯一配置解析。"""
 import os
-import shlex
-import subprocess
-import sys
 from pathlib import Path
+import subprocess
+from main import parse_args
+from model import load_model_config
 
-import pytest
-
-from model import CONTRACT_FIELDS, config_value, load_model_config
-
-ROOT = Path(__file__).resolve().parents[1]
-_WEIGHTS = load_model_config()['weights']
-REAL_CKPT = ROOT / _WEIGHTS['finetune']['path']
-PRETRAIN_CKPT = ROOT / _WEIGHTS['pretrain']['path']
-
-pytestmark = pytest.mark.skipif(os.name != 'posix', reason='训练入口是 bash 脚本')
+ROOT=Path(__file__).resolve().parents[1]
 
 
-def _fake_python(tmp_path):
-    path = tmp_path / 'fake_python.sh'
-    path.write_text(
-        '#!/usr/bin/env bash\n'
-        'for arg in "$@"; do\n'
-        '  if [[ "$arg" == "main.py" ]]; then\n'
-        '    printf "%s\\n" "$@" > "${CAPTURE:?}"\n'
-        '    exit 0\n'
-        '  fi\n'
-        'done\n'
-        f'exec {shlex.quote(sys.executable)} "$@"\n',
-        encoding='utf-8')
-    path.chmod(0o755)
-    return path
+def test_pretrain_and_finetune_scripts_share_the_formal_config(tmp_path):
+    capture=tmp_path/'argv.txt'
+    fake=tmp_path/'python.sh'
+    fake.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "${CAPTURE:?}"\n')
+    fake.chmod(0o755)
+    for mode in ('pretrain','finetune'):
+        env=os.environ.copy();env.update(PYTHON=str(fake),CAPTURE=str(capture),
+            DEVICE='cpu',DATA_ROOT=str(tmp_path/'data'),CHECKPOINT_DIR=str(tmp_path/'weights'))
+        result=subprocess.run(['bash',str(ROOT/'scripts'/f'{mode}.sh')],cwd=ROOT,env=env,capture_output=True,text=True)
+        assert result.returncode==0,result.stderr
+        tokens=capture.read_text().splitlines();index=tokens.index('main.py')
+        args=parse_args(tokens[index+1:])
+        cfg=load_model_config()
+        assert args.mode==mode and args.batch_size==cfg['training']['batch_size']
+        assert args.cpm_horizon==32 and args.lambda_delta==.5
+        assert args.save_training_state and args.data_root==str(tmp_path/'data')
+        assert args.condition_arm==('demo' if mode=='pretrain' else 'cat')
 
 
-def _prepare(tmp_path):
-    data = tmp_path / 'data'
-    (data / 'Raw' / 'HC').mkdir(parents=True)
-    (data / 'Raw' / 'MDD').mkdir(parents=True)
-    (data / 'Rest-meta-MDD-V1V2-Merged-MDD.xlsx').write_text('', encoding='utf-8')
-    checkpoints = tmp_path / 'checkpoints'
-    hc = checkpoints / 'neurotwin_pretrain'
-    hc.mkdir(parents=True)
-    (hc / 'base_best.pt').write_text('', encoding='utf-8')
-    return data, checkpoints
-
-
-def _run_script(tmp_path, script, capture, model_config=None):
-    data, checkpoints = _prepare(tmp_path)
-    env = os.environ.copy()
-    env.update(
-        PYTHON=str(_fake_python(tmp_path)),
-        CAPTURE=str(capture),
-        DATA_ROOT=str(data),
-        CHECKPOINT_DIR=str(checkpoints),
-        TMPDIR=str(tmp_path / 'runtime'),
-    )
-    if model_config is not None:
-        env['MODEL_CONFIG'] = str(model_config)
-    proc = subprocess.run(
-        ['bash', str(ROOT / 'scripts' / script)],
-        cwd=ROOT, env=env, capture_output=True, text=True)
-    assert proc.returncode == 0, proc.stderr
-    return _parse_argv(capture)
-
-
-@pytest.mark.parametrize('suffix', ['baseline', 'memory', 'spectral', 'staged'])
-@pytest.mark.parametrize('stage', ['pretrain', 'finetune'])
-def test_h32_scripts_use_config_and_isolated_output(tmp_path, suffix, stage):
-    import json
-    config = ROOT / 'configs' / f'neurotwin_h32_{suffix}.json'
-    cfg = json.loads(config.read_text())
-    got = _run_script(tmp_path, f'{stage}.sh', tmp_path / 'args.txt', model_config=config)
-    assert got['model_config'] == str(config)
-    assert got['cpm_horizon'] == '32'
-    assert got['context_min'] == got['context_max'] == '64'
-    assert got['condition_arm'] == cfg['data_and_split']['conditioning'][stage]['condition_arm']
-
-
-def _parse_argv(path):
-    tokens = Path(path).read_text(encoding='utf-8').splitlines()
-    out = {}
-    i = 0
-    while i < len(tokens):
-        if tokens[i].startswith('--'):
-            key = tokens[i][2:]
-            if i + 1 < len(tokens) and not tokens[i + 1].startswith('--'):
-                out[key] = tokens[i + 1]
-                i += 2
-            else:
-                out[key] = True
-                i += 1
-        else:
-            i += 1
-    return out
-
-
-def _same(actual, expected):
-    if isinstance(expected, bool):
-        return str(actual) == str(expected)
-    if isinstance(expected, int):
-        try:
-            return int(actual) == expected
-        except (TypeError, ValueError):
-            return False
-    if isinstance(expected, float):
-        try:
-            return float(actual) == expected
-        except (TypeError, ValueError):
-            return False
-    return str(actual) == str(expected)
-
-
-def _expected_from_json(stage):
-    cfg = load_model_config()
-    skip = {'model_arch', 'sc_delta_rank'}
-    if stage == 'pretrain':
-        # HC 预训练由 main.py 强制 tfm_patho_mode=none，且不进入冻结/解冻阶段。
-        skip |= {'tfm_patho_mode', 'freeze_backbone_epochs', 'backbone_lr_scale'}
-    expected = {
-        arg_key: config_value(cfg, path)
-        for path, arg_key in CONTRACT_FIELDS if arg_key not in skip}
-    cond = cfg['data_and_split']['conditioning'][stage]
-    expected['condition_group'] = cond['condition_group']
-    expected['condition_arm'] = cond['condition_arm']
-    return expected
-
-
-@pytest.mark.parametrize('stage,script', [
-    ('pretrain', 'pretrain.sh'),
-    ('finetune', 'finetune.sh'),
-])
-def test_scripts_follow_baseline_json(tmp_path, stage, script):
-    got = _run_script(tmp_path, script, tmp_path / f'{stage}_args.txt')
-    expected = _expected_from_json(stage)
-    missing = sorted(set(expected) - set(got))
-    mismatched = {
-        key: (got[key], value) for key, value in expected.items()
-        if key in got and not _same(got[key], value)}
-    assert not missing, f'{script} 未传基线字段：{missing}'
-    assert not mismatched, f'{script} 与基线不一致：{mismatched}'
-
-
-@pytest.mark.skipif(not REAL_CKPT.exists() or not PRETRAIN_CKPT.exists(),
-                    reason='当前 权重不在本机')
-@pytest.mark.parametrize('stage,script,ckpt', [
-    ('pretrain', 'pretrain.sh', PRETRAIN_CKPT),
-    ('finetune', 'finetune.sh', REAL_CKPT),
-])
-def test_scripts_match_checkpoint_snapshot(tmp_path, stage, script, ckpt):
-    import torch
-
-    got = _run_script(tmp_path, script, tmp_path / f'{stage}_args.txt')
-    snapshot = torch.load(ckpt, map_location='cpu', weights_only=True)
-    snapshot = snapshot['config']['args']
-    path_keys = {'mode', 'data_root', 'checkpoint_dir', 'name',
-                 'pretrained_weight', 'condition_inherit_stats', 'device'}
-    compared = {
-        key: value for key, value in got.items()
-        if key not in path_keys and key in snapshot}
-    mismatched = {
-        key: (actual, snapshot[key]) for key, actual in compared.items()
-        if not _same(actual, snapshot[key])}
-    assert compared, '未捕获到可比的训练参数'
-    assert not mismatched, f'{script} 与 checkpoint 快照不一致：{mismatched}'
+def test_finetune_defaults_to_registered_hc_weight():
+    args=parse_args(['--mode','finetune'])
+    assert args.pretrained_weight==load_model_config()['weights']['pretrain']['path']
