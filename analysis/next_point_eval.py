@@ -443,7 +443,7 @@ def build_next_point_loader(args,split,condition_bundle=None):
 
 
 @torch.no_grad()
-def run_inference(model,data_loader,device):
+def run_inference(model,data_loader,device,save_history=False):
     model.eval()
     chunks=defaultdict(list)
     for batch in tqdm(data_loader,desc='B H32 inference',leave=False):
@@ -452,6 +452,8 @@ def run_inference(model,data_loader,device):
         for name,tensor in dict(pred=pred,target=target,mask=mask,anchor=anchor,
                                 previous=x[:,:,0,-2],history_mean=x[:,:,0].mean(-1)).items():
             chunks[name].append(tensor.float().cpu().numpy())
+        if save_history:
+            chunks['history'].append(x[:, :, 0, :].float().cpu().numpy())
         chunks['subjects'].extend(map(str,batch['subj_id']))
         chunks['cutoff'].append(batch['cutoff'].numpy())
     if not chunks['subjects']:raise ValueError('评估集合为空')
@@ -483,10 +485,11 @@ def _write_table(path,arrays,subjects,labels,by_subject=False,model_name='CPM'):
 
 @torch.no_grad()
 def evaluate_split(model,data_loader,args,device,out_dir,split,ar1=None,save_arrays=False,
-                   compute_importance=False,importance_max_tasks=256):
+                   compute_importance=False,importance_max_tasks=256,
+                   checkpoint_identity=None,split_identity=None):
     out_dir=Path(out_dir);out_dir.mkdir(parents=True,exist_ok=True)
     tables=out_dir/'表格';tables.mkdir(exist_ok=True)
-    data=run_inference(model,data_loader,device)
+    data=run_inference(model,data_loader,device,save_history=save_arrays)
     pred,target,mask,anchor,subjects=(data[k] for k in ('pred','target','mask','anchor','subjects'))
     labels=[f'H{i}' for i in range(1,args.cpm_horizon+1)]
     steps=per_task_head_metrics(pred,target,mask,anchor)
@@ -495,6 +498,10 @@ def evaluate_split(model,data_loader,args,device,out_dir,split,ar1=None,save_arr
         torch.as_tensor(anchor),include_local=True).items()}
     report=dict(protocol=dict(model='CPM',horizon=args.cpm_horizon,
         context_length=args.eval_context_length,split=split,
+        mode=args.mode, tr_seconds=getattr(args, 'tr_seconds', 2.),
+        calibration_length=args.calibration_length,
+        multiscale_phase=getattr(args, 'multiscale_phase', False),
+        checkpoint=checkpoint_identity, split_hash=split_identity,
         n_subjects=len(np.unique(subjects)),n_anchors=len(subjects),
         aggregation='per anchor → within subject mean → equal subject mean',
         normalization='Raw first-32TR calibration; context-only RevIN',

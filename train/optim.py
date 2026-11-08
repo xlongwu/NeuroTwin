@@ -1,6 +1,8 @@
 """方案 B 的冻结策略、参数组、AdamW、相对余弦调度与 EMA。"""
 from copy import deepcopy
+import hashlib
 import math
+from pathlib import Path
 from typing import List
 
 import torch
@@ -64,6 +66,16 @@ def conditioning_param_names(model) -> List[str]:
                 names.append(pname)
                 break
     return sorted(names)
+
+
+def prediction_adapter_prefixes(model) -> tuple:
+    return tuple(name + '.' for name, module in model.named_modules()
+                 if name and getattr(module, 'is_prediction_adapter', False))
+
+
+def prediction_adapter_param_names(model) -> List[str]:
+    prefixes = prediction_adapter_prefixes(model)
+    return sorted(name for name, _ in model.named_parameters() if name.startswith(prefixes))
 
 
 class _RelativeCosineLR(LambdaLR):
@@ -135,7 +147,7 @@ def read_checkpoint(path) -> dict:
 
 
 def load_initial_weights(model, path, args) -> dict:
-    """相同结构严格加载；HC→MDD 只允许新增临床字段编码和零初始化增量。"""
+    """显式复制相同键；只允许登记的动态模块和HC→MDD临床字段为新增键。"""
     raw = read_checkpoint(path)
     saved, source = raw['config']['args'], raw['state_dict']
     if saved['mode'] != 'pretrain':
@@ -147,41 +159,49 @@ def load_initial_weights(model, path, args) -> dict:
     mismatch = {k: (saved[k], getattr(args, k)) for k in keys if saved[k] != getattr(args, k)}
     if mismatch:
         raise ValueError(f'初始化结构不匹配: {mismatch}')
+    if saved.get('multiscale_phase', False) and getattr(args, 'multiscale_phase', False):
+        dynamic_keys = ('multiscale_channels', 'phase_modes', 'tr_seconds')
+        mismatch = {k: (saved[k], getattr(args, k)) for k in dynamic_keys if saved[k] != getattr(args, k)}
+        if mismatch:
+            raise ValueError(f'动态模块初始化结构不匹配: {mismatch}')
     condition = raw['config']['condition']
     layout = model.conditioner.layout()
     source_layout = condition['meta']['layout_hash']
     if args.mode == 'pretrain':
         if source_layout != layout['layout_hash'] or condition['stats'] != model.conditioner.stats.to_dict():
             raise ValueError('HC 热启动条件布局或训练统计量未逐位继承')
-        model.load_state_dict(source, strict=True)
-        return {'source': str(path), 'copied': sorted(source), 'new_initialized': []}
-    if source_layout != layout['demo_layout_hash']:
+    elif source_layout != layout['demo_layout_hash']:
         raise ValueError('HC→MDD 共享三字段布局不匹配')
     target = model.state_dict()
     extra = sorted(set(source) - set(target))
     new = sorted(set(target) - set(source))
-    new_prefixes = ('conditioner.delta.',) + tuple(
+    new_prefixes = (() if args.mode == 'pretrain' else ('conditioner.delta.',) + tuple(
         f'conditioner.features.{kind}.{name}.'
-        for name in model.conditioner.new_group for kind in ('continuous', 'categorical'))
+        for name in model.conditioner.new_group for kind in ('continuous', 'categorical')))
+    if not saved.get('multiscale_phase', False) and getattr(args, 'multiscale_phase', False):
+        new_prefixes += prediction_adapter_prefixes(model)
     expected_new = {key for key in target if key.startswith(new_prefixes)}
     if extra or set(new) != expected_new:
-        raise ValueError(f'HC→MDD 存在未登记参数: extra={extra}, new={new}')
+        raise ValueError(f'初始化存在未登记参数: extra={extra}, new={new}')
     conflicts = [key for key in source if source[key].shape != target[key].shape]
     if conflicts:
         raise ValueError(f'HC→MDD 参数形状冲突: {conflicts}')
     target.update(source)
     model.load_state_dict(target, strict=True)
-    return {'source': str(path), 'copied': sorted(source), 'new_initialized': new}
+    return {'source': str(path), 'source_sha256': hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            'key_mapping': {key: key for key in sorted(source)},
+            'copied': sorted(source), 'new_initialized': new}
 
 
 def set_trainability(model, mode: str, encoder_unfrozen: bool) -> None:
-    """HC 冻结期训练完整 CPM；MDD 冻结期仅训练条件适配器。"""
+    """保留原B冻结策略，新增预测适配器在HC/MDD冻结期始终可训练。"""
     inner = getattr(model, '_orig_mod', model)
     for p in inner.parameters():
         p.requires_grad_(encoder_unfrozen)
     cond_names = set(conditioning_param_names(inner))
+    dynamics = set(prediction_adapter_param_names(inner))
     for name, p in inner.named_parameters():
-        if name in cond_names or (mode == 'pretrain' and name.startswith('cpm_head.')):
+        if name in cond_names or name in dynamics or (mode == 'pretrain' and name.startswith('cpm_head.')):
             p.requires_grad_(True)
     if encoder_unfrozen and getattr(model, '_orig_mod', None) is not None:
         torch.compiler.reset()
@@ -193,19 +213,25 @@ def set_training_mode(model, encoder_unfrozen: bool) -> None:
         inner = getattr(model, '_orig_mod', model)
         inner.eval()
         inner.cpm_head.train()
-        inner.conditioner.train()
+        if inner.conditioner is not None:
+            inner.conditioner.train()
+        for _, module in inner.named_modules():
+            if getattr(module, 'is_prediction_adapter', False):
+                module.train()
 
 
 def get_param_groups(model, args) -> list:
     inner = getattr(model, '_orig_mod', model)
     adapters = set(conditioning_param_names(inner))
-    buckets = {name: [] for name in ('encoder', 'cpm', 'condition')}
+    dynamics = set(prediction_adapter_param_names(inner))
+    buckets = {name: [] for name in ('encoder', 'cpm', 'condition', 'prediction')}
     for name, p in inner.named_parameters():
         if p.requires_grad:
             group = ('condition' if name in adapters else
+                     'prediction' if name in dynamics else
                      'cpm' if name.startswith('cpm_head.') else 'encoder')
             buckets[group].append(p)
-    scales = dict(encoder=args.backbone_lr_scale, cpm=1.0, condition=1.0)
+    scales = dict(encoder=args.backbone_lr_scale, cpm=1.0, condition=1.0, prediction=1.0)
     return [{'params': params, 'lr': args.lr_peak * scales[name], 'name': name}
             for name, params in buckets.items() if params]
 

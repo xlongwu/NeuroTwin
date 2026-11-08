@@ -163,7 +163,8 @@ def build_data_loader(args, base_stats=None, inherit_all=False):
         eval_anchors_per_subject=args.eval_anchors_per_subject,
         train_rollout_steps=args.cpm_horizon, train_anchor_max_offset=args.cpm_horizon,
         eval_all_future_steps=args.cpm_horizon, eval_anchor_min_future_steps=args.cpm_horizon,
-        eval_rollout_tasks_per_subject=0, eval_rollout_steps=0)
+        eval_rollout_tasks_per_subject=0, eval_rollout_steps=0,
+        augmentation_config=getattr(args, 'augmentation', None))
 
 
 @torch.no_grad()
@@ -243,6 +244,7 @@ def parse_args(argv=None):
     parser.add_argument('--init_weight', default='')
     parser.add_argument('--pretrained_weight', default='')
     parser.add_argument('--resume_training_state', default='')
+    parser.add_argument('--augmentation', type=json.loads, default=cfg.get('augmentation'))
     parser.add_argument('--save_training_state', action='store_true')
     parser.add_argument('--no_eval_after_train', dest='eval_after_train', action='store_false')
     args = parser.parse_args(argv)
@@ -334,7 +336,8 @@ def main(args):
         writer = None
     if resume_meta and not selector.should_stop:
         restore_rng_state(resume_meta['rng'])
-    print(f'[B] {args.mode} | run={run_dir} | K64 H32 | batch={args.batch_size}',flush=True)
+    label = '多尺度相位' if getattr(args, 'multiscale_phase', False) else 'B'
+    print(f'[{label}] {args.mode} | run={run_dir} | K64 H32 | batch={args.batch_size}',flush=True)
     epoch_limit = start if progress and progress['early_stopped'] else args.train_epochs
     for epoch in range(start,epoch_limit):
         if not unfrozen and epoch>=args.freeze_backbone_epochs:
@@ -384,6 +387,12 @@ def main(args):
             writer.flush()
         print(f'[Val] epoch={epoch+1} MAE={metrics["metric_mae_h1_32"]:.6f} '
               f'TemporalPCC={metrics["metric_temporal_pcc_h1_32"]:.6f} score={score:.6f} best={selector.best:.6f}',flush=True)
+        if getattr(args, 'multiscale_phase', False):
+            print('[Val stages] ' + ' | '.join(
+                f'{label}: MAE={metrics["metric_mae_"+label]:.6f} '
+                f'RMSE={metrics["metric_rmse_"+label]:.6f} '
+                f'TemporalPCC={metrics["metric_temporal_pcc_"+label]:.6f}'
+                for label in ('h1_8', 'h9_16', 'h17_32', 'h1_32')), flush=True)
         if args.save_training_state or progress:
             state=TrainingState(epoch=epoch+1,global_step=global_step,best_metric=selector.best,
                 best_metric_name=selector.metric_key,patience_counter=selector.counter,

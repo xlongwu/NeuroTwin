@@ -1,0 +1,43 @@
+{
+  "原B": {
+    "model": "CPM",
+    "horizon": 32,
+    "context_length": 64,
+    "split": "test",
+    "mode": "finetune",
+    "tr_seconds": 2.0,
+    "calibration_length": 32,
+    "multiscale_phase": false,
+    "checkpoint": {
+      "path": "checkpoints/CPM直接长程预测方案_1106/neurotwin_finetune/finetuned_best.pt",
+      "sha256": "d0ba07105712f0a0ba5ae7eb43b3c3fa6f173e8ca9e05f2ac5d7e67f1d94ad43"
+    },
+    "split_hash": "f1f36cbbede3ca7e",
+    "n_subjects": 225,
+    "n_anchors": 1800,
+    "aggregation": "per anchor → within subject mean → equal subject mean",
+    "normalization": "Raw first-32TR calibration; context-only RevIN",
+    "pcc": "spatial PCC along ROI at each horizon; temporal PCC along time within each stage"
+  },
+  "多尺度相位": {
+    "model": "CPM",
+    "horizon": 32,
+    "context_length": 64,
+    "split": "test",
+    "mode": "finetune",
+    "tr_seconds": 2.0,
+    "calibration_length": 32,
+    "multiscale_phase": true,
+    "checkpoint": {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_finetune/finetuned_best.pt",
+      "sha256": "23f31c9404e4d86b596c78fa09c948560c2c68f1a2e4ebc606c125dc42c2e3a0"
+    },
+    "split_hash": "f1f36cbbede3ca7e",
+    "n_subjects": 225,
+    "n_anchors": 1800,
+    "aggregation": "per anchor → within subject mean → equal subject mean",
+    "normalization": "Raw first-32TR calibration; context-only RevIN",
+    "pcc": "spatial PCC along ROI at each horizon; temporal PCC along time within each stage"
+  },
+  "代表规则": "按被试ID排序首/中/末；最早锚点；ROI首/中/末，未按预测效果选择"
+}

@@ -1444,6 +1444,7 @@ class NeuroTwinDataLoader:
         control_manifest: Optional[str] = None,
         stable_window_length: int = 0,
         clinical_target_field: str = '',
+        augmentation_config: Optional[dict] = None,
     ):
         task_mode = str(task_mode)
         if task_mode != 'next_timepoint':
@@ -1544,13 +1545,7 @@ class NeuroTwinDataLoader:
             stratify_key=self.stratify_key,
         )
 
-        augmentation = BrainSignalAugmentation(
-            noise_std=0.03,
-            scale_std=0.05,
-            channel_drop_prob=0.03,
-            time_mask_prob=0.15,
-            max_mask_ratio=0.10,
-        )
+        augmentation = BrainSignalAugmentation(**(augmentation_config or {}))
 
         # next-timepoint：训练视图动态采样 (K, t)，评估视图固定 K 与 anchor
         self.train_dataset = NextPointTrainView(

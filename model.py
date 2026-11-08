@@ -1,5 +1,5 @@
 # coding=utf-8
-"""方案 B 正式配置、权重身份核对与严格模型加载。"""
+"""正式B及实验配置的权重身份核对与严格模型加载。"""
 import argparse
 import hashlib
 import inspect
@@ -52,6 +52,8 @@ def verify_checkpoint_contract(args,cfg) -> None:
     expected=cfg['data_and_split']['conditioning'][args.mode]
     for key,val in expected.items():
         if getattr(args,key,None)!=val:mismatches.append(f'{key}: 角色条件不匹配')
+    if 'augmentation' in cfg and getattr(args, 'augmentation', None) != cfg['augmentation']:
+        mismatches.append('augmentation: checkpoint 与实验增强配置不一致')
     if mismatches:raise ValueError('正式配置与权重不一致:\n'+'\n'.join(mismatches))
 
 
@@ -88,10 +90,11 @@ def load_model_checkpoint(path,device='cpu'):
     return model.eval(),args,bundle
 
 
-def build_model(device='cpu',verify_hash=True,mode='finetune'):
-    cfg=load_model_config()
+def build_model(device='cpu',verify_hash=True,mode='finetune',
+                config_path=MODEL_CONFIG,checkpoint_path=None):
+    cfg=load_model_config(config_path)
     weight=cfg['weights'][mode]
-    path=ROOT/weight['path']
+    path=Path(checkpoint_path) if checkpoint_path is not None else ROOT/weight['path']
     if verify_hash:verify_checkpoint_hash(path,weight['sha256'])
     model,args,_=load_model_checkpoint(path,device)
     verify_checkpoint_contract(args,cfg)
@@ -102,10 +105,14 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode',choices=['pretrain','finetune'],default='finetune')
     parser.add_argument('--device',default='cpu')
+    parser.add_argument('--model_config',default=str(MODEL_CONFIG))
+    parser.add_argument('--ckpt',default='',help='显式指定已移动的权重，仍按所选配置核对SHA256和结构')
     args=parser.parse_args()
-    model,cfg=build_model(args.device,mode=args.mode)
-    print(f'[B] {args.mode}: {cfg["weights"][args.mode]["path"]}')
-    print(f'[B] strict load + SHA256 通过；参数量={sum(p.numel() for p in model.parameters())}；H={model.cpm_horizon}')
+    model,cfg=build_model(args.device,mode=args.mode,config_path=args.model_config,
+                          checkpoint_path=args.ckpt or None)
+    label='多尺度相位' if cfg['architecture'].get('multiscale_phase') else 'B'
+    print(f'[{label}] {args.mode}: {args.ckpt or cfg["weights"][args.mode]["path"]}')
+    print(f'[{label}] strict load + SHA256 通过；参数量={sum(p.numel() for p in model.parameters())}；H={model.cpm_horizon}')
 
 
 if __name__=='__main__':main()

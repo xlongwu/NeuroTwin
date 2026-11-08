@@ -7,7 +7,10 @@ import torch
 
 class BrainSignalAugmentation:
     """
-    训练时对单样本脑信号 x:[F, W, S] 做轻量增强
+    训练时对单样本脑信号 x:[F, W, S] 做增强。
+
+    默认值保留原B配方；多尺度相位实验从配置传入 noise_std=.005，
+    scale_std/channel_drop_prob/time_mask_prob=0，保留真实监督锚点。
 
     改进策略：
     1. additive noise：模拟扫描噪声

@@ -1,5 +1,5 @@
 # coding=utf-8
-"""方案 B 的六项固定权重预测损失及共用评价函数。"""
+"""共用六项预测损失；实验配置可指定时距权重与局部相关窗口。"""
 import math
 import torch
 import torch.nn as nn
@@ -52,7 +52,8 @@ def temporal_pcc_loss(pred: torch.Tensor, target: torch.Tensor,
 
 
 def masked_l1(pred: torch.Tensor, target: torch.Tensor,
-              mask: torch.Tensor = None, eps: float = 1e-8) -> torch.Tensor:
+              mask: torch.Tensor = None, eps: float = 1e-8,
+              horizon_weights: torch.Tensor = None) -> torch.Tensor:
     """Masked element-wise L1 over ``[B, F, H]`` futures.
 
     ``mask`` is ``[B, H]`` and marks which horizons have a real target. The
@@ -63,12 +64,15 @@ def masked_l1(pred: torch.Tensor, target: torch.Tensor,
         raise ValueError(
             f'masked_l1 expects matching [B,F,H] tensors, got '
             f'{tuple(pred.shape)} vs {tuple(target.shape)}')
-    if mask is None:
+    if mask is None and horizon_weights is None:
         return (pred - target).abs().mean()
-    if tuple(mask.shape) != (pred.shape[0], pred.shape[2]):
+    if mask is not None and tuple(mask.shape) != (pred.shape[0], pred.shape[2]):
         raise ValueError(
             f'masked_l1 mask must be [B,{pred.shape[2]}], got {tuple(mask.shape)}')
-    w = mask.to(pred.dtype)[:, None, :]
+    w = (pred.new_ones(pred.shape[0], 1, pred.shape[2]) if mask is None
+         else mask.to(pred.dtype)[:, None, :])
+    if horizon_weights is not None:
+        w = w * horizon_weights.to(pred).view(1, 1, -1)
     return ((pred - target).abs() * w).sum() / (
         w.sum().clamp_min(eps) * pred.shape[1])
 
@@ -273,7 +277,9 @@ class ForecastFidelityLoss(nn.Module):
 
     def __init__(self, lambda_rec: float, lambda_fc: float, lambda_freq: float,
                  lambda_delta: float, lambda_corr: float, lambda_local_corr: float,
-                 huber_delta: float = 1.0):
+                 huber_delta: float = 1.0, horizon_weight_start: float = 1.,
+                 horizon_weight_end: float = 1., local_corr_window: int = 8,
+                 local_corr_stride: int = 8):
         super().__init__()
         self.weights = dict(rec=lambda_rec, fc=lambda_fc, freq=lambda_freq,
                             delta=lambda_delta, corr=lambda_corr,
@@ -283,6 +289,12 @@ class ForecastFidelityLoss(nn.Module):
         if not math.isfinite(huber_delta) or huber_delta <= 0:
             raise ValueError('huber_delta 必须为正且有限')
         self.huber_delta = float(huber_delta)
+        if any(not math.isfinite(v) or v <= 0 for v in (horizon_weight_start, horizon_weight_end)):
+            raise ValueError('horizon 权重必须为正且有限')
+        if not 3 <= local_corr_window <= 32 or not 1 <= local_corr_stride <= local_corr_window:
+            raise ValueError('local_corr_window/stride 必须形成有效的H32时间相关窗口')
+        self.horizon_weight_start, self.horizon_weight_end = horizon_weight_start, horizon_weight_end
+        self.local_corr_window, self.local_corr_stride = local_corr_window, local_corr_stride
 
     def get_loss_weights(self) -> dict:
         return {name: float(weight) for name, weight in self.weights.items()}
@@ -293,7 +305,11 @@ class ForecastFidelityLoss(nn.Module):
             raise ValueError('预测和目标必须同为 [B,F,H]')
         if mask.shape != (pred.shape[0], pred.shape[-1]):
             raise ValueError('future mask 必须为 [B,H]')
-        raw = dict(rec=masked_l1(pred, target, mask),
+        weights = None
+        if (self.horizon_weight_start, self.horizon_weight_end) != (1., 1.):
+            weights = torch.linspace(self.horizon_weight_start, self.horizon_weight_end,
+                                     pred.shape[-1], device=pred.device, dtype=pred.dtype)
+        raw = dict(rec=masked_l1(pred, target, mask, horizon_weights=weights),
                    fc=fc_mse(pred, target, mask),
                    freq=frequency_l1(pred, target, mask))
         valid = (mask > 0).any().to(pred.dtype)
@@ -313,8 +329,10 @@ class ForecastFidelityLoss(nn.Module):
             if pred.shape[-1] != 32:
                 raise ValueError('局部时间 PCC 需要 H32')
             raw['local_corr'] = torch.stack([
-                temporal_pcc_loss(pred[..., s:s+8], target[..., s:s+8], mask[:, s:s+8])
-                for s in range(0, 32, 8)]).mean()
+                temporal_pcc_loss(pred[..., s:s+self.local_corr_window],
+                                  target[..., s:s+self.local_corr_window],
+                                  mask[:, s:s+self.local_corr_window])
+                for s in range(0, 33-self.local_corr_window, self.local_corr_stride)]).mean()
             total = total + self.weights['local_corr'] * raw['local_corr']
         stats = {f'loss_{key}': value.detach() for key, value in raw.items()}
         stats['loss_total'] = total.detach()

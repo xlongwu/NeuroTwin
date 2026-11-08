@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 方案 B 共用入口；算法参数统一由 configs/neurotwin.json 提供。
+# 共用入口；默认正式B，可通过 MODEL_CONFIG 或 --model_config 指定实验配置。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

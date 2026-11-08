@@ -1,7 +1,9 @@
 """从方案 B checkpoint 严格重建，执行相同划分和统计量的 H32 评价。"""
 import argparse
 from argparse import Namespace
+import hashlib
 import json
+from pathlib import Path
 import torch
 
 from model import (ROOT,load_model_config,load_model_checkpoint)
@@ -33,10 +35,17 @@ def evaluate(ckpt_path,out_dir,eval_splits=('test',),seed=2024,device=None,
     result={}
     for split in eval_splits:
         loader,_,owner=npe.build_next_point_loader(args,split,condition_bundle=bundle)
+        from main import split_hash
+        actual_split_hash=split_hash(owner,args)
+        if bundle.get('split_hash') and bundle['split_hash']!=actual_split_hash:
+            raise ValueError('评价被试划分与checkpoint不一致')
         ar1=npe.fit_ar1_from_train(owner.base_dataset,owner.get_train_subjects())
         report=npe.evaluate_split(model,loader,args,device,out_dir,split,ar1=ar1,
             save_arrays=save_arrays,compute_importance=compute_feature_importance,
-            importance_max_tasks=importance_max_tasks)
+            importance_max_tasks=importance_max_tasks,
+            checkpoint_identity={'path':str(ckpt_path),
+                                 'sha256':hashlib.sha256(Path(ckpt_path).read_bytes()).hexdigest()},
+            split_identity=actual_split_hash)
         result[split]=npe.summarize(report)
     return result
 
