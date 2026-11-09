@@ -220,7 +220,7 @@ def load_training_state(path: os.PathLike | str, *, model, criterion, optimizer,
 
     ema_expected = ema is not None
     if bool(plain.get('ema_present')) != ema_expected:
-        raise ValueError('训练状态中的 EMA 启用状态与当前 --use_ema 不一致')
+        raise ValueError('训练状态的EMA记录与当前V2运行不一致')
     if ema is not None and float(plain.get('ema_decay')) != float(ema.decay):
         raise ValueError('训练状态中的 EMA decay 与当前 --ema_decay 不一致')
 

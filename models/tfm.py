@@ -1,5 +1,5 @@
 # coding=utf-8
-"""历史功能图引导TFM与条件CPM；可配置多尺度相位适配器直接预测H32。"""
+"""唯一V2：历史功能图引导TFM、局部—全局相位状态及未来时距交互CPM。"""
 from contextlib import contextmanager, nullcontext
 from typing import Optional
 
@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from models.common import BrainRevIN
 from models.conditioning import ARMS, ConditioningConfig, build_condition_encoder
 from models.graph_prior import SoftAnatomicalPrior
-from models.temporal_multiscale import MultiScaleTemporalEncoder
-from models.phase_forecast import PhaseAwareForecast
+from models.temporal_multiscale import MultiScaleTemporalEncoder, CausalTemporalBlock
+from models.phase_forecast import LocalGlobalPhaseForecast
 from models.tfm_backbone import RMSNorm, TFMEncoderBlock, TemporalPatchEmbed, build_context_grid
 
 @contextmanager
@@ -83,10 +83,10 @@ class DynamicForecastAdapter(nn.Module):
         self.multiscale_query = nn.Linear(dim, dim)
         self.phase_query = nn.Linear(dim, dim)
         self.memory_proj = nn.Linear(dim, dim)
-        self.query_scales = nn.Parameter(torch.full((2,), .01))
-        self.memory_logit = nn.Parameter(torch.tensor(-6.))
+        self.query_scales = nn.Parameter(torch.full((2,), .1))
+        self.memory_logit = nn.Parameter(torch.tensor(-3.))
         for layer in (self.multiscale_query, self.phase_query, self.memory_proj):
-            nn.init.normal_(layer.weight, std=1e-3)
+            nn.init.normal_(layer.weight, std=.02)
             nn.init.zeros_(layer.bias)
 
     def forward(self, context: torch.Tensor, roi_embed: torch.Tensor,
@@ -95,6 +95,23 @@ class DynamicForecastAdapter(nn.Module):
         delta = (self.query_scales[0]*self.multiscale_query(state).unsqueeze(2)
                  + self.query_scales[1]*self.phase_query(phase))
         return memory, delta, self.memory_logit.sigmoid()
+
+
+class FutureTemporalAdapter(nn.Module):
+    """逐 ROI 沿未来时间轴交换潜在状态；不读取真实未来。"""
+    is_prediction_adapter = True
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.blocks = nn.Sequential(*(CausalTemporalBlock(dim, d) for d in (1, 2, 4)))
+        self.out_proj = nn.Linear(dim, dim)
+        nn.init.normal_(self.out_proj.weight, std=.01)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, f, h, d = x.shape
+        z = self.blocks(x.reshape(b*f, h, d).transpose(1, 2)).transpose(1, 2)
+        return x + self.out_proj(z).reshape(b, f, h, d)
 
 
 class CPMHorizonHead(nn.Module):
@@ -117,8 +134,7 @@ class CPMHorizonHead(nn.Module):
                  num_layers: int = 2, dropout: float = 0.1,
                  cond_dim: Optional[int] = None,
                  cond_lambda: float = 1.0,
-                 cond_rng_isolated: bool = False,
-                 multiscale_phase: bool = False):
+                 cond_rng_isolated: bool = False):
         super().__init__()
         if horizon < 1:
             raise ValueError(f"cpm_horizon 必须 >= 1，收到 {horizon}")
@@ -144,7 +160,8 @@ class CPMHorizonHead(nn.Module):
         with _rng_scope(cond_rng_isolated):
             self.film = (ConditionFiLM(cond_dim, self.dim, lam=cond_lambda)
                          if cond_dim else None)
-        self.dynamic_adapter = DynamicForecastAdapter(dim) if multiscale_phase else None
+        self.dynamic_adapter = DynamicForecastAdapter(dim)
+        self.future_temporal = FutureTemporalAdapter(dim)
     def forward(self, context: torch.Tensor, roi_embed: torch.Tensor,
                 cond: Optional[torch.Tensor] = None,
                 multiscale_state: Optional[torch.Tensor] = None,
@@ -162,11 +179,9 @@ class CPMHorizonHead(nn.Module):
         # 查询 [B, F, H, D] = e^ROI + e^horizon
         q = roi_embed.view(1, f, 1, d) + self.horizon_embed.view(1, 1, h_out, d)
         queries = q.expand(b, f, h_out, d)
-        extra_memory, memory_scale = None, None
-        if self.dynamic_adapter is not None:
-            extra_memory, delta, memory_scale = self.dynamic_adapter(
-                context, roi_embed, multiscale_state, phase_features)
-            queries = queries + delta
+        extra_memory, delta, memory_scale = self.dynamic_adapter(
+            context, roi_embed, multiscale_state, phase_features)
+        queries = queries + delta
         if self.film is not None and cond is not None:
             scale, shift = self.film(cond)
             queries = queries * (1.0 + scale.view(b, 1, 1, d)) \
@@ -174,14 +189,14 @@ class CPMHorizonHead(nn.Module):
         # 额外记忆以小门控残差读取；两组记忆都只来自可见历史。
         q_flat = queries.reshape(b, f * h_out, d)
         m_flat = context.reshape(b, -1, d)
-        if extra_memory is not None:
-            m_flat = torch.cat((m_flat, extra_memory), 1)
+        m_flat = torch.cat((m_flat, extra_memory), 1)
         for layer in self.layers:
             attn_out = layer['attn'](layer['norm_q'](q_flat),
                                      layer['norm_m'](m_flat), memory_scale,
-                                     f if extra_memory is not None else 0)
+                                     f)
             q_flat = q_flat + layer['drop'](attn_out)
             q_flat = q_flat + layer['drop'](layer['ffn'](layer['norm_ffn'](q_flat)))
+        q_flat = self.future_temporal(q_flat.reshape(b, f, h_out, d)).reshape(b, f*h_out, d)
         out = self.out_proj(q_flat)                            # [B, F*H, 1]
         return out.view(b, f, h_out)
 
@@ -202,8 +217,8 @@ class _CrossAttention(nn.Module):
         self.dropout = float(dropout)
 
     def forward(self, q: torch.Tensor, memory: torch.Tensor,
-                memory_scale: Optional[torch.Tensor] = None,
-                extra_memory_count: int = 0) -> torch.Tensor:
+                memory_scale: torch.Tensor,
+                extra_memory_count: int) -> torch.Tensor:
         """q [B, Nq, D]，memory [B, Nm, D] → [B, Nq, D]。"""
         b, nq, _ = q.shape
         qh = self.q_proj(q).view(b, nq, self.num_heads, self.head_dim
@@ -212,15 +227,11 @@ class _CrossAttention(nn.Module):
         kh = kh.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)
         vh = vh.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)
         dropout = self.dropout if self.training else 0.0
-        if extra_memory_count:
-            # 共享Q/K/V投影，独立读取附加历史token，再做小幅残差融合。
-            # 无稠密attention bias，可继续使用Flash Attention。
-            split = kh.shape[2] - extra_memory_count
-            out = F.scaled_dot_product_attention(qh, kh[:, :, :split], vh[:, :, :split], dropout_p=dropout)
-            extra = F.scaled_dot_product_attention(qh, kh[:, :, split:], vh[:, :, split:], dropout_p=dropout)
-            out = out + memory_scale * extra
-        else:
-            out = F.scaled_dot_product_attention(qh, kh, vh, dropout_p=dropout)
+        # 两组历史记忆共享投影，各自归一化后通过门控残差融合。
+        split = kh.shape[2] - extra_memory_count
+        out = F.scaled_dot_product_attention(qh, kh[:, :, :split], vh[:, :, :split], dropout_p=dropout)
+        extra = F.scaled_dot_product_attention(qh, kh[:, :, split:], vh[:, :, split:], dropout_p=dropout)
+        out = out + memory_scale * extra
         out = out.transpose(1, 2).reshape(b, nq, self.dim)
         return self.out_proj(out)
 
@@ -238,7 +249,7 @@ class NeuroTwinTFM(nn.Module):
                  cpm_layers: int = 2, condition_config: Optional[dict] = None,
                  condition_stats_payload: Optional[dict] = None,
                  condition_arm: Optional[str] = None, use_revin: bool = True,
-                 multiscale_phase: bool = False, multiscale_channels: int = 64,
+                 multiscale_channels: int = 64,
                  phase_modes: int = 13, tr_seconds: float = 2.):
         super().__init__()
         if patch_len < 1 or context_max < patch_len:
@@ -247,7 +258,6 @@ class NeuroTwinTFM(nn.Module):
         self.patch_len, self.dim = int(patch_len), int(dim)
         self.cpm_horizon = int(cpm_horizon)
         self.use_revin = bool(use_revin)
-        self.multiscale_phase = bool(multiscale_phase)
         self.condition_cfg_dict = dict(condition_config) if condition_config else None
         cfg_arm = (condition_config or {}).get('arm')
         if condition_arm is not None and condition_arm not in ARMS:
@@ -286,11 +296,9 @@ class NeuroTwinTFM(nn.Module):
         self.cpm_head = CPMHorizonHead(
             dim=dim, horizon=cpm_horizon, num_heads=num_heads,
             num_layers=cpm_layers, dropout=dropout, cond_dim=cond_dim or None,
-            cond_rng_isolated=self.conditioning_on, multiscale_phase=multiscale_phase)
-        self.multiscale_encoder = (MultiScaleTemporalEncoder(multiscale_channels, dim)
-                                   if multiscale_phase else None)
-        self.phase_forecast = (PhaseAwareForecast(context_max, cpm_horizon, dim, phase_modes, tr_seconds)
-                               if multiscale_phase else None)
+            cond_rng_isolated=self.conditioning_on)
+        self.multiscale_encoder = MultiScaleTemporalEncoder(multiscale_channels, dim)
+        self.phase_forecast = LocalGlobalPhaseForecast(context_max, cpm_horizon, dim, phase_modes, tr_seconds)
 
     def _prepare_condition(self, condition, condition_epoch=None):
         if condition is None:
@@ -331,18 +339,13 @@ class NeuroTwinTFM(nn.Module):
             x_grid = normalized[:, :, 0, :]
         cond = self._prepare_condition(condition, condition_epoch)
         tokens, graph = self._encode(x_grid)
-        dynamic = {}
-        if self.multiscale_phase:
-            state = self.multiscale_encoder(x_grid)
-            phase_features, oscillation = self.phase_forecast(x_grid, state)
-            prediction = self.cpm_head(tokens, self.patch_embed.roi_embed, cond,
-                                       state, phase_features)
-            gate = self.phase_forecast.correction_gate(state, phase_features)
-            prediction = prediction + gate * oscillation
-            dynamic = dict(multiscale_state=state, phase_features=phase_features,
-                           oscillation_pred=oscillation, oscillation_gate=gate)
-        else:
-            prediction = self.cpm_head(tokens, self.patch_embed.roi_embed, cond)
+        state = self.multiscale_encoder(x_grid)
+        phase_features, oscillation = self.phase_forecast(x_grid, state)
+        prediction = self.cpm_head(tokens, self.patch_embed.roi_embed, cond, state, phase_features)
+        gate = self.phase_forecast.correction_gate(state, phase_features)
+        prediction = prediction + gate * oscillation
+        dynamic = dict(multiscale_state=state, phase_features=phase_features,
+                       oscillation_pred=oscillation, oscillation_gate=gate)
         if self.rev_norm is not None:
             prediction = self.rev_norm(
                 prediction.unsqueeze(-1), 'denorm', stats=norm_stats).squeeze(-1)

@@ -1,5 +1,5 @@
 # coding=utf-8
-"""正式B及实验配置的权重身份核对与严格模型加载。"""
+"""唯一V2配置的权重身份核对与严格模型加载。"""
 import argparse
 import hashlib
 import inspect
@@ -18,8 +18,8 @@ MODEL_ALIASES = dict(features='num_rois',patch_len='tfm_patch_len',dim='tfm_dim'
                      use_revin='norm')
 
 
-def load_model_config(path=MODEL_CONFIG) -> dict:
-    with open(path,encoding='utf-8') as f:
+def load_model_config() -> dict:
+    with open(MODEL_CONFIG,encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -32,7 +32,7 @@ def config_value(cfg: dict, path):
 # 只核对影响有效计算、优化与选模的配方；路径及运行并发不参与身份约束。
 TRAINING_CONTRACT = ('seed','sampling_seed','cond_dropout_seed','batch_size','train_epochs',
                     'lr_init','lr_peak','lr_final','warmup_epochs','weight_decay','grad_clip',
-                    'patience','freeze_backbone_epochs','backbone_lr_scale','use_ema',
+                    'patience','freeze_backbone_epochs','backbone_lr_scale',
                     'ema_decay','amp','selection_corr_weight','train_samples_per_subject',
                     'random_context','random_cutoff','eval_context_length','eval_anchors_per_subject')
 
@@ -40,7 +40,9 @@ TRAINING_CONTRACT = ('seed','sampling_seed','cond_dropout_seed','batch_size','tr
 def contract_fields(cfg):
     return ([(('architecture',k),k) for k in cfg['architecture']]
             + [(('loss',k),k) for k in cfg['loss']]
-            + [(('training',k),k) for k in TRAINING_CONTRACT])
+            + [(('training',k),k) for k in TRAINING_CONTRACT]
+            + [(('training',k),k) for k in ('unfreeze_last_layers','cpm_lr_scale')
+               if k in cfg['training']])
 
 
 def verify_checkpoint_contract(args,cfg) -> None:
@@ -90,9 +92,8 @@ def load_model_checkpoint(path,device='cpu'):
     return model.eval(),args,bundle
 
 
-def build_model(device='cpu',verify_hash=True,mode='finetune',
-                config_path=MODEL_CONFIG,checkpoint_path=None):
-    cfg=load_model_config(config_path)
+def build_model(device='cpu',verify_hash=True,mode='finetune',checkpoint_path=None):
+    cfg=load_model_config()
     weight=cfg['weights'][mode]
     path=Path(checkpoint_path) if checkpoint_path is not None else ROOT/weight['path']
     if verify_hash:verify_checkpoint_hash(path,weight['sha256'])
@@ -105,12 +106,10 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode',choices=['pretrain','finetune'],default='finetune')
     parser.add_argument('--device',default='cpu')
-    parser.add_argument('--model_config',default=str(MODEL_CONFIG))
     parser.add_argument('--ckpt',default='',help='显式指定已移动的权重，仍按所选配置核对SHA256和结构')
     args=parser.parse_args()
-    model,cfg=build_model(args.device,mode=args.mode,config_path=args.model_config,
-                          checkpoint_path=args.ckpt or None)
-    label='多尺度相位' if cfg['architecture'].get('multiscale_phase') else 'B'
+    model,cfg=build_model(args.device,mode=args.mode,checkpoint_path=args.ckpt or None)
+    label=cfg['_meta']['display_name']
     print(f'[{label}] {args.mode}: {args.ckpt or cfg["weights"][args.mode]["path"]}')
     print(f'[{label}] strict load + SHA256 通过；参数量={sum(p.numel() for p in model.parameters())}；H={model.cpm_horizon}')
 

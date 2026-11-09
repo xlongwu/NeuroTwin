@@ -1,4 +1,4 @@
-"""B 六项固定损失、有效掩码和 H1 差分语义。"""
+"""V2六项损失、有效掩码和 H1 差分语义。"""
 import pytest
 import torch
 from model import load_model_config

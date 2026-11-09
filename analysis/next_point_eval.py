@@ -1,4 +1,4 @@
-"""方案 B 固定锚点 H32 评价：逐时距、阶段轨迹、基线及 ROI 归因。"""
+"""V2 固定锚点 H32 评价：逐时距、阶段轨迹、基线及 ROI 归因。"""
 from collections import defaultdict
 import csv
 import json
@@ -461,7 +461,7 @@ def run_inference(model,data_loader,device,save_history=False):
             for k,v in chunks.items()}
 
 
-def _write_table(path,arrays,subjects,labels,by_subject=False,model_name='CPM'):
+def _write_table(path,arrays,subjects,labels,by_subject=False,model_name='V2'):
     rows=[]
     if by_subject:
         for sid in np.unique(subjects):
@@ -496,11 +496,10 @@ def evaluate_split(model,data_loader,args,device,out_dir,split,ar1=None,save_arr
     stages={k:v.numpy() for k,v in h32_stage_metrics(
         torch.as_tensor(pred),torch.as_tensor(target),torch.as_tensor(mask),
         torch.as_tensor(anchor),include_local=True).items()}
-    report=dict(protocol=dict(model='CPM',horizon=args.cpm_horizon,
+    report=dict(protocol=dict(model='V2',horizon=args.cpm_horizon,
         context_length=args.eval_context_length,split=split,
         mode=args.mode, tr_seconds=getattr(args, 'tr_seconds', 2.),
         calibration_length=args.calibration_length,
-        multiscale_phase=getattr(args, 'multiscale_phase', False),
         checkpoint=checkpoint_identity, split_hash=split_identity,
         n_subjects=len(np.unique(subjects)),n_anchors=len(subjects),
         aggregation='per anchor → within subject mean → equal subject mean',

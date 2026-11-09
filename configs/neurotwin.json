@@ -1,8 +1,10 @@
 {
   "_meta": {
     "name": "neurotwin",
-    "status": "current",
-    "description": "唯一正式方案 B：历史功能图引导 TFM 编码 + 字段条件 CPM，固定 K64 直接预测 H32；以已验证权重为准。"
+    "status": "current_validation_only",
+    "description": "唯一正式多尺度相位协同预测方案（原V2）；保留已完成150轮训练的HC/MDD EMA best，尚未测试集评价。",
+    "display_name": "多尺度相位协同预测方案",
+    "previous_label": "V2"
   },
   "architecture": {
     "num_rois": 116,
@@ -25,16 +27,23 @@
     "sc_prior_rank": 12,
     "sc_delta_a": true,
     "sc_delta_rank": null,
-    "sc_sinkhorn_iters": 64
+    "sc_sinkhorn_iters": 64,
+    "multiscale_channels": 64,
+    "phase_modes": 13,
+    "tr_seconds": 2.0
   },
   "loss": {
     "lambda_rec": 1.0,
-    "lambda_fc": 0.05,
-    "lambda_freq": 0.05,
-    "lambda_delta": 0.5,
-    "lambda_corr": 0.1,
-    "lambda_local_corr": 0.05,
-    "huber_delta": 1.0
+    "lambda_fc": 0.02,
+    "lambda_freq": 0.02,
+    "lambda_delta": 0.3,
+    "lambda_corr": 0.2,
+    "lambda_local_corr": 0.03,
+    "huber_delta": 1.0,
+    "horizon_weight_start": 1.0,
+    "horizon_weight_end": 1.5,
+    "local_corr_window": 16,
+    "local_corr_stride": 8
   },
   "data_and_split": {
     "data_root": "data/",
@@ -73,15 +82,14 @@
     "grad_clip": 1.0,
     "patience": 12,
     "freeze_backbone_epochs": 10,
-    "backbone_lr_scale": 0.2,
-    "use_ema": true,
-    "ema_decay": 0.999,
+    "backbone_lr_scale": 0.1,
+    "ema_decay": 0.995,
     "amp": true,
-    "checkpoint_dir": "checkpoints/方案B/训练",
+    "checkpoint_dir": "checkpoints/多尺度相位协同预测方案_1108",
     "random_context": false,
     "eval_context_length": 64,
     "eval_anchors_per_subject": 8,
-    "selection_corr_weight": 0.05,
+    "selection_corr_weight": 0.15,
     "train_samples_per_subject": 8,
     "compile": false,
     "num_workers": 6,
@@ -94,37 +102,45 @@
     "cache_in_memory": false,
     "random_cutoff": true,
     "stratify_bins": 5,
-    "tf32": true
+    "tf32": true,
+    "cpm_lr_scale": 0.1,
+    "unfreeze_last_layers": 2,
+    "eval_after_train": false
   },
   "evaluation_protocol": {
-    "primary": "完整 H32 被试等权 MAE + 0.05*(1-Temporal PCC)，越低越好；保存完整和逐时距指标。",
+    "primary": "完整H32被试等权 MAE + 0.15*(1-Temporal PCC)，越低越好。",
     "aggregation": "先按锚点计算，再被试内平均，最后跨被试等权。",
-    "results": {
-      "pretrain": "checkpoints/全时距双分支_20261104_231429/B/健康评估",
-      "finetune": "checkpoints/全时距双分支_20261104_231429/B/抑郁症评估"
-    }
+    "selection_note": "仅验证集按原指标选择EMA best；原始权重指标仅记录；不自动测试。",
+    "validation_summary": "results/模型优化/长程相位预测V1与V2_20261109/说明/训练结果总结.md"
   },
   "weights": {
     "initializer": {
-      "path": "checkpoints/方案B/初始化/hc_h8_to_h32.pt",
-      "source": "checkpoints/baseline_1031/neurotwin_pretrain/base_best.pt",
-      "note": "原 HC H8 起点，仅复制有效 B 参数，horizon embedding 显式 repeat_last 扩展；不代表 H32 训练完成。",
-      "sha256": "efb6e4218191bc7028861aa23d9e1ee27514086830fe23bdccbaf1377add4ca6",
-      "source_sha256": "041689f82ad205f41bad3c8d5d688c4d8818a87eb538fa3dfec870910ef961bc"
+      "path": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt",
+      "sha256": "b68289fe358da9bc9db3abad4bf6d139329a93d625fd24c9acad2a61c44ed106",
+      "epoch": 149,
+      "epoch_indexing": "1-based",
+      "note": "HC训练仅从当前V2 HC权重热启动，不再支持旧B初始化。"
     },
     "pretrain": {
-      "path": "checkpoints/方案B/neurotwin_pretrain/base_best.pt",
-      "source": "checkpoints/全时距双分支_20261104_231429/B/neurotwin_pretrain/base_best.pt",
-      "epoch": 145,
-      "sha256": "e0187d32ccd7255189dd80f1626a9f6a2ca50ad43a95e8b05ae7e2cd13a42a37",
-      "source_sha256": "079aa4ea18293d83a81673a4dc046e7df80d23a395f0f20aede22b9999a384ab"
+      "path": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt",
+      "sha256": "b68289fe358da9bc9db3abad4bf6d139329a93d625fd24c9acad2a61c44ed106",
+      "epoch": 149,
+      "epoch_indexing": "1-based",
+      "note": "150轮训练后按验证分数选出的EMA best；不是last，尚未评价测试集。"
     },
     "finetune": {
-      "path": "checkpoints/方案B/neurotwin_finetune/finetuned_best.pt",
-      "source": "checkpoints/全时距双分支_20261104_231429/B/neurotwin_finetune/finetuned_best.pt",
-      "epoch": 94,
-      "sha256": "d0ba07105712f0a0ba5ae7eb43b3c3fa6f173e8ca9e05f2ac5d7e67f1d94ad43",
-      "source_sha256": "3a26016afe39e611f42ff200bf89db258989398dd088629cafb3be0f4c345b1b"
+      "path": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_best.pt",
+      "sha256": "6581e667f085f36aab4c983b3947000be2e6b796bc2666c9459a873f75940eb0",
+      "epoch": 149,
+      "epoch_indexing": "1-based",
+      "note": "150轮训练后按验证分数选出的EMA best；不是last，尚未评价测试集。"
     }
+  },
+  "augmentation": {
+    "noise_std": 0.005,
+    "scale_std": 0.0,
+    "channel_drop_prob": 0.0,
+    "time_mask_prob": 0.0,
+    "max_mask_ratio": 0.1
   }
 }

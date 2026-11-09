@@ -1,4 +1,4 @@
-"""方案 B 的冻结策略、参数组、AdamW、相对余弦调度与 EMA。"""
+"""V2局部解冻、参数分组、AdamW、相对余弦调度与EMA。"""
 from copy import deepcopy
 import hashlib
 import math
@@ -13,7 +13,7 @@ from models import ARCH_VERSION
 class ModelEMA:
     """参数滑动平均（EMA），用于验证与最终权重保存。"""
 
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model, decay=0.995):
         self.ema = deepcopy(model).eval()
         self.decay = decay
         for p in self.ema.parameters():
@@ -140,14 +140,18 @@ def save_checkpoint(path, model, meta: dict) -> str:
 def read_checkpoint(path) -> dict:
     raw = torch.load(path, map_location='cpu', weights_only=False)
     if not isinstance(raw, dict) or raw.get('arch_version') != ARCH_VERSION:
-        raise ValueError('需要方案 B 精简权重；旧权重请先通过 scripts/migrate_b_checkpoint.py 显式迁移')
+        raise ValueError('仅支持当前V2权重格式')
     if not isinstance(raw.get('state_dict'), dict) or not isinstance(raw.get('config'), dict):
         raise ValueError(f'权重缺少 state_dict/config: {path}')
+    required = {'phase_forecast.window_embed', 'cpm_head.future_temporal.out_proj.weight',
+                'cpm_head.dynamic_adapter.query_scales', 'multiscale_encoder.out_proj.weight'}
+    if not required.issubset(raw['state_dict']):
+        raise ValueError('仅支持完整V2结构权重，不支持旧方案')
     return raw
 
 
 def load_initial_weights(model, path, args) -> dict:
-    """显式复制相同键；只允许登记的动态模块和HC→MDD临床字段为新增键。"""
+    """显式复制相同键；只允许HC→MDD临床字段为新增键。"""
     raw = read_checkpoint(path)
     saved, source = raw['config']['args'], raw['state_dict']
     if saved['mode'] != 'pretrain':
@@ -155,15 +159,11 @@ def load_initial_weights(model, path, args) -> dict:
     keys = ('num_rois', 'context_max', 'tfm_dim', 'tfm_layers', 'tfm_heads',
             'tfm_ff_ratio', 'tfm_patch_len', 'cpm_horizon', 'cpm_layers',
             'norm', 'dropout', 'sc_prior_rank', 'sc_delta_a', 'sc_delta_rank',
-            'sc_lambda_mode', 'sc_lambda_init', 'sc_sinkhorn_iters')
+            'sc_lambda_mode', 'sc_lambda_init', 'sc_sinkhorn_iters',
+            'multiscale_channels', 'phase_modes', 'tr_seconds')
     mismatch = {k: (saved[k], getattr(args, k)) for k in keys if saved[k] != getattr(args, k)}
     if mismatch:
         raise ValueError(f'初始化结构不匹配: {mismatch}')
-    if saved.get('multiscale_phase', False) and getattr(args, 'multiscale_phase', False):
-        dynamic_keys = ('multiscale_channels', 'phase_modes', 'tr_seconds')
-        mismatch = {k: (saved[k], getattr(args, k)) for k in dynamic_keys if saved[k] != getattr(args, k)}
-        if mismatch:
-            raise ValueError(f'动态模块初始化结构不匹配: {mismatch}')
     condition = raw['config']['condition']
     layout = model.conditioner.layout()
     source_layout = condition['meta']['layout_hash']
@@ -178,8 +178,6 @@ def load_initial_weights(model, path, args) -> dict:
     new_prefixes = (() if args.mode == 'pretrain' else ('conditioner.delta.',) + tuple(
         f'conditioner.features.{kind}.{name}.'
         for name in model.conditioner.new_group for kind in ('continuous', 'categorical')))
-    if not saved.get('multiscale_phase', False) and getattr(args, 'multiscale_phase', False):
-        new_prefixes += prediction_adapter_prefixes(model)
     expected_new = {key for key in target if key.startswith(new_prefixes)}
     if extra or set(new) != expected_new:
         raise ValueError(f'初始化存在未登记参数: extra={extra}, new={new}')
@@ -193,31 +191,42 @@ def load_initial_weights(model, path, args) -> dict:
             'copied': sorted(source), 'new_initialized': new}
 
 
-def set_trainability(model, mode: str, encoder_unfrozen: bool) -> None:
-    """保留原B冻结策略，新增预测适配器在HC/MDD冻结期始终可训练。"""
+def set_trainability(model, mode: str, encoder_unfrozen: bool,
+                     unfreeze_last_layers: int = 2) -> None:
+    """V2仅解冻末尾TFM层及输出模块；条件和预测适配器始终训练。"""
     inner = getattr(model, '_orig_mod', model)
+    if not 0 <= unfreeze_last_layers <= len(inner.blocks):
+        raise ValueError('unfreeze_last_layers 必须为有效的末尾层数')
     for p in inner.parameters():
-        p.requires_grad_(encoder_unfrozen)
+        p.requires_grad_(False)
     cond_names = set(conditioning_param_names(inner))
     dynamics = set(prediction_adapter_param_names(inner))
+    tail = tuple(f'blocks.{i}.' for i in range(len(inner.blocks)-unfreeze_last_layers, len(inner.blocks)))
+    output = ('cpm_head.', 'final_norm.', 'rev_norm.')
     for name, p in inner.named_parameters():
-        if name in cond_names or name in dynamics or (mode == 'pretrain' and name.startswith('cpm_head.')):
+        if (name in cond_names or name in dynamics
+                or (mode == 'pretrain' and name.startswith('cpm_head.'))
+                or (encoder_unfrozen and name.startswith(tail + output))):
             p.requires_grad_(True)
     if encoder_unfrozen and getattr(model, '_orig_mod', None) is not None:
         torch.compiler.reset()
 
 
-def set_training_mode(model, encoder_unfrozen: bool) -> None:
-    model.train()
-    if not encoder_unfrozen:
-        inner = getattr(model, '_orig_mod', model)
-        inner.eval()
-        inner.cpm_head.train()
-        if inner.conditioner is not None:
-            inner.conditioner.train()
-        for _, module in inner.named_modules():
-            if getattr(module, 'is_prediction_adapter', False):
-                module.train()
+def set_training_mode(model, encoder_unfrozen: bool, unfreeze_last_layers: int = 2) -> None:
+    inner = getattr(model, '_orig_mod', model)
+    inner.eval()
+    inner.cpm_head.train()
+    if inner.conditioner is not None:
+        inner.conditioner.train()
+    if encoder_unfrozen:
+        for block in list(inner.blocks)[len(inner.blocks)-unfreeze_last_layers:]:
+            block.train()
+        inner.final_norm.train()
+        if inner.rev_norm is not None:
+            inner.rev_norm.train()
+    for _, module in inner.named_modules():
+        if getattr(module, 'is_prediction_adapter', False):
+            module.train()
 
 
 def get_param_groups(model, args) -> list:
@@ -231,7 +240,8 @@ def get_param_groups(model, args) -> list:
                      'prediction' if name in dynamics else
                      'cpm' if name.startswith('cpm_head.') else 'encoder')
             buckets[group].append(p)
-    scales = dict(encoder=args.backbone_lr_scale, cpm=1.0, condition=1.0, prediction=1.0)
+    scales = dict(encoder=args.backbone_lr_scale, cpm=args.cpm_lr_scale,
+                  condition=1.0, prediction=1.0)
     return [{'params': params, 'lr': args.lr_peak * scales[name], 'name': name}
             for name, params in buckets.items() if params]
 

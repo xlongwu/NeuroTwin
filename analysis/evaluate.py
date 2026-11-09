@@ -1,4 +1,4 @@
-"""从方案 B checkpoint 严格重建，执行相同划分和统计量的 H32 评价。"""
+"""从V2 checkpoint 严格重建，执行相同划分和统计量的 H32 评价。"""
 import argparse
 from argparse import Namespace
 import hashlib

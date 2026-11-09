@@ -22,7 +22,7 @@ def test_pretrain_and_finetune_scripts_share_the_formal_config(tmp_path):
         args=parse_args(tokens[index+1:])
         cfg=load_model_config()
         assert args.mode==mode and args.batch_size==cfg['training']['batch_size']
-        assert args.cpm_horizon==32 and args.lambda_delta==.5
+        assert args.cpm_horizon==32 and args.lambda_delta==.3
         assert args.save_training_state and args.data_root==str(tmp_path/'data')
         assert args.condition_arm==('demo' if mode=='pretrain' else 'cat')
 

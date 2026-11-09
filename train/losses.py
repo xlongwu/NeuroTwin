@@ -1,5 +1,5 @@
 # coding=utf-8
-"""共用六项预测损失；实验配置可指定时距权重与局部相关窗口。"""
+"""V2六项预测损失：时距加权重建、FC、频域、差分及全局/局部相关。"""
 import math
 import torch
 import torch.nn as nn
@@ -273,12 +273,12 @@ def temporal_difference_huber(pred: torch.Tensor, target: torch.Tensor,
 
 
 class ForecastFidelityLoss(nn.Module):
-    """与已验证 B 相同的重建、FC、FFT、差分及全局/局部时间 PCC 损失。"""
+    """V2重建、FC、FFT、差分及全局/局部时间PCC损失。"""
 
     def __init__(self, lambda_rec: float, lambda_fc: float, lambda_freq: float,
                  lambda_delta: float, lambda_corr: float, lambda_local_corr: float,
                  huber_delta: float = 1.0, horizon_weight_start: float = 1.,
-                 horizon_weight_end: float = 1., local_corr_window: int = 8,
+                 horizon_weight_end: float = 1.5, local_corr_window: int = 16,
                  local_corr_stride: int = 8):
         super().__init__()
         self.weights = dict(rec=lambda_rec, fc=lambda_fc, freq=lambda_freq,

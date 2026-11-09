@@ -1,0 +1,126 @@
+{
+  "status": "deleted",
+  "non_v2": [
+    {
+      "path": "checkpoints/CPM直接长程预测方案_1106/neurotwin_finetune/finetuned_best.pt",
+      "bytes": 23568654
+    },
+    {
+      "path": "checkpoints/CPM直接长程预测方案_1106/neurotwin_pretrain/base_best.pt",
+      "bytes": 23515506
+    },
+    {
+      "path": "checkpoints/CPM直接长程预测方案_1106/初始化/hc_h8_to_h32.pt",
+      "bytes": 23482994
+    },
+    {
+      "path": "checkpoints/baseline_1031/neurotwin_finetune/finetuned_best.pt",
+      "bytes": 25051774
+    },
+    {
+      "path": "checkpoints/baseline_1031/neurotwin_finetune/finetuned_last.pt",
+      "bytes": 25051774
+    },
+    {
+      "path": "checkpoints/baseline_1031/neurotwin_pretrain/base_best.pt",
+      "bytes": 24997242
+    },
+    {
+      "path": "checkpoints/baseline_1031/neurotwin_pretrain/base_last.pt",
+      "bytes": 24997242
+    },
+    {
+      "path": "checkpoints/个体脑动力学方案_1103/neurotwin_finetune/finetuned_best.pt",
+      "bytes": 25201934
+    },
+    {
+      "path": "checkpoints/个体脑动力学方案_1103/neurotwin_finetune/finetuned_last.pt",
+      "bytes": 25201934
+    },
+    {
+      "path": "checkpoints/个体脑动力学方案_1103/neurotwin_pretrain/base_best.pt",
+      "bytes": 25169126
+    },
+    {
+      "path": "checkpoints/个体脑动力学方案_1103/neurotwin_pretrain/base_last.pt",
+      "bytes": 25169126
+    },
+    {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_finetune/finetuned_best.pt",
+      "bytes": 25413996
+    },
+    {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_finetune/finetuned_last.pt",
+      "bytes": 25413996
+    },
+    {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_finetune/training_state.pt",
+      "bytes": 101595806
+    },
+    {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_pretrain/base_best.pt",
+      "bytes": 25360208
+    },
+    {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_pretrain/base_last.pt",
+      "bytes": 25360208
+    },
+    {
+      "path": "checkpoints/多尺度相位预测_20261107/neurotwin_pretrain/training_state.pt",
+      "bytes": 101387410
+    },
+    {
+      "path": "checkpoints/长程相位预测_V1_20261108/neurotwin_finetune/finetuned_best.pt",
+      "bytes": 25434284
+    },
+    {
+      "path": "checkpoints/长程相位预测_V1_20261108/neurotwin_finetune/finetuned_last.pt",
+      "bytes": 25434284
+    },
+    {
+      "path": "checkpoints/长程相位预测_V1_20261108/neurotwin_finetune/training_state.pt",
+      "bytes": 84416324
+    },
+    {
+      "path": "checkpoints/长程相位预测_V1_20261108/neurotwin_pretrain/base_best.pt",
+      "bytes": 25380496
+    },
+    {
+      "path": "checkpoints/长程相位预测_V1_20261108/neurotwin_pretrain/base_last.pt",
+      "bytes": 25380496
+    },
+    {
+      "path": "checkpoints/长程相位预测_V1_20261108/neurotwin_pretrain/training_state.pt",
+      "bytes": 84207864
+    }
+  ],
+  "v2_preserved": [
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_best.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_last.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/training_state.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_last.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/training_state.pt"
+  ],
+  "non_v2_total_MiB": 806.992223739624,
+  "completed_at": "2026-11-09T16:42:09+08:00",
+  "authorization": "用户在确认23个非V2权重清单后要求清除",
+  "deleted_files": 23,
+  "deleted_bytes": 846192678,
+  "preserved_sha256": {
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_best.pt": "6581e667f085f36aab4c983b3947000be2e6b796bc2666c9459a873f75940eb0",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_last.pt": "15841c689bb0f4d1974b6563f237663204b2423be28bf54b50b804e6d0d8efd0",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/training_state.pt": "b2de4f393cf643131222934f0b27ff941406fa7d2976259373a2118ef719ee05",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt": "b68289fe358da9bc9db3abad4bf6d139329a93d625fd24c9acad2a61c44ed106",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_last.pt": "cdc6ef37dd72f7a237ea652b3a58ccf5a681fb347b58d4400e1159296fc49067",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/training_state.pt": "704474c486d33838497fd7ceb8b92baa1df22ac3493c9f37fb35f70523b1d0da"
+  },
+  "remaining_weight_files": [
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_best.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_last.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/training_state.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_last.pt",
+    "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/training_state.pt"
+  ]
+}

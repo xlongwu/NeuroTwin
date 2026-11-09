@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 共用入口；默认正式B，可通过 MODEL_CONFIG 或 --model_config 指定实验配置。
+# V2唯一训练入口，算法参数来自configs/neurotwin.json。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -10,7 +10,6 @@ export TMPDIR="$ROOT/.runtime_tmp"
 mkdir -p "$TMPDIR"
 export TORCH_SHARING_STRATEGY=file_system
 command=("${PYTHON:-python}" -u main.py --mode "$mode")
-[[ -z "${MODEL_CONFIG:-}" ]] || command+=(--model_config "$MODEL_CONFIG")
 [[ -z "${DATA_ROOT:-}" ]] || command+=(--data_root "$DATA_ROOT")
 [[ -z "${DEVICE:-}" ]] || command+=(--device "$DEVICE")
 [[ -z "${CHECKPOINT_DIR:-}" ]] || command+=(--checkpoint_dir "$CHECKPOINT_DIR")

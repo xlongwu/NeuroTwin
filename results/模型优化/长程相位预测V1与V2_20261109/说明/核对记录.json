@@ -1,0 +1,83 @@
+{
+  "整理时间": "2026-11-09T14:21:53+08:00",
+  "训练结束时间": "2026-11-09T13:32:41+08:00",
+  "评价范围": "已有验证日志；未运行测试集",
+  "流水线状态": "complete",
+  "权重与日志核对": [
+    {
+      "队列": "HC",
+      "版本": "V0",
+      "权重": "checkpoints/多尺度相位预测_20261107/neurotwin_pretrain/base_best.pt",
+      "权重SHA256": "c772cce8385b44ad4a5cb04ef4fe07a9909942c08d1af25cdb5771759d523b41",
+      "训练记录": "checkpoints/多尺度相位预测_20261107/neurotwin_pretrain/验证训练记录.jsonl",
+      "训练记录SHA256": "8c2dc6b7021227d0e77b4b6fbf438d90202c03f5580a6204b69f7f2fdf0be5cb",
+      "best轮数": 10,
+      "完成轮数": 22,
+      "split_hash": "4aa135c007e75fe4",
+      "严格加载与CPU前向": true
+    },
+    {
+      "队列": "HC",
+      "版本": "V1",
+      "权重": "checkpoints/长程相位预测_V1_20261108/neurotwin_pretrain/base_best.pt",
+      "权重SHA256": "831cd8e974cafd0aef1b95193d4dc7de6e900f511d0a95b9006142eb8e920d16",
+      "训练记录": "checkpoints/长程相位预测_V1_20261108/neurotwin_pretrain/验证训练记录.jsonl",
+      "训练记录SHA256": "7a531196acb373cd6fcda3a8e59e8fefbac0cbe25690c7fdec67740e5d65cb55",
+      "best轮数": 150,
+      "完成轮数": 150,
+      "split_hash": "4aa135c007e75fe4",
+      "严格加载与CPU前向": true
+    },
+    {
+      "队列": "HC",
+      "版本": "V2",
+      "权重": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt",
+      "权重SHA256": "b68289fe358da9bc9db3abad4bf6d139329a93d625fd24c9acad2a61c44ed106",
+      "训练记录": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/验证训练记录.jsonl",
+      "训练记录SHA256": "38e92f7148663f5b0651bc6e3a83d7e811bbc503f8b5f5bece30cd6b5deef239",
+      "best轮数": 149,
+      "完成轮数": 150,
+      "split_hash": "4aa135c007e75fe4",
+      "严格加载与CPU前向": true
+    },
+    {
+      "队列": "MDD",
+      "版本": "V0",
+      "权重": "checkpoints/多尺度相位预测_20261107/neurotwin_finetune/finetuned_best.pt",
+      "权重SHA256": "23f31c9404e4d86b596c78fa09c948560c2c68f1a2e4ebc606c125dc42c2e3a0",
+      "训练记录": "checkpoints/多尺度相位预测_20261107/neurotwin_finetune/验证训练记录.jsonl",
+      "训练记录SHA256": "9e61e7b5eff49f9668c6bdbcadf83b67ce05b266e99ad04d7166f10a7b5d3025",
+      "best轮数": 10,
+      "完成轮数": 22,
+      "split_hash": "f1f36cbbede3ca7e",
+      "严格加载与CPU前向": true
+    },
+    {
+      "队列": "MDD",
+      "版本": "V1",
+      "权重": "checkpoints/长程相位预测_V1_20261108/neurotwin_finetune/finetuned_best.pt",
+      "权重SHA256": "364afe63d46b346c08f1eab836bc36369e01cd000c4d0813b7c7f25d7b8b824a",
+      "训练记录": "checkpoints/长程相位预测_V1_20261108/neurotwin_finetune/验证训练记录.jsonl",
+      "训练记录SHA256": "86372a72758eab5a8f319cab4a3afa634d2f9819fb9180ef3c03d076a20260da",
+      "best轮数": 150,
+      "完成轮数": 150,
+      "split_hash": "f1f36cbbede3ca7e",
+      "严格加载与CPU前向": true
+    },
+    {
+      "队列": "MDD",
+      "版本": "V2",
+      "权重": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_best.pt",
+      "权重SHA256": "6581e667f085f36aab4c983b3947000be2e6b796bc2666c9459a873f75940eb0",
+      "训练记录": "checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/验证训练记录.jsonl",
+      "训练记录SHA256": "8f304ee222998eb39f5de5ec824f3af5890a63242c74a7cdbc33f90865514add",
+      "best轮数": 149,
+      "完成轮数": 150,
+      "split_hash": "f1f36cbbede3ca7e",
+      "严格加载与CPU前向": true
+    }
+  ],
+  "比较口径": "相同split_hash、K64、每被试8锚点、固定32TR校准；先锚点再被试等权",
+  "显著性检验": "未执行：仅有单个种子和汇总验证日志，不能从中推导置信区间",
+  "运行命令": "python results/模型优化/长程相位预测V1与V2_20261109/复现代码/训练结果整理.py"
+}

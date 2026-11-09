@@ -1,0 +1,7 @@
+﻿队列,版本,完成轮数,best轮数,早停,验证被试数,split_hash,参数量,耗时分钟,权重路径,SHA256
+HC,V0,22,10,True,222,4aa135c007e75fe4,6315384,,checkpoints/多尺度相位预测_20261107/neurotwin_pretrain/base_best.pt,c772cce8385b44ad4a5cb04ef4fe07a9909942c08d1af25cdb5771759d523b41
+HC,V1,150,150,False,222,4aa135c007e75fe4,6315384,255.68333333333334,checkpoints/长程相位预测_V1_20261108/neurotwin_pretrain/base_best.pt,831cd8e974cafd0aef1b95193d4dc7de6e900f511d0a95b9006142eb8e920d16
+HC,V2,150,149,False,222,4aa135c007e75fe4,7170620,343.3666666666667,checkpoints/多尺度相位协同预测方案_1108/neurotwin_pretrain/base_best.pt,b68289fe358da9bc9db3abad4bf6d139329a93d625fd24c9acad2a61c44ed106
+MDD,V0,22,10,True,225,f1f36cbbede3ca7e,6326104,,checkpoints/多尺度相位预测_20261107/neurotwin_finetune/finetuned_best.pt,23f31c9404e4d86b596c78fa09c948560c2c68f1a2e4ebc606c125dc42c2e3a0
+MDD,V1,150,150,False,225,f1f36cbbede3ca7e,6326104,266.95,checkpoints/长程相位预测_V1_20261108/neurotwin_finetune/finetuned_best.pt,364afe63d46b346c08f1eab836bc36369e01cd000c4d0813b7c7f25d7b8b824a
+MDD,V2,150,149,False,225,f1f36cbbede3ca7e,7181340,347.76666666666665,checkpoints/多尺度相位协同预测方案_1108/neurotwin_finetune/finetuned_best.pt,6581e667f085f36aab4c983b3947000be2e6b796bc2666c9459a873f75940eb0

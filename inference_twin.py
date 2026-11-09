@@ -1,4 +1,4 @@
-"""方案 B 单被试推理：固定扫描校准、字段条件、直接 H32 和观测刷新预测。"""
+"""V2 单被试推理：固定扫描校准、字段条件、直接 H32 和观测刷新预测。"""
 from __future__ import annotations
 import argparse
 import json

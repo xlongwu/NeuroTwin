@@ -1,5 +1,5 @@
 # coding=utf-8
-"""方案 B 唯一训练入口：HC CPM 预训练 → MDD 条件微调。"""
+"""V2 唯一训练入口：HC CPM 预训练 → MDD 条件微调。"""
 import argparse
 from collections import defaultdict
 import json
@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from model import MODEL_CONFIG, build_model_from_args, load_model_config
+from model import build_model_from_args, load_model_config
 from models.conditioning import ConditioningConfig
 from train.losses import ForecastFidelityLoss
 from train.forecast_metrics import H32_STAGE_LABELS, h32_stage_metrics, horizon_metrics
@@ -207,20 +207,17 @@ def evaluate_tfm(model, data_loader, criterion, device, args) -> dict:
 
 
 def _resume_argument_mismatches(saved: dict, current: dict) -> dict:
-    ignored = {'checkpoint_dir','name','model_config','init_weight','pretrained_weight',
+    ignored = {'checkpoint_dir','name','init_weight','pretrained_weight',
                'resume_training_state','save_training_state','eval_after_train','device'}
     if current['train_epochs'] >= saved['train_epochs']:
         ignored.add('train_epochs')
-    return {k:(saved.get(k),current.get(k)) for k in sorted(set(saved)|set(current))
+    return {k:(saved.get(k),current.get(k)) for k in sorted(current)
             if k not in ignored and saved.get(k)!=current.get(k)}
 
 
 def parse_args(argv=None):
-    preview = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    preview.add_argument('--model_config', default=str(MODEL_CONFIG))
-    selected, _ = preview.parse_known_args(argv)
-    cfg = load_model_config(selected.model_config)
-    parser = argparse.ArgumentParser(description=__doc__, parents=[preview])
+    cfg = load_model_config()
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--mode', choices=['pretrain','finetune'], default='pretrain')
     for section in ('architecture','loss','training','data_and_split'):
         for key, val in cfg[section].items():
@@ -247,10 +244,12 @@ def parse_args(argv=None):
     parser.add_argument('--augmentation', type=json.loads, default=cfg.get('augmentation'))
     parser.add_argument('--save_training_state', action='store_true')
     parser.add_argument('--no_eval_after_train', dest='eval_after_train', action='store_false')
+    parser.set_defaults(eval_after_train=cfg['training'].get('eval_after_train', True))
     args = parser.parse_args(argv)
     args.name = args.name or f'neurotwin_{args.mode}'
     args.condition_group = args.condition_group or condition[args.mode]['condition_group']
     args.condition_arm = args.condition_arm or condition[args.mode]['condition_arm']
+    args.split_file = args.split_file or str(Path(args.data_root)/f'subject_split_{args.mode}.json')
     args.init_weight = args.init_weight or cfg['weights']['initializer']['path']
     args.pretrained_weight = args.pretrained_weight or cfg['weights']['pretrain']['path']
     args.model_arch, args.task_mode, args.bold_source, args.graph_source = 'tfm','next_timepoint','raw','history_fc'
@@ -261,7 +260,7 @@ def parse_args(argv=None):
 def main(args):
     check_seed_separation(args)
     if args.cpm_horizon != 32 or args.context_min != 64 or args.context_max != 64 or args.random_context:
-        raise ValueError('正式方案 B 使用固定 K64 / H32')
+        raise ValueError('V2使用固定K64 / H32')
     torch.set_num_threads(args.num_threads)
     torch.multiprocessing.set_sharing_strategy('file_system')
     set_seed(args.seed)
@@ -296,18 +295,19 @@ def main(args):
         raise ValueError('续训条件统计量或被试划分不一致')
     model = build_model_from_args(args, device, bundle)
     migration = load_initial_weights(model, source, args) if not progress else progress['study']['initialization']
-    criterion = ForecastFidelityLoss(**{k:getattr(args,k) for k in load_model_config(args.model_config)['loss']}).to(device)
+    criterion = ForecastFidelityLoss(**{k:getattr(args,k) for k in load_model_config()['loss']}).to(device)
     unfrozen = args.freeze_backbone_epochs == 0
-    set_trainability(model,args.mode,unfrozen)
+    last_layers = args.unfreeze_last_layers
+    set_trainability(model,args.mode,unfrozen,last_layers)
     optimizer = build_optimizer(model,criterion,args)
     scheduler = build_scheduler(optimizer,args)
     if progress and progress['backbone_unfrozen'] and not unfrozen:
-        set_trainability(model,args.mode,True)
+        set_trainability(model,args.mode,True,last_layers)
         unfreeze_while_preserving_state(model,optimizer,args)
         scheduler.sync_param_groups()
         unfrozen = True
     scaler = torch.amp.GradScaler('cuda',enabled=amp)
-    ema = ModelEMA(model,args.ema_decay) if args.use_ema else None
+    ema = ModelEMA(model,args.ema_decay)
     if args.compile and device.type=='cuda':
         model = torch.compile(model,dynamic=True)
     selector = CheckpointSelector('metric_selection_h32',patience=args.patience)
@@ -336,17 +336,17 @@ def main(args):
         writer = None
     if resume_meta and not selector.should_stop:
         restore_rng_state(resume_meta['rng'])
-    label = '多尺度相位' if getattr(args, 'multiscale_phase', False) else 'B'
+    label = load_model_config()['_meta']['display_name']
     print(f'[{label}] {args.mode} | run={run_dir} | K64 H32 | batch={args.batch_size}',flush=True)
     epoch_limit = start if progress and progress['early_stopped'] else args.train_epochs
     for epoch in range(start,epoch_limit):
         if not unfrozen and epoch>=args.freeze_backbone_epochs:
-            set_trainability(model,args.mode,True)
+            set_trainability(model,args.mode,True,last_layers)
             added,names=unfreeze_while_preserving_state(model,optimizer,args)
             scheduler.sync_param_groups()
             unfrozen=True;selector.counter=0
             print(f'[unfreeze] epoch={epoch+1} added={added} groups={names}',flush=True)
-        set_training_mode(model,unfrozen)
+        set_training_mode(model,unfrozen,last_layers)
         train_data.batch_sampler.set_epoch(epoch)
         train_values=defaultdict(list)
         for batch in tqdm(train_data,desc=f'Epoch {epoch+1}/{args.train_epochs}',leave=False):
@@ -360,11 +360,12 @@ def main(args):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],args.grad_clip)
             scaler.step(optimizer);scaler.update()
-            if ema:ema.update(model)
+            ema.update(model)
             global_step+=1
             for k,v in terms.items():train_values[k].append(float(v))
-        eval_model=ema.ema if ema else model
+        eval_model=ema.ema
         metrics=evaluate_tfm(eval_model,val_data,criterion,device,args)
+        raw_metrics = evaluate_tfm(model,val_data,criterion,device,args)
         scheduler.step()
         is_best,score=selector.step(metrics)
         if not unfrozen:selector.counter=0
@@ -373,26 +374,32 @@ def main(args):
                   val_metrics=metrics,val_metric=score,condition=bundle,
                   initialization=migration,backbone_unfrozen=unfrozen,
                   loss_weights=criterion.get_loss_weights())
+        meta['val_metrics_raw'] = raw_metrics
         if is_best:save_checkpoint(run_dir/best_name,eval_model,meta)
         stopped=selector.should_stop
         if stopped or epoch==args.train_epochs-1:
             save_checkpoint(run_dir/('base_last.pt' if args.mode=='pretrain' else 'finetuned_last.pt'),eval_model,meta)
         with (run_dir/'验证训练记录.jsonl').open('a',encoding='utf-8') as f:
-            f.write(json.dumps(dict(epoch=epoch+1,train=train_metrics,val=metrics,
-                    loss_weights=criterion.get_loss_weights()),ensure_ascii=False)+'\n')
+            record = dict(epoch=epoch+1,train=train_metrics,val=metrics,
+                          loss_weights=criterion.get_loss_weights())
+            record.update(val_raw=raw_metrics, val_ema=metrics)
+            f.write(json.dumps(record,ensure_ascii=False)+'\n')
         if writer:
             for k,v in metrics.items():writer.add_scalar('Val/'+k,v,epoch)
+            for k,v in raw_metrics.items():writer.add_scalar('ValRaw/'+k,v,epoch)
             for k,v in train_metrics.items():writer.add_scalar('Train/'+k,v,epoch)
             for g in optimizer.param_groups:writer.add_scalar('LR/'+g['name'],g['lr'],epoch)
             writer.flush()
         print(f'[Val] epoch={epoch+1} MAE={metrics["metric_mae_h1_32"]:.6f} '
               f'TemporalPCC={metrics["metric_temporal_pcc_h1_32"]:.6f} score={score:.6f} best={selector.best:.6f}',flush=True)
-        if getattr(args, 'multiscale_phase', False):
-            print('[Val stages] ' + ' | '.join(
-                f'{label}: MAE={metrics["metric_mae_"+label]:.6f} '
-                f'RMSE={metrics["metric_rmse_"+label]:.6f} '
-                f'TemporalPCC={metrics["metric_temporal_pcc_"+label]:.6f}'
-                for label in ('h1_8', 'h9_16', 'h17_32', 'h1_32')), flush=True)
+        print(f'[Val raw] epoch={epoch+1} MAE={raw_metrics["metric_mae_h1_32"]:.6f} '
+              f'TemporalPCC={raw_metrics["metric_temporal_pcc_h1_32"]:.6f} '
+              f'score={raw_metrics["metric_selection_h32"]:.6f}', flush=True)
+        print('[Val stages] ' + ' | '.join(
+            f'{stage}: MAE={metrics["metric_mae_"+stage]:.6f} '
+            f'RMSE={metrics["metric_rmse_"+stage]:.6f} '
+            f'TemporalPCC={metrics["metric_temporal_pcc_"+stage]:.6f}'
+            for stage in ('h1_8', 'h9_16', 'h17_32', 'h1_32')), flush=True)
         if args.save_training_state or progress:
             state=TrainingState(epoch=epoch+1,global_step=global_step,best_metric=selector.best,
                 best_metric_name=selector.metric_key,patience_counter=selector.counter,
